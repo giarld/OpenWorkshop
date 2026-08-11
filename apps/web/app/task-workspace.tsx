@@ -19,7 +19,7 @@ import { AVATAR_SETTINGS_EVENT, DEFAULT_AVATARS, avatarSettings, isImageAvatar, 
 import { DeliveryWorkspace } from "./delivery-workspace";
 import { CommissionWorkspace } from "./commission-workspace";
 import { UsageStatisticsWorkspace } from "./usage-statistics-workspace";
-import { activeProjects, projectIdAfterArchive, storedWorkspaceView, type ManagedProject, type WorkspaceView } from "./project-management";
+import { activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, projectIdAfterArchive, storedWorkspaceView, workspaceContentState, type ManagedProject, type WorkspaceView } from "./project-management";
 import { commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, tokenPrice, tokenUsageTotals, type CodeChange, type MentionTrigger, type ReviewFinding, type RunEvent, type RunQuestion } from "./task-run";
 import {
   TASK_STATUSES,
@@ -30,6 +30,7 @@ import {
   taskSwimlaneGroups,
   taskSwimlanes,
   treeRoots,
+  workspaceOverviewStats,
   type Task,
   type TaskFilters,
   type TaskSort,
@@ -60,6 +61,7 @@ const EMPTY_FILTERS: TaskFilters = { search: "", status: "all", owner: "all", pr
 const SELECTED_PROJECT_KEY = "workshop:selected-project";
 const SELECTED_VIEW_KEY = "workshop:selected-workspace-view";
 const ARCHIVED_SWIMLANE_ID = "archived-swimlane-group";
+const OVERVIEW_VIEWS = new Set<View>(["commissions", "requirements", "board", "delivery"]);
 const PAGES: Array<{ id: View; label: string }> = [
   { id: "projects", label: "项目管理" },
   { id: "commissions", label: "客户委托" },
@@ -70,7 +72,7 @@ const PAGES: Array<{ id: View; label: string }> = [
   { id: "usage", label: "使用统计" }
 ];
 
-export function TaskWorkspace({ settings }: { settings: ReactNode }) {
+export function TaskWorkspace({ header, settings }: { header: ReactNode; settings: ReactNode }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState("");
   const [projectCommissions, setProjectCommissions] = useState<Commission[]>([]);
@@ -102,6 +104,10 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
   const taskDialog = useRef<HTMLDialogElement>(null);
   const propertyDialog = useRef<HTMLDialogElement>(null);
   const projectManagementDialog = useRef<HTMLDialogElement>(null);
+  const projectIdRef = useRef(projectId);
+  const projectDataRequestGate = useRef(createProjectDataRequestGate()).current;
+  const projectSnapshotSingleFlight = useRef(createKeyedSingleFlight()).current;
+  projectIdRef.current = projectId;
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { delay: 180, tolerance: 8 } }), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
 
   useEffect(() => {
@@ -109,9 +115,11 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
     setViewLoaded(true);
     void api<Project[]>("/api/projects").then((items) => {
       const active = activeProjects(items);
+      const preferredId = preferredProjectId(active, localStorage.getItem(SELECTED_PROJECT_KEY));
       setProjects(active);
-      setProjectId(preferredProjectId(active, localStorage.getItem(SELECTED_PROJECT_KEY)));
-    }).catch((error: Error) => setMessage(error.message)).finally(() => setLoading(false));
+      setProjectId(preferredId);
+      if (!preferredId) setLoading(false);
+    }).catch((error: Error) => { setMessage(error.message); setLoading(false); });
   }, []);
 
   useEffect(() => {
@@ -147,15 +155,14 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
   }, [managedProject]);
 
   useEffect(() => {
-    if (view !== "board" || !projectId) return;
+    if (!OVERVIEW_VIEWS.has(view) || !projectId) return;
     const timer = window.setInterval(() => { void refreshProject(); if (taskDialogTask) void refreshTaskDialog(taskDialogTask.id); }, 2000);
     return () => window.clearInterval(timer);
   }, [view, projectId, taskDialogTask?.id]);
 
   useEffect(() => {
-    if (!projectId) { setTasks([]); setProjectCommissions([]); return; }
-    void loadTasks(projectId, setTasks, setMessage, setLoading);
-    void api<Commission[]>(`/api/projects/${projectId}/commissions`).then(setProjectCommissions).catch((error: Error) => setMessage(error.message));
+    if (!projectId) { setTasks([]); setProjectCommissions([]); setLoading(false); return; }
+    void loadProjectSnapshot(projectId, true);
   }, [projectId]);
 
   useEffect(() => {
@@ -190,7 +197,7 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
         const previous = tasks;
         setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: "in_progress", latestRunStatus: "queued" } : item));
         setMessage("");
-        try { await triggerTask(task); await loadTasks(projectId, setTasks, setMessage); setMessage("任务已启动，Agent 正在接管执行。"); }
+        try { await triggerTask(task); await loadCurrentProjectTasks(); setMessage("任务已启动，Agent 正在接管执行。"); }
         catch (error) { setTasks(previous); setMessage((error as Error).message); }
         return;
       }
@@ -207,7 +214,7 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
     setMessage("");
     try {
       await api(`/api/tasks/${task.id}${path}`, { method: "POST", body: JSON.stringify(body) });
-      await loadTasks(projectId, setTasks, setMessage);
+      await loadCurrentProjectTasks();
     } catch (error) {
       setTasks(previous);
       setMessage((error as Error).message);
@@ -237,7 +244,7 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
     }
     setSelected(new Set());
     if (taskDialogTask && archived.some((task) => task.id === taskDialogTask.id || (!task.parent_id && task.commission_id === taskDialogTask.commission_id))) setTaskDialogTask(null);
-    await loadTasks(projectId, setTasks, setMessage);
+    await loadCurrentProjectTasks();
     setMessage(failures.length ? failures.join("；") : archivesTree ? "主任务及其全部子任务已归档。" : `已归档 ${archived.length} 个任务。`);
   }
 
@@ -247,7 +254,7 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
     setTaskBusy(true); setMessage("");
     try {
       const restored = await api<Task>(`/api/tasks/${task.id}/unarchive`, { method: "POST" });
-      await loadTasks(projectId, setTasks, setMessage);
+      await loadCurrentProjectTasks();
       setTaskDialogTask((current) => current?.id === restored.id ? restored : current);
       setMessage(restoresTree ? "主任务及其全部子任务已解除归档并回到 Done。" : "任务已解除归档并回到 Done。");
     } catch (error) { setMessage((error as Error).message); }
@@ -256,6 +263,20 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
 
   function toggleCollapsed(id: string) {
     setCollapsed((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+  }
+
+  function selectProject(nextProjectId: string) {
+    if (nextProjectId === projectIdRef.current) return;
+    projectIdRef.current = nextProjectId;
+    projectDataRequestGate.invalidate();
+    setTasks([]);
+    setProjectCommissions([]);
+    setSelected(new Set());
+    setTaskDialogTask(null);
+    setPropertyTask(null);
+    setMessage("");
+    setLoading(Boolean(nextProjectId));
+    setProjectId(nextProjectId);
   }
 
   async function associateProject(event: FormEvent<HTMLFormElement>) {
@@ -273,7 +294,7 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
         ?? await api<RootPath>("/api/roots", { method: "POST", body: JSON.stringify({ path }) });
       const project = await api<Project>("/api/projects", { method: "POST", body: JSON.stringify({ name, path: ".", rootPathId: root.id }) });
       setProjects((current) => [...current, project]);
-      setProjectId(project.id);
+      selectProject(project.id);
       form.reset();
       form.closest("details")?.removeAttribute("open");
       setMessage(`已关联 ${project.name}。`);
@@ -311,7 +332,7 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
       const nextProjectId = projectIdAfterArchive(projects, projectId, managedProject.id);
       setProjects((current) => current.filter((project) => project.id !== managedProject.id));
       setManagedProject(null);
-      setProjectId(nextProjectId);
+      selectProject(nextProjectId);
       if (!nextProjectId) localStorage.removeItem(SELECTED_PROJECT_KEY);
       setMessage("项目关联已解除，项目文件和历史数据均已保留。");
     } catch (error) { setProjectManagementError(`解除关联失败：${(error as Error).message}`); }
@@ -333,7 +354,7 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
         ownerType: data.get("ownerType"),
         dueDate: data.get("dueDate") || null
       }) });
-      await loadTasks(projectId, setTasks, setMessage);
+      await loadCurrentProjectTasks();
       form.reset();
       form.closest("details")?.removeAttribute("open");
       setMessage("任务已创建并进入 Backlog。");
@@ -343,8 +364,42 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
   }
 
   async function refreshProject() {
-    try { await Promise.all([loadTasks(projectId, setTasks, setMessage), api<Commission[]>(`/api/projects/${projectId}/commissions`).then(setProjectCommissions)]); }
-    catch (error) { setMessage((error as Error).message); }
+    const requestedProjectId = projectIdRef.current;
+    if (requestedProjectId) await loadProjectSnapshot(requestedProjectId, false);
+  }
+
+  async function loadProjectSnapshot(requestedProjectId: string, showLoading: boolean) {
+    if (showLoading && requestedProjectId === projectIdRef.current) setLoading(true);
+    await projectSnapshotSingleFlight.run(requestedProjectId, async () => {
+      const request = projectDataRequestGate.begin(requestedProjectId);
+      const isCurrent = () => projectDataRequestGate.accepts(request, projectIdRef.current);
+      try {
+        const [nextTasks, nextCommissions] = await Promise.all([
+          api<Task[]>(`/api/projects/${requestedProjectId}/tasks?includeArchived=true`),
+          api<Commission[]>(`/api/projects/${requestedProjectId}/commissions`)
+        ]);
+        if (isCurrent()) {
+          setTasks(nextTasks);
+          setProjectCommissions(nextCommissions);
+        }
+      } catch (error) {
+        if (isCurrent()) setMessage((error as Error).message);
+      } finally {
+        if (isCurrent()) setLoading(false);
+      }
+    });
+  }
+
+  async function loadCurrentProjectTasks() {
+    const requestedProjectId = projectIdRef.current;
+    if (!requestedProjectId) return;
+    const request = projectDataRequestGate.begin(requestedProjectId);
+    try {
+      const nextTasks = await api<Task[]>(`/api/projects/${requestedProjectId}/tasks?includeArchived=true`);
+      if (projectDataRequestGate.accepts(request, projectIdRef.current)) setTasks(nextTasks);
+    } catch (error) {
+      if (projectDataRequestGate.accepts(request, projectIdRef.current)) setMessage((error as Error).message);
+    }
   }
 
   async function refreshNotificationCount() {
@@ -464,22 +519,35 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
     </form>
   </details>;
 
-  if (loading && !projects.length) return <section className="empty-state">正在加载项目与任务…</section>;
-  if (!projects.length) return <section className="task-workspace" aria-label="任务工作区"><div className="workspace-shell"><WorkspaceNav view={view} unreadNotifications={unreadNotifications} onChange={setView} /><section className="workspace-content" id="workspace-content" tabIndex={-1}>{view === "settings" ? settings : view === "usage" ? <UsageStatisticsWorkspace /> : view === "projects" ? <ProjectManagementPage projects={projects} projectId={projectId} associate={associate} onSelect={setProjectId} onManage={openProjectManagement} /> : <section className="empty-state"><h2>暂无可用项目</h2><p>关联主机上的现有项目目录后开始管理任务。</p>{associate}{message && <p className="workspace-message" role="status">{message}</p>}</section>}</section></div></section>;
+  const contentState = workspaceContentState(view, loading);
+
+  if (loading && !projects.length) return <section className="task-workspace" aria-label="任务工作区">
+    <WorkspaceNav view={view} unreadNotifications={unreadNotifications} onChange={setView} />
+    <div className="workspace-stage">{header}<section className="workspace-content" id="workspace-content" tabIndex={-1}>{contentState === "settings" ? settings : <section className="empty-state">正在加载项目与任务…</section>}</section></div>
+  </section>;
+  if (!projects.length) return <section className="task-workspace" aria-label="任务工作区">
+    <WorkspaceNav view={view} unreadNotifications={unreadNotifications} onChange={setView} />
+    <div className="workspace-stage">{header}<section className="workspace-content" id="workspace-content" tabIndex={-1}>{view === "settings" ? settings : view === "usage" ? <UsageStatisticsWorkspace /> : view === "projects" ? <ProjectManagementPage projects={projects} projectId={projectId} associate={associate} onSelect={selectProject} onManage={openProjectManagement} /> : <section className="empty-state"><h2>暂无可用项目</h2><p>关联主机上的现有项目目录后开始管理任务。</p>{associate}{message && <p className="workspace-message" role="status">{message}</p>}</section>}</section></div>
+  </section>;
+
+  const overview = workspaceOverviewStats(tasks);
+  const showOverview = OVERVIEW_VIEWS.has(view);
 
   return <section className="task-workspace" aria-label="任务工作区">
-    <div className="project-bar">
-      <div className="project-picker"><label>当前项目<select value={projectId} onChange={(event) => setProjectId(event.target.value)}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label><p>{tasks.filter((task) => task.status !== "archived").length} 个活跃任务 · {projectCommissions.length} 个委托</p></div>
-      <div className="project-actions">{createTaskDialog}{associate}</div>
-    </div>
-    <div className="workspace-shell">
-      <WorkspaceNav view={view} unreadNotifications={unreadNotifications} onChange={setView} />
+    <WorkspaceNav view={view} unreadNotifications={unreadNotifications} onChange={setView} />
+    <div className="workspace-stage">
+      {header}
+      <div className="project-bar">
+        <div className="project-picker"><label>当前项目<select value={projectId} onChange={(event) => selectProject(event.target.value)}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label><p>{loading ? "正在加载项目数据…" : `${overview.total} 个未归档任务 · ${projectCommissions.length} 个委托`}</p></div>
+        <div className="project-actions">{!loading && createTaskDialog}{associate}</div>
+      </div>
       <section className="workspace-content" id="workspace-content" tabIndex={-1}>
         {message && <p className="workspace-message" role="status">{message}</p>}
-        {view === "projects" && <ProjectManagementPage projects={projects} projectId={projectId} associate={associate} onSelect={(id) => { setMessage(""); setProjectId(id); }} onManage={openProjectManagement} />}
+        {contentState === "settings" ? settings : contentState === "loading" ? <section className="empty-state">正在加载当前项目…</section> : <>
+        {showOverview && <WorkspaceOverview total={overview.total} completed={overview.completed} running={overview.running} attention={overview.attention} completion={overview.completion} />}
+        {view === "projects" && <ProjectManagementPage projects={projects} projectId={projectId} associate={associate} onSelect={selectProject} onManage={openProjectManagement} />}
         <CommissionWorkspace projectId={projectId} section={view === "requirements" ? "requirements" : "commissions"} hidden={!(["commissions", "requirements"] as View[]).includes(view)} onChanged={() => void refreshProject()} onStageChange={(stage) => setView(stage)} />
-        <DeliveryWorkspace projectId={projectId} tasks={tasks} section={view === "notifications" ? "notifications" : "delivery"} hidden={!(["delivery", "notifications"] as View[]).includes(view)} onChanged={() => { void loadTasks(projectId, setTasks, setMessage); void refreshNotificationCount(); }} />
-        {view === "settings" && settings}
+        <DeliveryWorkspace projectId={projectId} tasks={tasks} section={view === "notifications" ? "notifications" : "delivery"} hidden={!(["delivery", "notifications"] as View[]).includes(view)} onChanged={() => { void loadCurrentProjectTasks(); void refreshNotificationCount(); }} />
         {view === "usage" && <UsageStatisticsWorkspace />}
         {view === "board" && <><div className="filters">
           <div className="view-switch" aria-label="看板显示方式"><button className={boardView === "board" ? "active" : ""} onClick={() => setBoardView("board")}>看板</button><button className={boardView === "list" ? "active" : ""} onClick={() => setBoardView("list")}>列表</button></div>
@@ -493,6 +561,7 @@ export function TaskWorkspace({ settings }: { settings: ReactNode }) {
           <label>委托<select value={filters.commission} onChange={(event) => setFilters({ ...filters, commission: event.target.value })}><option value="">全部</option>{commissions.map((id) => <option key={id} value={id}>{id.slice(0, 8)}</option>)}</select></label>
           <button className="secondary compact" onClick={() => setFilters(EMPTY_FILTERS)}>清除筛选</button>
         </div>{boardView === "board" ? <TaskBoard tasks={tasks} visibleTasks={visibleTasks} commissionTitles={commissionTitles} collapsed={collapsed} manual={sort === "manual"} sensors={sensors} onDragEnd={handleDragEnd} onToggle={toggleCollapsed} onOpen={openTask} /> : <TaskList tasks={visibleTasks} collapsed={collapsed} selected={selected} onToggle={toggleCollapsed} onSelect={setSelected} onArchive={(ids) => archiveTasks(ids)} onUnarchive={unarchiveTask} onOpen={openTask} />}</>}
+        </>}
       </section>
     </div>
     <TaskRunDialog dialog={taskDialog} task={taskDialogTask} tasks={tasks} runs={taskRuns} tokenRuns={taskTokenRuns} eventsByRun={taskRunEvents} busy={taskBusy} message={message} onClose={() => setTaskDialogTask(null)} onOpenTask={openTask} onProperties={(task) => { setPropertyError(""); setPropertyTask(task); }} onArchive={(task) => archiveTasks([task.id])} onUnarchive={unarchiveTask} onAction={taskAction} onSteer={steerRun} onAnswer={answerRunInput} onApprovals={() => { setTaskDialogTask(null); setView("notifications"); }} />
@@ -506,7 +575,7 @@ function ProjectManagementPage({ projects, projectId, associate, onSelect, onMan
     <header className="project-management-header"><div><p className="eyebrow">Projects</p><h2>项目管理</h2><p>切换当前工作项目，或管理本地目录关联。</p></div>{associate}</header>
     {projects.length ? <div className="commission-list">{projects.map((project) => {
       const active = project.id === projectId;
-      return <article className="commission-card" key={project.id}>
+      return <article className="commission-card project-card" key={project.id}>
         <button className="commission-card-main" onClick={() => onSelect(project.id)} aria-current={active ? "true" : undefined}>
           <span className="commission-card-title"><strong>{project.name}</strong>{active && <small>当前项目</small>}</span>
           <span className="commission-summary">{project.path}</span>
@@ -531,10 +600,35 @@ function ProjectManagementDialog({ dialog, project, busy, error, onClose, onSubm
 
 function WorkspaceNav({ view, unreadNotifications, onChange }: { view: View; unreadNotifications: number; onChange(view: View): void }) {
   return <nav className="workspace-nav" aria-label="工作区分页">
+    <div className="workspace-brand"><img src="/brand/openworkshop-logo-64.png" width="32" height="32" alt="" aria-hidden="true" /><strong>OpenWorkshop</strong></div>
     <p>工作区</p>
     {PAGES.map((item) => <button key={item.id} className={view === item.id ? "active" : ""} aria-current={view === item.id ? "page" : undefined} onClick={() => onChange(item.id)}><span>{item.label}</span>{item.id === "notifications" && unreadNotifications > 0 && <span className="notification-badge" aria-label={unreadNotifications + " 条未处理通知"}>{unreadNotifications > 99 ? "99+" : unreadNotifications}</span>}</button>)}
     <button className={`workspace-nav-settings ${view === "settings" ? "active" : ""}`} aria-current={view === "settings" ? "page" : undefined} onClick={() => onChange("settings")}>设置</button>
+    <a className="workspace-nav-github" href="https://github.com/giarld/OpenWorkshop" target="_blank" rel="noreferrer" aria-label="在新标签页打开 OpenWorkshop GitHub 仓库"><img src="/brand/github-mark.svg" width="16" height="16" alt="" aria-hidden="true" /><span>GitHub</span></a>
   </nav>;
+}
+
+function WorkspaceOverview({ total, completed, running, attention, completion }: { total: number; completed: number; running: number; attention: number; completion: number }) {
+  return <section className="workspace-overview" aria-label="当前项目概览">
+    <article className="overview-card">
+      <header><span>任务进度</span><small>{completed} / {total}</small></header>
+      <strong>{completion}<span>%</span></strong>
+      <div className="overview-progress" aria-label={`任务完成度 ${completion}%`}><span style={{ width: `${completion}%` }} /></div>
+      <p>当前项目已完成比例</p>
+    </article>
+    <article className="overview-card">
+      <header><span>Agent 执行</span><small className="overview-live">LIVE</small></header>
+      <strong>{running}</strong>
+      <div className="overview-progress"><span style={{ width: `${total ? Math.min(100, Math.round((running / total) * 100)) : 0}%` }} /></div>
+      <p>{running ? "任务正在排队或执行" : "当前没有活跃 Run"}</p>
+    </article>
+    <article className="overview-card">
+      <header><span>需要关注</span><small className={attention ? "overview-alert" : "overview-clear"}>{attention ? "待处理" : "正常"}</small></header>
+      <strong>{attention}</strong>
+      <div className="overview-progress"><span style={{ width: `${total ? Math.min(100, Math.round((attention / total) * 100)) : 0}%` }} /></div>
+      <p>{attention ? "个任务阻塞或等待人工处理" : "没有阻塞或待处理任务"}</p>
+    </article>
+  </section>;
 }
 
 function TaskBoard({ tasks, visibleTasks, commissionTitles, collapsed, manual, sensors, onDragEnd, onToggle, onOpen }: { tasks: Task[]; visibleTasks: Task[]; commissionTitles: Map<string, string>; collapsed: Set<string>; manual: boolean; sensors: ReturnType<typeof useSensors>; onDragEnd(event: DragEndEvent): void; onToggle(id: string): void; onOpen(task: Task): void }) {
@@ -895,13 +989,6 @@ function focusTask(id: string) {
   element?.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
   element?.classList.add("highlighted");
   window.setTimeout(() => element?.classList.remove("highlighted"), 1800);
-}
-
-async function loadTasks(projectId: string, setTasks: (tasks: Task[]) => void, setMessage: (message: string) => void, setLoading?: (loading: boolean) => void) {
-  setLoading?.(true);
-  try { setTasks(await api<Task[]>(`/api/projects/${projectId}/tasks?includeArchived=true`)); }
-  catch (error) { setMessage((error as Error).message); }
-  finally { setLoading?.(false); }
 }
 
 async function api<T = unknown>(url: string, init?: RequestInit): Promise<T> {

@@ -33,6 +33,7 @@ export type TaskFilters = {
 
 export type TaskSwimlane = { root: Task; tasks: Task[]; done: number; total: number };
 export type TaskSwimlaneGroups = { active: TaskSwimlane[]; archived: TaskSwimlane[] };
+export type WorkspaceOverviewStats = { total: number; completed: number; running: number; attention: number; completion: number };
 
 export function preferredProjectId(projects: Array<{ id: string }>, saved: string | null): string {
   return projects.some((project) => project.id === saved) ? saved! : projects[0]?.id ?? "";
@@ -98,6 +99,20 @@ export function taskSwimlaneGroups(tasks: Task[], visibleTasks: Task[]): TaskSwi
   return {
     active: lanes.filter((lane) => lane.root.status !== "archived"),
     archived: lanes.filter((lane) => lane.root.status === "archived")
+  };
+}
+
+export function workspaceOverviewStats(tasks: Task[]): WorkspaceOverviewStats {
+  const current = tasks.filter((task) => task.status !== "archived");
+  const completed = current.filter((task) => task.status === "done").length;
+  const running = current.filter((task) => ["queued", "preparing", "running"].includes(task.latestRunStatus ?? "")).length;
+  const attention = current.filter((task) => task.status === "blocked" || ["waiting_approval", "waiting_input"].includes(task.latestRunStatus ?? "")).length;
+  return {
+    total: current.length,
+    completed,
+    running,
+    attention,
+    completion: current.length ? Math.round((completed / current.length) * 100) : 0
   };
 }
 

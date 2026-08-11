@@ -43,20 +43,18 @@ export default function Home() {
 
   if (screen === "settings") return <main className="workspace-main">
     <a className="skip-link" href="#workspace-content">跳到主要内容</a>
-    <header className="app-header">
-      <div className="app-title"><div><p className="eyebrow">OpenWorkshop</p><h1>项目工作台</h1></div><AgentIndicators /></div>
-      <div className="header-actions">
-        <button className="secondary" onClick={logout}>退出登录</button>
-      </div>
-    </header>
-    {message && <p className="message" role="status">{message}</p>}
-    <TaskWorkspace settings={<SettingsWorkspace onPinChanged={() => { setMessage("PIN 已修改，所有旧会话均已撤销，请重新登录。"); setScreen("login"); }} />} />
+    <TaskWorkspace
+      header={<header className="app-header">
+        <div className="app-title"><div><p className="eyebrow">项目概览</p><h1>项目工作台</h1><p>管理需求、任务执行与最终交付。</p></div><AgentIndicators /></div>
+      </header>}
+      settings={<SettingsWorkspace onLogout={logout} onPinChanged={() => { setMessage("PIN 已修改，所有旧会话均已撤销，请重新登录。"); setScreen("login"); }} />}
+    />
   </main>;
 
   return (
     <main className="auth-main">
       <section className="panel">
-        <p className="eyebrow">OpenWorkshop</p>
+        <div className="auth-brand"><img className="auth-logo" src="/brand/openworkshop-logo-256.png" width="76" height="76" alt="" aria-hidden="true" /></div>
         {screen === "loading" && <h1>正在连接…</h1>}
         {(screen === "initialize" || screen === "login") && <>
           <h1>{screen === "initialize" ? "设置访问 PIN" : "登录"}</h1>

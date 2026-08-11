@@ -22,7 +22,7 @@ type AgentSettings = { health: { ok: boolean; version?: string; models?: CodexMo
 const ROLE_LABELS: Record<AgentRole, string> = { supervisor: "项目主管 Agent", developer: "执行 Agent", reviewer: "审查 Agent" };
 const ROLE_DESCRIPTIONS: Record<AgentRole, string> = { supervisor: "负责需求澄清、任务规划与执行调度协调。", developer: "负责实现任务与处理返工。", reviewer: "负责独立验证任务结果。" };
 
-export function SettingsWorkspace({ onPinChanged }: { onPinChanged(): void }) {
+export function SettingsWorkspace({ onLogout, onPinChanged }: { onLogout(): void | Promise<void>; onPinChanged(): void }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -124,7 +124,7 @@ export function SettingsWorkspace({ onPinChanged }: { onPinChanged(): void }) {
   return <section className="settings-page" aria-labelledby="settings-title">
     <header className="settings-page-header">
       <div><p className="eyebrow">Workspace Settings</p><h2 id="settings-title">设置</h2></div>
-      <p>按影响范围管理工作台、项目执行与访问安全。</p>
+      <div className="settings-page-header-actions"><p>按影响范围管理工作台、项目执行与访问安全。</p><button type="button" className="secondary" onClick={() => void onLogout()}>退出登录</button></div>
     </header>
 
     {!settings ? <section className="settings-loading">{message || "正在加载设置…"}</section> : <>
