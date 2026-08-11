@@ -42,6 +42,18 @@ test("task trigger creates the right grant and promotes only its authorized clos
   } finally { await server.close(); await fixture.close(); }
 });
 
+test("rejects execution grants for archived projects or disabled roots", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    const task = fixture.task("lifecycle-guard", fixture.main, "todo");
+    fixture.database.prepare("UPDATE root_paths SET enabled = 0").run();
+    assert.throws(() => createExecutionGrant(fixture.database, task), /root is disabled/);
+    fixture.database.prepare("UPDATE root_paths SET enabled = 1").run();
+    fixture.database.prepare("UPDATE projects SET archived_at = ? WHERE id = ?").run(new Date().toISOString(), fixture.project);
+    assert.throws(() => createExecutionGrant(fixture.database, task), /Project is archived/);
+  } finally { await fixture.close(); }
+});
+
 test("main task trigger schedules runnable children and marks the main task in progress", async () => {
   const fixture = await schedulerFixture();
   try {

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { APPROVAL_POLICIES, COMMAND_APPROVAL_POLICY, COMMAND_SANDBOX_MODE, SANDBOX_MODES, codexAppServerArgs, createRunContext, recoverRunContexts, validateCustomArgs, type ApprovalPolicy, type CodexAppServer, type CodexAppServerOptions, type CodexRunHandle, type NormalizedCodexEvent, type SandboxMode } from "./codex.ts";
+import { APPROVAL_POLICIES, COMMAND_APPROVAL_POLICY, COMMAND_SANDBOX_MODE, SANDBOX_MODES, CodexAppServerClosedError, codexAppServerArgs, createRunContext, recoverRunContexts, validateCustomArgs, type ApprovalPolicy, type CodexAppServer, type CodexAppServerOptions, type CodexRunHandle, type NormalizedCodexEvent, type SandboxMode } from "./codex.ts";
 import type { AgentMentionHandler } from "./comments.ts";
 import { SettingsStore } from "./database.ts";
 import { notify } from "./notifications.ts";
@@ -90,6 +90,7 @@ export class CodexRunController {
   private readonly hub: EventHub;
   private readonly launch: RunClientLauncher;
   private readonly onTerminal: (runId: string) => Promise<void>;
+  private closing = false;
 
   constructor(database: DatabaseSync, hub: EventHub, launch: RunClientLauncher, onTerminal: (runId: string) => Promise<void> = async () => undefined) {
     this.database = database;
@@ -124,8 +125,9 @@ export class CodexRunController {
       FROM tasks
       JOIN commissions ON commissions.id = tasks.commission_id
       JOIN projects ON projects.id = commissions.project_id
+      JOIN root_paths ON root_paths.id = projects.root_path_id
       JOIN requirement_versions AS requirement ON requirement.id = commissions.active_requirement_version_id
-      WHERE tasks.id = ? AND tasks.archived_at IS NULL AND projects.archived_at IS NULL
+      WHERE tasks.id = ? AND tasks.archived_at IS NULL AND projects.archived_at IS NULL AND root_paths.enabled = 1
     `).get(run.task_id) as TaskContext | undefined;
     if (!task) throw notFound("Task not found");
     const contextFiles = runContextFiles(this.database, run, task);
@@ -208,6 +210,7 @@ export class CodexRunController {
   }
 
   async close(): Promise<void> {
+    this.closing = true;
     await Promise.allSettled([...this.active.keys()].map((runId) => this.release(runId)));
     await Promise.allSettled([...this.pendingCompletions]);
   }
@@ -291,6 +294,10 @@ export class CodexRunController {
   }
 
   private async fail(runId: string, error: unknown): Promise<void> {
+    if (this.closing || error instanceof CodexAppServerClosedError) {
+      await this.release(runId);
+      return;
+    }
     const summary = error instanceof Error ? error.message : String(error);
     this.database.prepare("UPDATE runs SET status = 'failed', finished_at = ?, failure_summary = ? WHERE id = ?").run(new Date().toISOString(), summary, runId);
     appendRunEvent(this.database, this.hub, runId, "run.status", "Run failed", { status: "failed", summary });

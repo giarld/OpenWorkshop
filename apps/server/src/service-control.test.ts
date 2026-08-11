@@ -28,3 +28,21 @@ test("starts a detached service and observes when it stops", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("ignores dead or incomplete stale locks but waits for an active owner", async () => {
+  const root = await mkdtemp(join(tmpdir(), "workshop-stale-stop-"));
+  const lock = join(root, "runtime", "workshop.lock");
+  try {
+    await mkdir(lock, { recursive: true });
+    await writeFile(join(lock, "owner"), "2147483647\nstale-token\n");
+    await waitForServiceStop(root, 100, () => false);
+
+    await writeFile(join(lock, "owner"), `${process.pid}\nactive-token\n`);
+    await assert.rejects(waitForServiceStop(root, 100, (pid) => pid === process.pid), /Timed out waiting/);
+
+    await rm(join(lock, "owner"));
+    await waitForServiceStop(root, 100, () => true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -9,6 +9,7 @@ import {
   codexAppServerArgs,
   checkCodexHealth,
   CodexAppServer,
+  CodexAppServerClosedError,
   createRunContext,
   recoverRunContexts,
   normalizeCodexEvent,
@@ -189,6 +190,17 @@ test("reports health and fails pending RPC calls when the child exits", async ()
   const crashed = launch({ crash: true });
   await assert.rejects(crashed.initialize(), /exited unexpectedly/);
   await crashed.close();
+});
+
+test("distinguishes an expected host close from an unexpected App Server exit", async () => {
+  const events: NormalizedCodexEvent[] = [];
+  const client = launch({ onEvent: (event) => events.push(event) });
+  await client.initialize();
+  const run = await client.startRun({ cwd: process.cwd(), prompt: "Keep running" });
+  const completion = run.completed.catch((error: unknown) => error);
+  await client.close();
+  assert.ok(await completion instanceof CodexAppServerClosedError);
+  assert.equal(events.find((event) => event.type === "process.exited")?.payload.expected, true);
 });
 
 test("reports spawn errors without crashing the host process", async () => {

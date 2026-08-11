@@ -8,6 +8,7 @@ import type { FastifyInstance } from "fastify";
 
 const runFile = promisify(execFile);
 const SCAN_IGNORES = new Set([".git", ".svn", ".openworkshop", "node_modules", "vendor", "dist", "build", "target", ".cache"]);
+const RESERVED_RUN_STATUSES = ["queued", "preparing", "running", "waiting_approval", "waiting_input"] as const;
 const BUILD_HINTS: Record<string, string[]> = {
   "CMakeLists.txt": ["cmake -S . -B build", "cmake --build build"],
   Makefile: ["make"],
@@ -198,8 +199,16 @@ export function registerProjectRoutes(server: FastifyInstance, database: Databas
     const projects = database.prepare("SELECT real_path FROM projects WHERE root_path_id = ? AND archived_at IS NULL").all(current.id) as Array<{ real_path: string }>;
     if (projects.some((project) => !isWithinRoot(realPath, project.real_path))) throw conflict("The new root would exclude an associated project");
     const enabled = request.body?.enabled === undefined ? current.enabled : request.body.enabled === true ? 1 : request.body.enabled === false ? 0 : (() => { throw badRequest("enabled must be boolean"); })();
-    database.prepare("UPDATE root_paths SET path = ?, real_path = ?, enabled = ?, updated_at = ? WHERE id = ?")
-      .run(resolve(path), realPath, enabled, new Date().toISOString(), current.id);
+    transaction(database, () => {
+      const lockedCurrent = rootById(database, current.id);
+      if (lockedCurrent.enabled && !enabled) assertNoReservedRuns(database, "project.root_path_id = ?", current.id, "Root has reserved Runs and cannot be disabled");
+      const now = new Date().toISOString();
+      database.prepare("UPDATE root_paths SET path = ?, real_path = ?, enabled = ?, updated_at = ? WHERE id = ?")
+        .run(resolve(path), realPath, enabled, now, current.id);
+      if (!enabled) database.prepare(`UPDATE execution_grants SET status = 'revoked', revoked_at = ? WHERE status = 'active' AND commission_id IN (
+        SELECT commission.id FROM commissions AS commission JOIN projects AS project ON project.id = commission.project_id WHERE project.root_path_id = ?
+      )`).run(now, current.id);
+    });
     return rootById(database, current.id);
   });
 
@@ -255,10 +264,35 @@ export function registerProjectRoutes(server: FastifyInstance, database: Databas
 
   server.post<{ Params: { id: string } }>("/api/projects/:id/archive", async (request) => {
     const project = activeProjectById(database, request.params.id);
-    const now = new Date().toISOString();
-    database.prepare("UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?").run(now, now, project.id);
+    transaction(database, () => {
+      assertNoReservedRuns(database, "project.id = ?", project.id, "Project has reserved Runs and cannot be archived");
+      const now = new Date().toISOString();
+      database.prepare("UPDATE projects SET archived_at = ?, updated_at = ? WHERE id = ?").run(now, now, project.id);
+      database.prepare(`UPDATE execution_grants SET status = 'revoked', revoked_at = ? WHERE status = 'active' AND commission_id IN (
+        SELECT id FROM commissions WHERE project_id = ?
+      )`).run(now, project.id);
+    });
     return projectById(database, project.id);
   });
+}
+
+function assertNoReservedRuns(database: DatabaseSync, projectPredicate: string, value: string, message: string): void {
+  const placeholders = RESERVED_RUN_STATUSES.map(() => "?").join(", ");
+  const reserved = database.prepare(`SELECT 1 FROM runs AS run JOIN projects AS project ON project.id = run.project_id
+    WHERE ${projectPredicate} AND run.status IN (${placeholders}) LIMIT 1`).get(value, ...RESERVED_RUN_STATUSES);
+  if (reserved) throw conflict(message);
+}
+
+function transaction<T>(database: DatabaseSync, action: () => T): T {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const result = action();
+    database.exec("COMMIT");
+    return result;
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 async function execute(file: string, args: string[], cwd: string): Promise<string> {

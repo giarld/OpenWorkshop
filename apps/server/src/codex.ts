@@ -81,6 +81,13 @@ export type CodexAppServerOptions = {
 type PendingRequest = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
 type TurnWaiter = { resolve: (event: NormalizedCodexEvent) => void; reject: (error: Error) => void };
 
+export class CodexAppServerClosedError extends Error {
+  constructor() {
+    super("Codex App Server closed by the host");
+    this.name = "CodexAppServerClosedError";
+  }
+}
+
 export class CodexAppServer {
   private readonly process: ChildProcessWithoutNullStreams;
   private readonly options: CodexAppServerOptions;
@@ -91,6 +98,7 @@ export class CodexAppServer {
   private readonly threadModels = new Map<string, string>();
   private readonly requestTimeoutMs: number;
   private exited = false;
+  private closing = false;
 
   private constructor(process: ChildProcessWithoutNullStreams, options: CodexAppServerOptions) {
     this.process = process;
@@ -99,7 +107,7 @@ export class CodexAppServer {
     createInterface({ input: process.stdout }).on("line", (line) => this.receive(line));
     process.stderr.resume();
     process.once("error", (error) => this.finish(error, "process/error", {}));
-    process.once("exit", (code, signal) => this.finish(new Error(`Codex App Server exited unexpectedly (${signal ?? code ?? "unknown"})`), "process/exit", { code, signal }));
+    process.once("exit", (code, signal) => this.finish(this.closing ? new CodexAppServerClosedError() : new Error(`Codex App Server exited unexpectedly (${signal ?? code ?? "unknown"})`), "process/exit", { code, signal, expected: this.closing }));
   }
 
   static launch(options: CodexAppServerOptions = {}): CodexAppServer {
@@ -187,6 +195,7 @@ export class CodexAppServer {
 
   async close(): Promise<void> {
     if (this.exited) return;
+    this.closing = true;
     this.process.stdin.end();
     this.process.kill();
     await new Promise<void>((resolve) => this.process.once("exit", () => resolve()));

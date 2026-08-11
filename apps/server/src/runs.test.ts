@@ -321,6 +321,38 @@ test("expires resolved input requests and validates their exact question set", a
   }
 });
 
+test("keeps an active Run recoverable when the controller closes normally", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-run-shutdown-"));
+  const database = await openWorkshopDatabase(home);
+  const { taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  let rejectCompletion!: (error: Error) => void;
+  const completed = new Promise<NormalizedCodexEvent>((_resolve, reject) => { rejectCompletion = reject; });
+  const terminal: string[] = [];
+  const controller = new CodexRunController(database, new EventHub(), () => ({
+    initialize: async () => undefined,
+    startRun: async () => ({ threadId: "thread-shutdown", turnId: "turn-shutdown", completed }),
+    steer: async () => undefined,
+    interrupt: async () => undefined,
+    close: async () => { rejectCompletion(new Error("closed by test host")); }
+  }), async (id) => { terminal.push(id); });
+  try {
+    await controller.start(runId, home);
+    await controller.close();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const run = database.prepare("SELECT status, finished_at, failure_summary FROM runs WHERE id = ?").get(runId) as { status: string; finished_at: string | null; failure_summary: string | null };
+    assert.equal(run.status, "running");
+    assert.equal(run.finished_at, null);
+    assert.equal(run.failure_summary, null);
+    assert.deepEqual(terminal, []);
+  } finally {
+    await controller.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 async function runFixture(overrides: Partial<RunController> = {}) {
   const home = await mkdtemp(join(tmpdir(), "project-workshop-runs-"));
   const database = await openWorkshopDatabase(home);

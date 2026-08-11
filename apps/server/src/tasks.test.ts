@@ -203,10 +203,15 @@ test("human waiver advances the commission to main-task acceptance", async () =>
   try {
     const response = await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: {
       mainTask: { title: "Main", acceptanceCriteria: ["Human approval"] },
-      tasks: [{ clientId: "T1", parentClientId: null, title: "Child", acceptanceCriteria: ["Reviewed"], dependsOn: [] }]
+      tasks: [
+        { clientId: "T1", parentClientId: null, title: "Child", acceptanceCriteria: ["Reviewed"], dependsOn: [] },
+        { clientId: "T2", parentClientId: null, title: "Archived child", acceptanceCriteria: ["Historical"], dependsOn: [] }
+      ]
     } });
     const plan = response.json() as { mainTask: { id: string }; tasks: Array<{ id: string }> };
     fixture.database.prepare("UPDATE commissions SET status = 'active' WHERE id = ?").run(fixture.commissionA);
+    fixture.database.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(plan.tasks[1]!.id);
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[1]!.id}/archive` })).statusCode, 200);
     const waived = await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[0]!.id}/waive`, payload: { reason: "Verified externally" } });
     assert.equal(waived.statusCode, 200);
     assert.equal(waived.json().human_waiver_reason, "Verified externally");
@@ -218,6 +223,7 @@ test("human waiver advances the commission to main-task acceptance", async () =>
     assert.equal(acceptance.statusCode, 200);
     assert.equal(acceptance.json().evidence[0].status, "waived");
     assert.match(acceptance.json().deliveryDocument.contentMarkdown, /## 变更摘要[\s\S]*## 文件清单[\s\S]*## 已知风险[\s\S]*## 未完成项[\s\S]*## 人工操作/);
+    assert.doesNotMatch(acceptance.json().deliveryDocument.contentMarkdown, /Archived child/);
     const rejected = await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.mainTask.id}/reject`, payload: { reason: "补充交付说明" } });
     assert.equal(rejected.statusCode, 200);
     assert.equal((fixture.database.prepare("SELECT status FROM tasks WHERE id = ?").get(plan.tasks[0]!.id) as { status: string }).status, "todo");

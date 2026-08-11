@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -108,6 +109,22 @@ test("associates and archives a project without deleting its record", async () =
     assert.equal(projectResponse.statusCode, 201);
     const associated = projectResponse.json() as { id: string; vcs_type: string };
     assert.equal(associated.vcs_type, "none");
+
+    const now = new Date().toISOString();
+    const commission = randomUUID(), requirement = randomUUID(), task = randomUUID(), grant = randomUUID(), run = randomUUID();
+    database.prepare("INSERT INTO commissions (id, project_id, title, status, created_at, updated_at) VALUES (?, ?, 'Commission', 'planned', ?, ?)").run(commission, associated.id, now, now);
+    database.prepare("INSERT INTO requirement_versions (id, commission_id, version_no, content_markdown, acceptance_json, status, created_by, created_at, approved_at) VALUES (?, ?, 1, 'Requirement', '[]', 'approved', 'human', ?, ?)").run(requirement, commission, now, now);
+    database.prepare("UPDATE commissions SET active_requirement_version_id = ?, status = 'active' WHERE id = ?").run(requirement, commission);
+    database.prepare("INSERT INTO tasks (id, commission_id, number_path, position, title, description, status, priority, owner_type, acceptance_json, review_round_limit, review_round_used, created_at, updated_at) VALUES (?, ?, '1', 0, 'Task', '', 'todo', 'medium', 'ai', '[]', 2, 0, ?, ?)").run(task, commission, now, now);
+    database.prepare("UPDATE commissions SET main_task_id = ? WHERE id = ?").run(task, commission);
+    database.prepare("INSERT INTO execution_grants (id, commission_id, root_task_id, scope, status, created_at) VALUES (?, ?, ?, 'commission_tree', 'active', ?)").run(grant, commission, task, now);
+    database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, execution_grant_id, status, attempt_no, config_snapshot_json, context_snapshot_json) VALUES (?, ?, ?, ?, 'developer', 'manual', ?, 'queued', 1, '{}', '{}')").run(run, associated.id, commission, task, grant);
+    assert.equal((await server.inject({ method: "PUT", url: `/api/roots/${root.id}`, payload: { enabled: false } })).statusCode, 409);
+    assert.equal((await server.inject({ method: "POST", url: `/api/projects/${associated.id}/archive` })).statusCode, 409);
+    database.prepare("UPDATE runs SET status = 'cancelled' WHERE id = ?").run(run);
+    assert.equal((await server.inject({ method: "PUT", url: `/api/roots/${root.id}`, payload: { enabled: false } })).statusCode, 200);
+    assert.equal((database.prepare("SELECT status FROM execution_grants WHERE id = ?").get(grant) as { status: string }).status, "revoked");
+    assert.equal((await server.inject({ method: "PUT", url: `/api/roots/${root.id}`, payload: { enabled: true } })).statusCode, 200);
     const archivedResponse = await server.inject({ method: "POST", url: `/api/projects/${associated.id}/archive` });
     assert.equal(archivedResponse.statusCode, 200);
     assert.ok((archivedResponse.json() as { archived_at: string | null }).archived_at);

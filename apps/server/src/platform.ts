@@ -35,22 +35,25 @@ export async function acquireInstanceLock(root: string, isAlive: (pid: number) =
   };
 }
 
+export async function instanceLockIsActive(root: string, isAlive: (pid: number) => boolean = processIsAlive): Promise<boolean> {
+  const lockPath = join(root, "runtime", "workshop.lock");
+  const owner = await readLockOwner(lockPath);
+  return owner ? isAlive(owner.pid) : false;
+}
+
 async function createLockDirectory(lockPath: string, recoveryPath: string, root: string, isAlive: (pid: number) => boolean, ownerToken: string): Promise<void> {
   await clearStaleRecovery(recoveryPath, root, isAlive);
-  try {
-    await mkdir(lockPath, { mode: 0o700 });
-    if (await pathExists(recoveryPath)) {
-      await rm(lockPath, { recursive: true, force: true });
-      throw new Error(`OpenWorkshop is recovering an instance lock for ${root}`);
-    }
-    await writeFile(join(lockPath, "owner"), `${process.pid}\n${ownerToken}\n`, { flag: "wx", mode: 0o600 });
-    return;
-  } catch (error) {
-    if (!isFileExistsError(error)) throw error;
-  }
+  if (await installOwnedLock(lockPath, recoveryPath, root, ownerToken)) return;
 
-  const observed = await readLockOwner(lockPath);
-  if (!observed || isAlive(observed.pid)) throw new Error(`OpenWorkshop is already using ${root}`);
+  let observed = await readLockOwner(lockPath);
+  let lockExists = await pathExists(lockPath);
+  if (!lockExists) {
+    if (await installOwnedLock(lockPath, recoveryPath, root, ownerToken)) return;
+    observed = await readLockOwner(lockPath);
+    lockExists = await pathExists(lockPath);
+  }
+  if (observed && isAlive(observed.pid)) throw new Error(`OpenWorkshop is already using ${root}`);
+  if (!observed && !lockExists) throw new Error(`OpenWorkshop could not observe the competing instance lock for ${root}`);
 
   const recoveryToken = randomUUID();
   await acquireRecoveryClaim(recoveryPath, root, isAlive, recoveryToken);
@@ -59,15 +62,41 @@ async function createLockDirectory(lockPath: string, recoveryPath: string, root:
     const recoveryOwner = await readLockOwner(recoveryPath);
     if (recoveryOwner?.token !== recoveryToken) throw new Error(`OpenWorkshop lost its instance lock recovery claim for ${root}`);
     const claimed = await readLockOwner(lockPath);
-    if (!claimed || claimed.pid !== observed.pid || claimed.token !== observed.token || isAlive(claimed.pid)) {
-      throw new Error(`OpenWorkshop is already using ${root}`);
-    }
-    await rm(lockPath, { recursive: true, force: true });
-    await mkdir(lockPath, { mode: 0o700 });
-    await writeFile(join(lockPath, "owner"), `${process.pid}\n${ownerToken}\n`, { flag: "wx", mode: 0o600 });
+    const claimedExists = await pathExists(lockPath);
+    if (observed && (!claimed || claimed.pid !== observed.pid || claimed.token !== observed.token || isAlive(claimed.pid))) throw new Error(`OpenWorkshop is already using ${root}`);
+    if (!observed && (claimed || !claimedExists)) throw new Error(`OpenWorkshop is already using ${root}`);
+    if (claimedExists) await rm(lockPath, { recursive: true, force: true });
+    if (!await installOwnedLock(lockPath, recoveryPath, root, ownerToken, recoveryToken)) throw new Error(`OpenWorkshop is already using ${root}`);
   } finally {
     const recoveryOwner = await readLockOwner(recoveryPath);
     if (recoveryOwner?.token === recoveryToken) await rm(recoveryPath, { recursive: true, force: true });
+  }
+}
+
+async function installOwnedLock(lockPath: string, recoveryPath: string, root: string, ownerToken: string, recoveryToken?: string): Promise<boolean> {
+  const temporaryPath = `${lockPath}.${ownerToken}.tmp`;
+  await mkdir(temporaryPath, { mode: 0o700 });
+  try {
+    await writeFile(join(temporaryPath, "owner"), `${process.pid}\n${ownerToken}\n`, { flag: "wx", mode: 0o600 });
+    if (recoveryToken) {
+      if ((await readLockOwner(recoveryPath))?.token !== recoveryToken) throw new Error(`OpenWorkshop lost its instance lock recovery claim for ${root}`);
+    } else if (await pathExists(recoveryPath)) {
+      throw new Error(`OpenWorkshop is recovering an instance lock for ${root}`);
+    }
+    try {
+      await rename(temporaryPath, lockPath);
+    } catch (error) {
+      if (isFileExistsError(error) || hasCode(error, "ENOTEMPTY") || (hasCode(error, "EPERM") && await pathExists(lockPath))) return false;
+      throw error;
+    }
+    const recoveryOwner = await readLockOwner(recoveryPath);
+    const recoveryConflict = recoveryToken ? recoveryOwner?.token !== recoveryToken : Boolean(recoveryOwner || await pathExists(recoveryPath));
+    if (!recoveryConflict) return true;
+    const installedOwner = await readLockOwner(lockPath);
+    if (installedOwner?.token === ownerToken) await rm(lockPath, { recursive: true, force: true });
+    throw new Error(recoveryToken ? `OpenWorkshop lost its instance lock recovery claim for ${root}` : `OpenWorkshop is recovering an instance lock for ${root}`);
+  } finally {
+    await rm(temporaryPath, { recursive: true, force: true });
   }
 }
 

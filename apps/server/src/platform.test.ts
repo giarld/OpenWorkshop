@@ -51,6 +51,20 @@ test("recovers a stale or incomplete instance-lock recovery claim", async () => 
   }
 });
 
+test("recovers an incomplete main lock without an owner", async () => {
+  const root = await mkdtemp(join(tmpdir(), "project-workshop-incomplete-lock-"));
+  try {
+    await prepareWorkshopHome(root);
+    const lockPath = join(root, "runtime", "workshop.lock");
+    await mkdir(lockPath);
+    const release = await acquireInstanceLock(root, (pid) => pid === process.pid);
+    assert.equal((await readFile(join(lockPath, "owner"), "utf8")).split(/\r?\n/, 1)[0], String(process.pid));
+    await release();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("uses portable runtime control files and prunes expired logs", async () => {
   const root = await mkdtemp(join(tmpdir(), "project-workshop-runtime-"));
   try {

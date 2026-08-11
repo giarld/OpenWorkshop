@@ -233,7 +233,9 @@ export class Scheduler {
   }
 
   private async prepareWorkspace(run: RunRow): Promise<{ plan: WorkspacePlan } | undefined> {
-    const project = this.database.prepare("SELECT real_path, vcs_type FROM projects WHERE id = ? AND archived_at IS NULL").get(run.project_id) as { real_path: string; vcs_type: VcsInfo["type"] } | undefined;
+    const project = this.database.prepare(`SELECT project.real_path, project.vcs_type FROM projects AS project
+      JOIN root_paths AS root ON root.id = project.root_path_id
+      WHERE project.id = ? AND project.archived_at IS NULL AND root.enabled = 1`).get(run.project_id) as { real_path: string; vcs_type: VcsInfo["type"] } | undefined;
     const task = this.database.prepare("SELECT read_only FROM tasks WHERE id = ? AND archived_at IS NULL").get(run.task_id) as { read_only: number } | undefined;
     if (!project || !task) throw new Error("Reserved Run lost its project or task");
     const continued = await this.continueWorkspace(run, project.real_path);
@@ -316,10 +318,16 @@ export function createExecutionGrant(database: DatabaseSync, taskId: string): Gr
 }
 
 function createExecutionGrantUnsafe(database: DatabaseSync, taskId: string): GrantRow {
-    const task = database.prepare(`SELECT task.id, task.commission_id, commission.main_task_id, commission.project_id, commission.status
-      FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id
-      WHERE task.id = ? AND task.archived_at IS NULL AND commission.archived_at IS NULL`).get(taskId) as { id: string; commission_id: string; main_task_id: string | null; project_id: string; status: string } | undefined;
+    const task = database.prepare(`SELECT task.id, task.commission_id, commission.main_task_id, commission.project_id, commission.status,
+        project.archived_at AS project_archived_at, root.enabled AS root_enabled
+      FROM tasks AS task
+      JOIN commissions AS commission ON commission.id = task.commission_id
+      JOIN projects AS project ON project.id = commission.project_id
+      JOIN root_paths AS root ON root.id = project.root_path_id
+      WHERE task.id = ? AND task.archived_at IS NULL AND commission.archived_at IS NULL`).get(taskId) as { id: string; commission_id: string; main_task_id: string | null; project_id: string; status: string; project_archived_at: string | null; root_enabled: number } | undefined;
     if (!task) throw new Error("Task not found");
+    if (task.project_archived_at) throw conflict("Project is archived");
+    if (!task.root_enabled) throw conflict("Project root is disabled");
     if (database.prepare("SELECT 1 FROM commissions WHERE project_id = ? AND status = 'active' AND id <> ?").get(task.project_id, task.commission_id)) throw conflict("Project already has another active commission");
     if (database.prepare(`SELECT 1 FROM runs WHERE commission_id = ? AND status IN (${RESERVED_RUN_STATUSES.map(() => "?").join(", ")}) LIMIT 1`).get(task.commission_id, ...RESERVED_RUN_STATUSES)) throw conflict("Commission already has reserved Runs");
     if (["draft", "clarifying", "awaiting_requirement_approval", "awaiting_acceptance", "done", "archived"].includes(task.status)) throw conflict("Commission cannot be executed");
@@ -347,7 +355,10 @@ export function coveredTaskIds(database: DatabaseSync, grantId: string): string[
 export function runnableTasks(database: DatabaseSync, grantId: string, globalLimit = setting(database, "globalConcurrency", 4), projectLimit = setting(database, "projectConcurrency", 2)): RunnableTask[] {
   const grant = grantById(database, grantId);
   if (grant.status !== "active") return [];
-  const commission = database.prepare("SELECT project_id, status FROM commissions WHERE id = ?").get(grant.commission_id) as { project_id: string; status: string } | undefined;
+  const commission = database.prepare(`SELECT commission.project_id, commission.status FROM commissions AS commission
+    JOIN projects AS project ON project.id = commission.project_id
+    JOIN root_paths AS root ON root.id = project.root_path_id
+    WHERE commission.id = ? AND commission.archived_at IS NULL AND project.archived_at IS NULL AND root.enabled = 1`).get(grant.commission_id) as { project_id: string; status: string } | undefined;
   if (!commission || commission.status !== "active") return [];
   if (grant.scope === "target_closure" && (database.prepare("SELECT status FROM tasks WHERE id = ?").get(grant.root_task_id) as { status: string }).status === "done") {
     database.prepare("UPDATE execution_grants SET status = 'exhausted' WHERE id = ?").run(grant.id); return [];
@@ -535,7 +546,10 @@ function reviewComment(review: ReviewResult): string {
 
 function canStartRun(database: DatabaseSync, run: RunRow): boolean {
   if (!run.execution_grant_id || grantById(database, run.execution_grant_id).status !== "active") return false;
-  if (!database.prepare("SELECT 1 FROM commissions WHERE id = ? AND status = 'active'").get(run.commission_id)) return false;
+  if (!database.prepare(`SELECT 1 FROM commissions AS commission
+    JOIN projects AS project ON project.id = commission.project_id
+    JOIN root_paths AS root ON root.id = project.root_path_id
+    WHERE commission.id = ? AND commission.status = 'active' AND commission.archived_at IS NULL AND project.archived_at IS NULL AND root.enabled = 1`).get(run.commission_id)) return false;
   const taskStatus = run.trigger_type === "review" || run.trigger_type === "rework" ? "in_progress" : "todo";
   if (!database.prepare("SELECT 1 FROM tasks WHERE id = ? AND status = ? AND archived_at IS NULL").get(run.task_id, taskStatus)) return false;
   if (database.prepare("SELECT 1 FROM task_dependencies AS dependency JOIN tasks AS required ON required.id = dependency.depends_on_task_id WHERE dependency.task_id = ? AND required.status <> 'done' LIMIT 1").get(run.task_id)) return false;

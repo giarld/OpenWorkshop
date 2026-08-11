@@ -1,8 +1,6 @@
 import { spawn } from "node:child_process";
-import { access } from "node:fs/promises";
-import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { readRuntimeState, type RuntimeState } from "./platform.ts";
+import { instanceLockIsActive, readRuntimeState, type RuntimeState } from "./platform.ts";
 
 export async function startBackgroundService(root: string, cliPath: string | undefined, host: string, port: number, timeoutMs = 10_000): Promise<RuntimeState> {
   const current = await readRuntimeState(root);
@@ -30,13 +28,10 @@ export async function startBackgroundService(root: string, cliPath: string | und
   throw new Error("Timed out waiting for OpenWorkshop to start; run workshop start --foreground for details");
 }
 
-export async function waitForServiceStop(root: string, timeoutMs = 10_000): Promise<void> {
+export async function waitForServiceStop(root: string, timeoutMs = 10_000, isAlive?: (pid: number) => boolean): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const locked = await access(join(root, "runtime", "workshop.lock")).then(() => true, (error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT") return false;
-      throw error;
-    });
+    const locked = await instanceLockIsActive(root, isAlive);
     if (!await readRuntimeState(root) && !locked) return;
     await delay(50);
   }
