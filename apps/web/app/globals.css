@@ -74,9 +74,11 @@ aside { padding: .8rem 1rem; border-left: .25rem solid #c47a2c; background: #fff
 .workspace-nav { position: sticky; z-index: 10; top: 0; height: 100vh; min-height: 36rem; display: flex; flex-direction: column; gap: .18rem; padding: 1.25rem .85rem 1rem; border-right: 1px solid var(--line); background: var(--sidebar); }
 .workspace-brand { display: flex; align-items: center; gap: .65rem; min-height: 2.7rem; margin-bottom: 1rem; padding: 0 .35rem; color: var(--ink); }
 .workspace-brand > img { width: 2rem; height: 2rem; flex: 0 0 auto; display: block; object-fit: contain; filter: drop-shadow(0 .2rem .35rem #1e3b6b1c); }
-.workspace-brand strong { overflow: hidden; font-size: .82rem; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-brand-title { min-width: 0; display: flex; align-items: flex-end; gap: .42rem; }
+.workspace-brand strong { min-width: 0; overflow: hidden; font-size: 1.07rem; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-brand small { flex: 0 0 auto; color: #8a877f; font-size: .66rem; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .workspace-nav > p { padding: .4rem .65rem; color: #8a877f; font-size: .61rem; font-weight: 900; letter-spacing: .12em; text-transform: uppercase; }
-.workspace-nav button, .workspace-nav-github { min-height: 2.35rem; display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .5rem .65rem; border-left: .16rem solid transparent; border-radius: .15rem; background: transparent; color: #6d6a63; font-size: .74rem; text-align: left; text-decoration: none; transition: background .15s, color .15s, border-color .15s; }
+.workspace-nav button, .workspace-nav-github { min-height: 2.35rem; display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .5rem .65rem; border-left: .16rem solid transparent; border-radius: .15rem; background: transparent; color: #6d6a63; font-size: .865rem; text-align: left; text-decoration: none; transition: background .15s, color .15s, border-color .15s; }
 .workspace-nav button:hover, .workspace-nav-github:hover { background: #f3f0e9; color: var(--ink); }
 .workspace-nav button.active { border-left-color: var(--accent); background: var(--accent-soft); color: #711024; }
 .workspace-nav .workspace-nav-settings { margin-top: 0; }

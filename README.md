@@ -79,6 +79,17 @@ OpenWorkshop 将现有本地代码库、固定角色 Codex Agent 和人工决策
 
 ### 安装与启动
 
+推荐直接从 npm 全局安装：
+
+```bash
+npm install -g openworkshop
+workshop skill install --agent codex
+workshop start
+workshop gui
+```
+
+也可以从源码安装并链接 CLI：
+
 ```bash
 npm install
 npm run build
@@ -88,7 +99,7 @@ workshop start
 workshop gui
 ```
 
-`npm link --workspace @workshop/server` 会将当前 Workspace 中的 CLI 链接为全局 `workshop` 命令。`workshop skill install --agent codex` 将配套 Skill 安装到 Codex 的个人 Skill 目录 `$HOME/.agents/skills/workshop`；省略 `--agent` 时默认使用 `codex`，已有同名目录时不会覆盖，可增加 `--force` 更新。安装后可在 Codex 中显式调用 `$workshop`，匹配 Workshop 工作流的任务也可以自动触发它。`start` 默认在后台启动服务并监听 `http://127.0.0.1:8787`；`gui` 使用系统默认浏览器打开工作台。首次访问时按照页面提示设置 6 位 PIN，然后配置允许访问的项目根目录。
+`npm install -g openworkshop` 会全局安装 `workshop` 命令；从源码安装时，`npm link --workspace @workshop/server` 会将当前 Workspace 中的 CLI 链接为同名全局命令。`workshop skill install --agent codex` 将配套 Skill 安装到 Codex 的个人 Skill 目录 `$HOME/.agents/skills/workshop`；省略 `--agent` 时默认使用 `codex`，已有同名目录时不会覆盖，可增加 `--force` 更新。安装后可在 Codex 中显式调用 `$workshop`，匹配 Workshop 工作流的任务也可以自动触发它。`start` 默认在后台启动服务并监听 `http://127.0.0.1:8787`；`gui` 使用系统默认浏览器打开工作台。首次访问时按照页面提示设置 6 位 PIN，然后配置允许访问的项目根目录。
 
 前台运行或允许局域网访问：
 

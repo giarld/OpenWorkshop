@@ -15,6 +15,7 @@ import { SortableContext, sortableKeyboardCoordinates, useSortable, verticalList
 import { CSS } from "@dnd-kit/utilities";
 import { Children, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
+import webPackage from "../package.json";
 import { AVATAR_SETTINGS_EVENT, DEFAULT_AVATARS, avatarSettings, isImageAvatar, type AvatarSettings } from "./avatar-settings";
 import { DeliveryWorkspace } from "./delivery-workspace";
 import { CommissionWorkspace } from "./commission-workspace";
@@ -600,7 +601,7 @@ function ProjectManagementDialog({ dialog, project, busy, error, onClose, onSubm
 
 function WorkspaceNav({ view, unreadNotifications, onChange }: { view: View; unreadNotifications: number; onChange(view: View): void }) {
   return <nav className="workspace-nav" aria-label="工作区分页">
-    <div className="workspace-brand"><img src="/brand/openworkshop-logo-64.png" width="32" height="32" alt="" aria-hidden="true" /><strong>OpenWorkshop</strong></div>
+    <div className="workspace-brand"><img src="/brand/openworkshop-logo-64.png" width="32" height="32" alt="" aria-hidden="true" /><span className="workspace-brand-title"><strong>OpenWorkshop</strong><small>v{webPackage.version}</small></span></div>
     <p>工作区</p>
     {PAGES.map((item) => <button key={item.id} className={view === item.id ? "active" : ""} aria-current={view === item.id ? "page" : undefined} onClick={() => onChange(item.id)}><span>{item.label}</span>{item.id === "notifications" && unreadNotifications > 0 && <span className="notification-badge" aria-label={unreadNotifications + " 条未处理通知"}>{unreadNotifications > 99 ? "99+" : unreadNotifications}</span>}</button>)}
     <button className={`workspace-nav-settings ${view === "settings" ? "active" : ""}`} aria-current={view === "settings" ? "page" : undefined} onClick={() => onChange("settings")}>设置</button>
