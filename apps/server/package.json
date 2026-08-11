@@ -1,0 +1,25 @@
+{
+  "name": "@workshop/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "workshop": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "node --watch src/cli.ts",
+    "start": "node dist/cli.js start"
+  },
+  "dependencies": {
+    "@fastify/static": "10.1.2",
+    "fastify": "5.11.2"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.2",
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

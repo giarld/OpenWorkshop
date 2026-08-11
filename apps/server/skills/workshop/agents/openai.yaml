@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workshop"
+  short_description: "通过 CLI 控制 OpenWorkshop 软件交付工作流"
+  default_prompt: "Use $workshop to inspect the current OpenWorkshop state and safely advance the requested workflow."

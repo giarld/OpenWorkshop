@@ -1,0 +1,38 @@
+node_modules/
+**/dist/
+apps/web/.next/
+apps/web/out/
+
+# Local runtime data
+.openworkshop/
+root/
+attachments/
+runtime/
+logs/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Generated analysis and caches
+graphify-out/
+coverage/
+.cache/
+
+# Internal project guidance, documentation, and memory
+/AGENTS.md
+/CLAUDE.md
+/.memory/
+/docs/
+/project-*/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
