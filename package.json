@@ -1,6 +1,6 @@
 {
   "name": "openworkshop",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "A local-first autonomous software delivery workbench",
   "type": "module",
   "bin": {
