@@ -4,7 +4,7 @@ import { notify } from "./notifications.ts";
 
 export type CommentAuthor = "human" | "agent" | "system";
 export type AgentMentionResult = { action: "steered" | "queued" | "triggered" | "unavailable"; runId?: string; message?: string };
-export type AgentMentionHandler = (taskId: string, message: string) => Promise<AgentMentionResult>;
+export type AgentMentionHandler = (taskId: string, message: string, attachmentIds?: readonly string[]) => Promise<AgentMentionResult>;
 
 export function mentionsAgent(content: string): boolean {
   return /@(agent|ai(?:\s+agent)?)(?=\s|[，。！？、:：]|$)/i.test(content);

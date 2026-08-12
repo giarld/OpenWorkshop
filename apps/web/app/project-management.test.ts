@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, projectIdAfterArchive, storedWorkspaceView, workspaceContentState, type ManagedProject } from "./project-management.ts";
+import { PROJECT_NAME_MAX_LENGTH, activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, initialWorkspaceView, projectIdAfterArchive, projectNameError, storedWorkspaceView, workspaceContentState, type ManagedProject } from "./project-management.ts";
 
 const project = (id: string, archivedAt: string | null = null): ManagedProject => ({ id, name: id, path: `C:/${id}`, real_path: `C:/${id}`, archived_at: archivedAt });
 
 test("project management only lists active associations", () => {
   assert.deepEqual(activeProjects([project("active"), project("archived", "2026-08-10T00:00:00.000Z")]).map((item) => item.id), ["active"]);
+});
+
+test("validates project name length consistently", () => {
+  assert.equal(projectNameError("Project"), null);
+  assert.equal(projectNameError(" "), "项目名称不能为空。");
+  assert.equal(projectNameError("项".repeat(PROJECT_NAME_MAX_LENGTH)), null);
+  assert.equal(projectNameError("项".repeat(PROJECT_NAME_MAX_LENGTH + 1)), `项目名称不能超过 ${PROJECT_NAME_MAX_LENGTH} 个字符。`);
 });
 
 test("archiving the active project selects the next available project", () => {
@@ -23,6 +30,14 @@ test("restores a valid workspace page and rejects stale values", () => {
   assert.equal(storedWorkspaceView("usage"), "usage");
   assert.equal(storedWorkspaceView("removed-page"), "commissions");
   assert.equal(storedWorkspaceView(null), "commissions");
+});
+
+test("keeps the saved workspace page on refresh instead of letting a stale hash override it", () => {
+  assert.equal(initialWorkspaceView("delivery", "#task-old"), "delivery");
+  assert.equal(initialWorkspaceView("settings", "#approval-old"), "settings");
+  assert.equal(initialWorkspaceView(null, "#task-current"), "board");
+  assert.equal(initialWorkspaceView("removed-page", "#approval-current"), "notifications");
+  assert.equal(initialWorkspaceView(null, ""), "commissions");
 });
 
 test("keeps settings available while project data is loading", () => {

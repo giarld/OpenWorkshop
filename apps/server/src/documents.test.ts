@@ -17,9 +17,13 @@ test("keeps locked document versions immutable and exposes locatable notificatio
   registerNotificationRoutes(server, database);
   try {
     const now = new Date().toISOString();
-    const root = randomUUID(), project = randomUUID(), document = randomUUID(), version = randomUUID();
+    const root = randomUUID(), project = randomUUID(), commission = randomUUID(), requirement = randomUUID(), task = randomUUID(), document = randomUUID(), version = randomUUID();
     database.prepare("INSERT INTO root_paths (id, path, real_path, enabled, created_at, updated_at) VALUES (?, 'root', 'root', 1, ?, ?)").run(root, now, now);
     database.prepare("INSERT INTO projects (id, name, path, real_path, root_path_id, vcs_type, created_at, updated_at) VALUES (?, 'Project', 'project', 'project', ?, 'none', ?, ?)").run(project, root, now, now);
+    database.prepare("INSERT INTO commissions (id, project_id, title, status, created_at, updated_at) VALUES (?, ?, 'Commission', 'active', ?, ?)").run(commission, project, now, now);
+    database.prepare("INSERT INTO requirement_versions (id, commission_id, version_no, content_markdown, acceptance_json, status, created_by, created_at, approved_at) VALUES (?, ?, 1, 'Requirement', '[]', 'approved', 'human', ?, ?)").run(requirement, commission, now, now);
+    database.prepare("UPDATE commissions SET active_requirement_version_id = ? WHERE id = ?").run(requirement, commission);
+    database.prepare("INSERT INTO tasks (id, commission_id, number_path, position, title, description, status, priority, owner_type, acceptance_json, review_round_limit, review_round_used, created_at, updated_at) VALUES (?, ?, '1', 0, 'Task', '', 'todo', 'medium', 'ai', '[]', 1, 0, ?, ?)").run(task, commission, now, now);
     database.prepare("INSERT INTO documents (id, project_id, type, title, created_at) VALUES (?, ?, 'decision', 'ADR', ?)").run(document, project, now);
     database.prepare("INSERT INTO document_versions (id, document_id, version_no, content_markdown, source_json, locked, created_by, created_at) VALUES (?, ?, 1, '# v1', '{}', 0, 'human', ?)").run(version, document, now);
     database.prepare("UPDATE documents SET current_version_id = ? WHERE id = ?").run(version, document);
@@ -31,9 +35,10 @@ test("keeps locked document versions immutable and exposes locatable notificatio
     assert.equal((await server.inject({ method: "GET", url: `/api/documents/${document}/export.md` })).body, "# v2");
     assert.match((await server.inject({ method: "POST", url: `/api/projects/${project}/documents/query`, payload: { query: "v1" } })).json()[0].href, /version=1/);
 
-    notify(database, "acceptance", "等待验收", "打开任务", "task", "task-1");
+    notify(database, "acceptance", "等待验收", "打开任务", "task", task);
     const notification = (await server.inject({ method: "GET", url: "/api/notifications?unread=true" })).json()[0];
-    assert.equal(notification.entity_id, "task-1");
+    assert.equal(notification.entity_id, task);
+    assert.equal(notification.project_id, project);
     assert.ok((await server.inject({ method: "POST", url: `/api/notifications/${notification.id}/read` })).json().read_at);
     assert.equal((await server.inject({ method: "DELETE", url: "/api/notifications/history" })).json().deleted, 1);
     assert.deepEqual((await server.inject({ method: "GET", url: "/api/notifications" })).json(), []);

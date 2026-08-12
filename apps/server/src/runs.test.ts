@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import Fastify from "fastify";
+import { storeAttachment } from "./attachments.ts";
 import { registerAuthentication } from "./auth.ts";
+import { addTaskComment } from "./comments.ts";
 import type { CodexAppServerOptions, CodexRunHandle, CodexRunOptions, NormalizedCodexEvent } from "./codex.ts";
 import { openWorkshopDatabase, SettingsStore } from "./database.ts";
 import { appendRunEvent, approvalKind, codexTokenUsage, CodexRunController, EventHub, pruneRawRunEvents, registerProductionRunRoutes, registerRunRoutes, type RunClientLauncher, type RunController } from "./runs.ts";
@@ -161,6 +163,154 @@ test("production assembly wires Codex controls, approvals, and live events", asy
   }
 });
 
+test("passes image attachments as initial visual input when an @Agent mention creates a Run", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-mentioned-run-image-"));
+  const database = await openWorkshopDatabase(home);
+  const server = Fastify();
+  const inputs: CodexRunOptions["input"][] = [];
+  try {
+    const { commissionId, taskId } = seedTask(database, home);
+    database.prepare("UPDATE tasks SET status = 'backlog' WHERE id = ?").run(taskId);
+    const attachment = await storeAttachment(database, join(home, "attachments"), { commissionId, taskId, originalName: "screen.png", mediaType: "image/png", data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) });
+    const comment = addTaskComment(database, { taskId, authorType: "human", content: "@Agent 请检查截图" });
+    database.prepare("UPDATE attachments SET comment_id = ? WHERE id = ?").run(String(comment.id), attachment.id);
+    const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
+      initialize: async () => undefined,
+      startRun: async (options) => {
+        inputs.push(options.input);
+        return { threadId: "thread-image", turnId: "turn-image", completed: new Promise<NormalizedCodexEvent>(() => undefined) };
+      },
+      steer: async () => undefined,
+      interrupt: async () => undefined,
+      close: async () => undefined
+    }), join(home, "attachments"));
+    const result = await mentionAgent(taskId, "@Agent 请检查截图", [attachment.id]);
+    assert.equal(result.action, "triggered");
+    const runAttachmentPath = join(home, ".openworkshop", "runs", result.runId!, "attachments", attachment.id, attachment.original_name);
+    assert.deepEqual(inputs[0]?.slice(1), [{ type: "localImage", path: runAttachmentPath }]);
+    assert.equal((database.prepare("SELECT run_id FROM attachments WHERE id = ?").get(attachment.id) as { run_id: string }).run_id, result.runId);
+    assert.deepEqual(await readFile(runAttachmentPath), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    const messages = await readFile(join(home, ".openworkshop", "runs", result.runId!, "messages.md"), "utf8");
+    assert.match(messages, /screen\.png/);
+    assert.match(messages, new RegExp(runAttachmentPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(messages, new RegExp(attachment.storage_path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  } finally {
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("associates a queued @Agent image with the reserved Run before its initial input is built", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-queued-run-image-"));
+  const database = await openWorkshopDatabase(home);
+  const server = Fastify();
+  const inputs: CodexRunOptions["input"][] = [];
+  try {
+    const { commissionId, taskId } = seedTask(database, home);
+    const runId = seedRun(database, taskId, 1);
+    database.prepare("UPDATE runs SET status = 'queued', started_at = NULL WHERE id = ?").run(runId);
+    const blockerTaskId = seedTask(database, home).taskId;
+    const blockerRunId = seedRun(database, blockerTaskId, 1);
+    new SettingsStore(database).set("globalConcurrency", 1);
+    const attachment = await storeAttachment(database, join(home, "attachments"), { commissionId, taskId, originalName: "queued.png", mediaType: "image/png", data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) });
+    const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
+      initialize: async () => undefined,
+      startRun: async () => ({ threadId: "unused", turnId: "unused", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
+      steer: async () => undefined,
+      interrupt: async () => undefined,
+      close: async () => undefined
+    }), join(home, "attachments"));
+    const result = await mentionAgent(taskId, "@Agent 排队截图", [attachment.id]);
+    assert.deepEqual(result, { action: "queued", runId });
+    assert.equal((database.prepare("SELECT run_id FROM attachments WHERE id = ?").get(attachment.id) as { run_id: string }).run_id, runId);
+    await server.close();
+    database.prepare("UPDATE runs SET status = 'failed', finished_at = ? WHERE id = ?").run(new Date().toISOString(), blockerRunId);
+    database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+    const controller = new CodexRunController(database, new EventHub(), () => ({
+      initialize: async () => undefined,
+      startRun: async (options) => {
+        inputs.push(options.input);
+        return { threadId: "thread-queued", turnId: "turn-queued", completed: new Promise<NormalizedCodexEvent>(() => undefined) };
+      },
+      steer: async () => undefined,
+      interrupt: async () => undefined,
+      close: async () => undefined
+    }), undefined, join(home, "attachments"));
+    await controller.start(runId, home);
+    assert.deepEqual(inputs[0]?.slice(1), [{ type: "localImage", path: join(home, ".openworkshop", "runs", runId, "attachments", attachment.id, attachment.original_name) }]);
+    await controller.close();
+  } finally {
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("steers an @Agent image that arrives while a Run is preparing", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-preparing-run-image-"));
+  const database = await openWorkshopDatabase(home);
+  const { commissionId, taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  const attachment = await storeAttachment(database, join(home, "attachments"), { commissionId, taskId, originalName: "preparing.png", mediaType: "image/png", data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) });
+  let continueInitialize!: () => void;
+  const initializing = new Promise<void>((resolve) => { continueInitialize = resolve; });
+  const steers: Array<string | CodexRunOptions["input"]> = [];
+  const controller = new CodexRunController(database, new EventHub(), () => ({
+    initialize: async () => initializing,
+    startRun: async () => ({ threadId: "thread-preparing", turnId: "turn-preparing", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
+    steer: async (_threadId, _turnId, input) => { steers.push(input); },
+    interrupt: async () => undefined,
+    close: async () => undefined
+  }), undefined, join(home, "attachments"));
+  try {
+    const starting = controller.start(runId, home);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    controller.queuePreparingSteer(runId, "@Agent 准备中截图", [attachment.id]);
+    continueInitialize();
+    await starting;
+    assert.deepEqual((steers[0] as CodexRunOptions["input"])?.slice(1), [{ type: "localImage", path: join(home, ".openworkshop", "runs", runId, "attachments", attachment.id, attachment.original_name) }]);
+    assert.equal((database.prepare("SELECT run_id FROM attachments WHERE id = ?").get(attachment.id) as { run_id: string }).run_id, runId);
+  } finally {
+    await controller.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("does not steer an @Agent image already included in the initial Run snapshot", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-preparing-run-initial-image-"));
+  const database = await openWorkshopDatabase(home);
+  const { commissionId, taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  const attachment = await storeAttachment(database, join(home, "attachments"), { commissionId, taskId, originalName: "initial.png", mediaType: "image/png", data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) });
+  const inputs: CodexRunOptions["input"][] = [];
+  const steers: Array<string | CodexRunOptions["input"]> = [];
+  const controller = new CodexRunController(database, new EventHub(), () => ({
+    initialize: async () => undefined,
+    startRun: async (options) => {
+      inputs.push(options.input);
+      return { threadId: "thread-initial", turnId: "turn-initial", completed: new Promise<NormalizedCodexEvent>(() => undefined) };
+    },
+    steer: async (_threadId, _turnId, input) => { steers.push(input); },
+    interrupt: async () => undefined,
+    close: async () => undefined
+  }), undefined, join(home, "attachments"));
+  try {
+    controller.queuePreparingSteer(runId, "@Agent 启动前截图", [attachment.id]);
+    await controller.start(runId, home);
+    assert.deepEqual(inputs[0]?.slice(1), [{ type: "localImage", path: join(home, ".openworkshop", "runs", runId, "attachments", attachment.id, attachment.original_name) }]);
+    assert.deepEqual(steers, []);
+    assert.equal((database.prepare("SELECT run_id FROM attachments WHERE id = ?").get(attachment.id) as { run_id: string }).run_id, runId);
+  } finally {
+    await controller.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("serves run details and executes steer, approval, pause, resume, interrupt, and cancel controls", async () => {
   const calls: string[] = [];
   const fixture = await runFixture({
@@ -223,6 +373,61 @@ test("serves run details and executes steer, approval, pause, resume, interrupt,
     assert.deepEqual(timeline.find((event: { event_type: string }) => event.event_type === "input.resolved").payload.answers, { choice: { answers: ["yes"] } });
   } finally {
     await fixture.close();
+  }
+});
+
+test("releases an intervention attachment when Codex rejects steer", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-run-attachment-steer-"));
+  const database = await openWorkshopDatabase(home);
+  const { commissionId, taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  const attachment = await storeAttachment(database, join(home, "attachments"), { commissionId, taskId, originalName: "notes.txt", mediaType: "text/plain", data: Buffer.from("notes") });
+  const steers: Array<string | CodexRunOptions["input"]> = [];
+  const controller = new CodexRunController(database, new EventHub(), () => ({
+    initialize: async () => undefined,
+    startRun: async () => ({ threadId: "thread-steer", turnId: "turn-steer", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
+    steer: async (_threadId, _turnId, input) => { steers.push(input); throw new Error("steer failed"); },
+    interrupt: async () => undefined,
+    close: async () => undefined
+  }), undefined, join(home, "attachments"));
+  try {
+    await controller.start(runId, home);
+    await assert.rejects(controller.steer(runId, "Read this", [attachment.id]), /steer failed/);
+    const copyPath = join(home, ".openworkshop", "runs", runId, "attachments", attachment.id, attachment.original_name);
+    assert.match(String((steers[0] as CodexRunOptions["input"])?.[0] && (steers[0] as NonNullable<CodexRunOptions["input"]>)[0]!.type === "text" ? (steers[0] as NonNullable<CodexRunOptions["input"]>)[0]!.text : ""), new RegExp(copyPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.equal(await readFile(copyPath, "utf8"), "notes");
+    assert.equal((database.prepare("SELECT run_id FROM attachments WHERE id = ?").get(attachment.id) as { run_id: string | null }).run_id, null);
+  } finally {
+    await controller.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("releases initial Run attachments when the Codex turn cannot start", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-run-attachment-start-"));
+  const database = await openWorkshopDatabase(home);
+  const { commissionId, taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  const attachment = await storeAttachment(database, join(home, "attachments"), { commissionId, taskId, originalName: "notes.txt", mediaType: "text/plain", data: Buffer.from("notes") });
+  database.prepare("UPDATE attachments SET run_id = ? WHERE id = ?").run(runId, attachment.id);
+  const controller = new CodexRunController(database, new EventHub(), () => ({
+    initialize: async () => undefined,
+    startRun: async () => { throw new Error("turn start failed"); },
+    steer: async () => undefined,
+    interrupt: async () => undefined,
+    close: async () => undefined
+  }), undefined, join(home, "attachments"));
+  try {
+    await assert.rejects(controller.start(runId, home), /turn start failed/);
+    assert.equal((database.prepare("SELECT run_id FROM attachments WHERE id = ?").get(attachment.id) as { run_id: string | null }).run_id, null);
+    await assert.rejects(access(join(home, ".openworkshop", "runs", runId)));
+  } finally {
+    await controller.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
   }
 });
 

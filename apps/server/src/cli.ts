@@ -15,9 +15,9 @@ import { pruneRawRunEvents } from "./runs.js";
 import { acquireInstanceLock, clearRuntimeState, consumeRuntimeStop, prepareWorkshopHome, pruneLogFiles, readLatestLog, readRuntimeState, requestRuntimeStop, writeRuntimeState, type RuntimeState } from "./platform.js";
 import { browserCommand, startBackgroundService, waitForServiceStop } from "./service-control.js";
 import { installWorkshopSkill } from "./skill-installer.js";
+import { isVersionCommand, WORKSHOP_VERSION } from "./version.js";
 import { familyHelp, parseWorkflowCommand, WORKFLOW_COMMANDS, workflowHelp, type WorkflowRequest } from "./workflow-cli.js";
 
-const VERSION = "0.1.0";
 const runFile = promisify(execFile);
 
 async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -30,8 +30,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(familyHelp(command));
     return;
   }
-  if (command === "version" || command === "--version" || command === "-v") {
-    console.log(VERSION);
+  if (isVersionCommand(command)) {
+    console.log(WORKSHOP_VERSION);
     return;
   }
   if (command === "skill") {
@@ -313,7 +313,7 @@ function printResult(data: unknown, output: string, text = false): void {
 }
 
 function help(): string {
-  return `OpenWorkshop ${VERSION}\n\nService commands:\n  start [--foreground] [--host HOST] [--port PORT]\n  stop, restart, status, gui, log [-n LINES], doctor, backup, restore, pin, version\n\nAgent integration:\n  skill install [--agent codex] [--force]\n\nAuthentication:\n  auth status|initialize|login|logout\n  login (alias for auth login)\n\n${workflowHelp()}\n\nEnvironment:\n  WORKSHOP_HOME, WORKSHOP_SERVER_URL`;
+  return `OpenWorkshop ${WORKSHOP_VERSION}\n\nService commands:\n  start [--foreground] [--host HOST] [--port PORT]\n  stop, restart, status, gui, log [-n LINES], doctor, backup, restore, pin, version\n\nAgent integration:\n  skill install [--agent codex] [--force]\n\nAuthentication:\n  auth status|initialize|login|logout\n  login (alias for auth login)\n\n${workflowHelp()}\n\nEnvironment:\n  WORKSHOP_HOME, WORKSHOP_SERVER_URL`;
 }
 
 type DoctorResult = { name: string; ok: boolean; detail?: string };

@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent, type KeyboardEvent } from "react";
 import { AVATAR_SETTINGS_EVENT, DEFAULT_AVATARS, avatarSettings, isImageAvatar, type AvatarSettings } from "./avatar-settings";
+import { applyColorTheme, COLOR_THEME_STORAGE_KEY, DEFAULT_COLOR_THEME, storedColorTheme, type ColorTheme } from "./theme-settings";
 
 type Settings = {
   globalConcurrency: number;
@@ -21,6 +22,11 @@ type CodexRuntime = { command: string; appServerArgs: string[]; sandboxMode: San
 type AgentSettings = { health: { ok: boolean; version?: string; models?: CodexModel[]; error?: string }; managed: CodexRuntime; configs: AgentConfig[] };
 const ROLE_LABELS: Record<AgentRole, string> = { supervisor: "项目主管 Agent", developer: "执行 Agent", reviewer: "审查 Agent" };
 const ROLE_DESCRIPTIONS: Record<AgentRole, string> = { supervisor: "负责需求澄清、任务规划与执行调度协调。", developer: "负责实现任务与处理返工。", reviewer: "负责独立验证任务结果。" };
+const COLOR_THEME_OPTIONS: Array<{ value: ColorTheme; label: string }> = [
+  { value: "light", label: "浅色" },
+  { value: "system", label: "跟随系统" },
+  { value: "dark", label: "深色" }
+];
 
 export function SettingsWorkspace({ onLogout, onPinChanged }: { onLogout(): void | Promise<void>; onPinChanged(): void }) {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -31,6 +37,27 @@ export function SettingsWorkspace({ onLogout, onPinChanged }: { onLogout(): void
   const [agentRole, setAgentRole] = useState<AgentRole>("supervisor");
   const [agentMessage, setAgentMessage] = useState("");
   const [avatars, setAvatars] = useState<AvatarSettings>(DEFAULT_AVATARS);
+  const [colorTheme, setColorTheme] = useState<ColorTheme>(DEFAULT_COLOR_THEME);
+
+  useEffect(() => {
+    setColorTheme(storedColorTheme(window.localStorage.getItem(COLOR_THEME_STORAGE_KEY)));
+  }, []);
+
+  function changeColorTheme(theme: ColorTheme) {
+    setColorTheme(theme);
+    window.localStorage.setItem(COLOR_THEME_STORAGE_KEY, theme);
+    applyColorTheme(theme);
+  }
+
+  function moveColorTheme(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+    if (!(["ArrowLeft", "ArrowRight", "Home", "End"] as string[]).includes(event.key)) return;
+    event.preventDefault();
+    const nextIndex = event.key === "Home" ? 0 : event.key === "End" ? COLOR_THEME_OPTIONS.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + COLOR_THEME_OPTIONS.length) % COLOR_THEME_OPTIONS.length;
+    const option = COLOR_THEME_OPTIONS[nextIndex];
+    if (!option) return;
+    changeColorTheme(option.value);
+    event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>("button")[nextIndex]?.focus();
+  }
 
   useEffect(() => {
     void fetch("/api/settings").then(async (response) => {
@@ -129,6 +156,12 @@ export function SettingsWorkspace({ onLogout, onPinChanged }: { onLogout(): void
 
     {!settings ? <section className="settings-loading">{message || "正在加载设置…"}</section> : <>
       <form className="settings-form" onSubmit={saveSettings}>
+        <section className="settings-group" aria-labelledby="appearance-settings-title">
+          <header><p className="settings-level">界面级</p><h3 id="appearance-settings-title">外观</h3><p>选择当前浏览器使用的工作台配色。</p></header>
+          <div className="theme-switch" role="radiogroup" aria-label="颜色主题">
+            {COLOR_THEME_OPTIONS.map((option, index) => <button key={option.value} type="button" role="radio" aria-checked={colorTheme === option.value} className={colorTheme === option.value ? "active" : ""} tabIndex={colorTheme === option.value ? 0 : -1} onClick={() => changeColorTheme(option.value)} onKeyDown={(event) => moveColorTheme(event, index)}>{option.label}</button>)}
+          </div>
+        </section>
         <section className="settings-group" aria-labelledby="system-settings-title">
           <header><p className="settings-level">系统级</p><h3 id="system-settings-title">运行与数据</h3><p>影响整个 OpenWorkshop 实例。</p></header>
           <div className="settings-fields">

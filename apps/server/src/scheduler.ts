@@ -43,7 +43,7 @@ export class Scheduler {
     this.runner = runner;
   }
 
-  async trigger(taskId: string) {
+  async trigger(taskId: string, beforeStart?: (runIds: readonly string[]) => void) {
     const { grant, runIds } = transaction(this.database, () => {
       const grant = createExecutionGrantUnsafe(this.database, taskId);
       if (grant.scope === "commission_tree") {
@@ -58,6 +58,7 @@ export class Scheduler {
         .run(new Date().toISOString(), ...covered);
       const runIds = runnableTasks(this.database, grant.id).map((task) => reserveRoutedRun(this.database, grant.id, task.id));
       settleBlockedCommissionTree(this.database, grant);
+      beforeStart?.(runIds);
       return { grant, runIds };
     });
     await this.startQueued();

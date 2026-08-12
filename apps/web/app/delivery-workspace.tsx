@@ -2,15 +2,15 @@
 
 import { FormEvent, useEffect, useRef, useState } from "react";
 import type { Task } from "./task-board";
+import type { AppNotification } from "./browser-notifications";
 import { deliveryEntries, type DeliveryCommission, type DeliveryEntry } from "./delivery-workspace-state";
 
 type DocumentSummary = { id: string; commission_id: string | null; title: string; type: string; version_no: number; locked: number };
 type DocumentDetails = DocumentSummary & { currentVersion: { content_markdown: string; version_no: number; locked: number }; versions: Array<{ id: string; version_no: number; locked: number; created_at: string }> };
 type Acceptance = { commissionStatus: string; task: Task; deliveryDocument: { id: string; contentMarkdown: string; versionNo: number } | null; tasks: Array<{ id: string; number_path: string; title: string; status: string; blocked_reason: string | null; human_waiver_reason: string | null }>; runs: Array<{ id: string; role: string; status: string; failure_summary: string | null }>; evidence: Array<{ id: string; type: string; status: string; summary: string }> };
-type AppNotification = { id: string; kind: string; title: string; body: string; entity_type: "task" | "approval"; entity_id: string; read_at: string | null };
 type Approval = { id: string; kind: string; status: string; request: Record<string, unknown> };
 
-export function DeliveryWorkspace({ projectId, tasks, section, hidden, onChanged }: { projectId: string; tasks: Task[]; section: "delivery" | "notifications"; hidden: boolean; onChanged(): void }) {
+export function DeliveryWorkspace({ projectId, tasks, section, hidden, onChanged, onNavigateNotification }: { projectId: string; tasks: Task[]; section: "delivery" | "notifications"; hidden: boolean; onChanged(): void; onNavigateNotification(item: AppNotification): void }) {
   const [documents, setDocuments] = useState<DocumentSummary[]>([]);
   const [commissions, setCommissions] = useState<DeliveryCommission[]>([]);
   const [activeEntry, setActiveEntry] = useState<DeliveryEntry | null>(null);
@@ -100,24 +100,11 @@ export function DeliveryWorkspace({ projectId, tasks, section, hidden, onChanged
   async function loadNotifications() {
     const items = await api<AppNotification[]>("/api/notifications");
     setNotifications(items);
-    const unread = items.filter((item) => !item.read_at);
-    if (!unread.length || !("Notification" in window)) return;
-    let permission = Notification.permission;
-    if (permission === "default") permission = await Notification.requestPermission();
-    if (permission !== "granted") return;
-    for (const item of unread) {
-      const key = `workshop-notification:${item.id}`;
-      if (sessionStorage.getItem(key) || (document.visibilityState === "visible" && location.hash === entityHash(item))) continue;
-      const notice = new Notification(item.title, { body: item.body, tag: item.id });
-      notice.onclick = () => { window.focus(); location.hash = entityHash(item); void readNotification(item); notice.close(); };
-      sessionStorage.setItem(key, "shown");
-    }
   }
 
   async function readNotification(item: AppNotification) {
     if (!item.read_at) await api(`/api/notifications/${item.id}/read`, { method: "POST" });
-    location.hash = entityHash(item);
-    if (item.entity_type === "task") document.getElementById(`task-${item.entity_id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    onNavigateNotification(item);
     await loadNotifications(); onChanged();
   }
 
@@ -173,5 +160,4 @@ function RejectForm({ disabled, onReject }: { disabled: boolean; onReject(reason
   return <form className="reject-form" onSubmit={submit}><input name="reason" placeholder="拒绝原因" required disabled={disabled} /><button className="secondary" disabled={disabled}>拒绝并返工</button></form>;
 }
 
-function entityHash(item: AppNotification): string { return item.entity_type === "task" ? `#task-${item.entity_id}` : `#approval-${item.entity_id}`; }
 async function api<T = unknown>(url: string, init?: RequestInit): Promise<T> { const response = await fetch(url, init?.body ? { ...init, headers: { "Content-Type": "application/json", ...init.headers } } : init); if (response.ok) return response.status === 204 ? undefined as T : await response.json() as T; const result = await response.json().catch(() => ({})) as { message?: string; error?: string }; throw new Error(result.message || result.error || `请求失败 (${response.status})`); }

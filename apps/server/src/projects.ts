@@ -9,6 +9,7 @@ import type { FastifyInstance } from "fastify";
 const runFile = promisify(execFile);
 const SCAN_IGNORES = new Set([".git", ".svn", ".openworkshop", "node_modules", "vendor", "dist", "build", "target", ".cache"]);
 const RESERVED_RUN_STATUSES = ["queued", "preparing", "running", "waiting_approval", "waiting_input"] as const;
+export const PROJECT_NAME_MAX_LENGTH = 100;
 const BUILD_HINTS: Record<string, string[]> = {
   "CMakeLists.txt": ["cmake -S . -B build", "cmake --build build"],
   Makefile: ["make"],
@@ -220,7 +221,7 @@ export function registerProjectRoutes(server: FastifyInstance, database: Databas
   server.get("/api/projects", async () => database.prepare("SELECT * FROM projects ORDER BY archived_at IS NOT NULL, name").all());
 
   server.post<{ Body: { name?: unknown; path?: unknown; rootPathId?: unknown } }>("/api/projects", async (request, reply) => {
-    const name = requiredString(request.body?.name, "name");
+    const name = limitedString(request.body?.name, "name", PROJECT_NAME_MAX_LENGTH);
     const path = requiredString(request.body?.path, "path");
     const root = enabledRootById(database, requiredString(request.body?.rootPathId, "rootPathId"));
     const realPath = await resolveWithinRoot(root.real_path, path);
@@ -245,7 +246,7 @@ export function registerProjectRoutes(server: FastifyInstance, database: Databas
 
   server.put<{ Params: { id: string }; Body: { name?: unknown } }>("/api/projects/:id", async (request) => {
     const project = activeProjectById(database, request.params.id);
-    const name = requiredString(request.body?.name, "name");
+    const name = limitedString(request.body?.name, "name", PROJECT_NAME_MAX_LENGTH);
     database.prepare("UPDATE projects SET name = ?, updated_at = ? WHERE id = ?").run(name, new Date().toISOString(), project.id);
     return projectById(database, project.id);
   });
@@ -335,6 +336,12 @@ function activeProjectById(database: DatabaseSync, id: string): ProjectRow {
 function requiredString(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim()) throw badRequest(`${name} must be a non-empty string`);
   return value.trim();
+}
+
+function limitedString(value: unknown, name: string, maxLength: number): string {
+  const result = requiredString(value, name);
+  if (result.length > maxLength) throw badRequest(`${name} must be at most ${maxLength} characters`);
+  return result;
 }
 
 function hasCode(error: unknown, code: string): boolean {

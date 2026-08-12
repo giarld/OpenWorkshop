@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { APPROVAL_POLICIES, COMMAND_APPROVAL_POLICY, COMMAND_SANDBOX_MODE, SANDBOX_MODES, CodexAppServerClosedError, codexAppServerArgs, createRunContext, recoverRunContexts, validateCustomArgs, type ApprovalPolicy, type CodexAppServer, type CodexAppServerOptions, type CodexRunHandle, type NormalizedCodexEvent, type SandboxMode } from "./codex.ts";
+import { attachmentMessage, localImageInputs, materializeRunAttachments, runAttachmentCopies, selectedTaskAttachments, type AttachmentRow } from "./attachments.ts";
+import { APPROVAL_POLICIES, COMMAND_APPROVAL_POLICY, COMMAND_SANDBOX_MODE, SANDBOX_MODES, CodexAppServerClosedError, codexAppServerArgs, createRunContext, recoverRunContexts, validateCustomArgs, type ApprovalPolicy, type CodexAppServer, type CodexAppServerOptions, type CodexInput, type CodexRunHandle, type NormalizedCodexEvent, type SandboxMode } from "./codex.ts";
 import type { AgentMentionHandler } from "./comments.ts";
 import { SettingsStore } from "./database.ts";
 import { notify } from "./notifications.ts";
@@ -59,7 +60,7 @@ export type RunEvent = {
 };
 
 export type RunController = {
-  steer(runId: string, message: string): Promise<void>;
+  steer(runId: string, message: string, attachmentIds?: readonly string[]): Promise<void>;
   interrupt(runId: string, mode: "pause" | "cancel"): Promise<void>;
   resume(taskId: string, previousRunId: string): Promise<string>;
   decideApproval(runId: string, requestId: string, decision: "accepted" | "declined", details?: JsonObject): Promise<void>;
@@ -78,7 +79,8 @@ type RunContextFiles = Parameters<typeof createRunContext>[2];
 type RunClient = Pick<CodexAppServer, "initialize" | "startRun" | "steer" | "interrupt" | "close">;
 export type RunClientLauncher = (options: CodexAppServerOptions) => RunClient;
 
-type ActiveRun = { client: RunClient; handle?: CodexRunHandle; cleanupContext(): Promise<void> };
+type ActiveRun = { client: RunClient; handle?: CodexRunHandle; contextDirectory: string; cleanupContext(): Promise<void> };
+type PendingSteer = { message: string; attachments: AttachmentRow[] };
 
 export class CodexRunController {
   private readonly active = new Map<string, ActiveRun>();
@@ -86,22 +88,43 @@ export class CodexRunController {
   private readonly approvalResponders = new Map<string, (decision: unknown) => void>();
   private readonly inputResponders = new Map<string, { respond: (answers: unknown) => void; questionIds: Set<string> }>();
   private readonly interruptModes = new Map<string, "pause" | "cancel">();
+  private readonly pendingSteers = new Map<string, PendingSteer[]>();
   private readonly database: DatabaseSync;
   private readonly hub: EventHub;
   private readonly launch: RunClientLauncher;
   private readonly onTerminal: (runId: string) => Promise<void>;
+  private readonly attachmentsRoot: string;
   private closing = false;
 
-  constructor(database: DatabaseSync, hub: EventHub, launch: RunClientLauncher, onTerminal: (runId: string) => Promise<void> = async () => undefined) {
+  constructor(database: DatabaseSync, hub: EventHub, launch: RunClientLauncher, onTerminal: (runId: string) => Promise<void> = async () => undefined, attachmentsRoot = "attachments") {
     this.database = database;
     this.hub = hub;
     this.launch = launch;
     this.onTerminal = onTerminal;
+    this.attachmentsRoot = attachmentsRoot;
   }
 
-  async steer(runId: string, message: string): Promise<void> {
+  async steer(runId: string, message: string, attachmentIds: readonly string[] = []): Promise<void> {
     const run = this.activeRun(runId);
-    await run.client.steer(run.handle!.threadId, run.handle!.turnId, message);
+    const runRow = runById(this.database, runId);
+    const attachments = selectedTaskAttachments(this.database, runRow.task_id, attachmentIds, "not-run");
+    claimRunAttachments(this.database, runId, runRow.task_id, attachments);
+    try {
+      const copies = await materializeRunAttachments(attachments, this.attachmentsRoot, run.contextDirectory);
+      const input: CodexInput[] = [{ type: "text", text: attachmentMessage(message, copies) }, ...localImageInputs(copies)];
+      await run.client.steer(run.handle!.threadId, run.handle!.turnId, attachments.length ? input : message);
+    } catch (error) {
+      releaseRunAttachments(this.database, runId, attachments);
+      throw error;
+    }
+  }
+
+  queuePreparingSteer(runId: string, message: string, attachmentIds: readonly string[]): void {
+    const run = runById(this.database, runId);
+    if (run.status !== "preparing") throw conflict("Run is no longer preparing");
+    const attachments = selectedTaskAttachments(this.database, run.task_id, attachmentIds, "not-run");
+    claimRunAttachments(this.database, run.id, run.task_id, attachments);
+    this.pendingSteers.set(run.id, [...this.pendingSteers.get(run.id) ?? [], { message, attachments }]);
   }
 
   async interrupt(runId: string, mode: "pause" | "cancel"): Promise<void> {
@@ -130,8 +153,21 @@ export class CodexRunController {
       WHERE tasks.id = ? AND tasks.archived_at IS NULL AND projects.archived_at IS NULL AND root_paths.enabled = 1
     `).get(run.task_id) as TaskContext | undefined;
     if (!task) throw notFound("Task not found");
-    const contextFiles = runContextFiles(this.database, run, task);
+    const runDirectory = join(task.project_root, ".openworkshop", "runs", runId);
+    this.pendingSteers.delete(runId);
+    const sourceContextAttachments = databaseContextAttachments(this.database, run);
+    const contextAttachments = runAttachmentCopies(sourceContextAttachments, runDirectory);
+    const initialSourceAttachments = databaseRunAttachments(this.database, run.id);
+    const initialAttachmentIds = new Set(initialSourceAttachments.map((attachment) => attachment.id));
+    const initialAttachments = contextAttachments.filter((attachment) => initialAttachmentIds.has(attachment.id));
+    const contextFiles = runContextFiles(this.database, run, task, sourceContextAttachments, contextAttachments);
     const context = await createRunContext(task.project_root, runId, contextFiles);
+    try { await materializeRunAttachments(sourceContextAttachments, this.attachmentsRoot, context.directory); }
+    catch (error) {
+      releaseRunAttachments(this.database, runId, initialSourceAttachments);
+      await context.cleanup();
+      throw error;
+    }
     const contextIndex = Object.keys(contextFiles).map((name) => `- ${join(context.directory, name)}`).join("\n");
     const config = object(JSON.parse(run.config_snapshot_json), "config snapshot");
     const customArgs = config.customArgs === undefined ? [] : stringArray(config.customArgs, "config customArgs");
@@ -150,20 +186,23 @@ export class CodexRunController {
       });
     } catch (error) {
       await context.cleanup();
+      releaseRunAttachments(this.database, runId, initialSourceAttachments);
       throw error;
     }
-    this.active.set(runId, { client, cleanupContext: context.cleanup });
+    this.active.set(runId, { client, contextDirectory: context.directory, cleanupContext: context.cleanup });
     try {
       await client.initialize();
+      const prompt = run.role === "supervisor"
+        ? `You are the project supervisor Agent. Reconcile the current task before it is executed again so completed work is not repeated. Read every context file, inspect the current workspace without modifying it, distinguish infrastructure interruption from implementation or review failure, and choose exactly one next action.\n\nCurrent objective: ${task.title}\nExecution boundary: read-only coordination; do not modify project files, run destructive commands, or perform the task itself.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"action":"resume_reviewer|resume_developer|rework_developer|restart_developer|replan|wait_human","summary":"string"}. Use resume_reviewer when review was interrupted or failed for infrastructure reasons; resume_developer when an interrupted developer should continue; rework_developer when review findings require code changes; restart_developer only when prior development cannot be reused; replan when the task definition or dependencies must change; wait_human when a human decision or operation is required.`
+        : run.role === "reviewer"
+          ? `You are the independent test/review Agent. Verify the current task against its acceptance criteria and project instructions. Read every context file before acting.\n\nCurrent objective: ${task.title}\nExecution boundary: inspect the current workspace; do not implement fixes.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"passed":boolean,"summary":"string","checks":[],"findings":[{"severity":"blocking|warning","file":"path","line":null,"message":"string"}]}. Only blocking findings make passed false.`
+          : `You are the developer Agent. Read every context file before acting.\n\nCurrent objective: ${task.title}\nExecution boundary: ${task.read_only ? "read-only analysis; do not modify project files" : "work only inside the provided workspace and complete the task acceptance criteria"}.\nContext files:\n${contextIndex}\n\nComplete the task and report the key result, checks, constraints, and remaining risks in the final message. The final message is saved to the task discussion; mention @负责人 when human attention or a decision is required.`;
       const handle = await client.startRun({
         cwd,
         sandbox: sandboxMode,
         approvalPolicy,
-        prompt: run.role === "supervisor"
-          ? `You are the project supervisor Agent. Reconcile the current task before it is executed again so completed work is not repeated. Read every context file, inspect the current workspace without modifying it, distinguish infrastructure interruption from implementation or review failure, and choose exactly one next action.\n\nCurrent objective: ${task.title}\nExecution boundary: read-only coordination; do not modify project files, run destructive commands, or perform the task itself.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"action":"resume_reviewer|resume_developer|rework_developer|restart_developer|replan|wait_human","summary":"string"}. Use resume_reviewer when review was interrupted or failed for infrastructure reasons; resume_developer when an interrupted developer should continue; rework_developer when review findings require code changes; restart_developer only when prior development cannot be reused; replan when the task definition or dependencies must change; wait_human when a human decision or operation is required.`
-          : run.role === "reviewer"
-            ? `You are the independent test/review Agent. Verify the current task against its acceptance criteria and project instructions. Read every context file before acting.\n\nCurrent objective: ${task.title}\nExecution boundary: inspect the current workspace; do not implement fixes.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"passed":boolean,"summary":"string","checks":[],"findings":[{"severity":"blocking|warning","file":"path","line":null,"message":"string"}]}. Only blocking findings make passed false.`
-            : `You are the developer Agent. Read every context file before acting.\n\nCurrent objective: ${task.title}\nExecution boundary: ${task.read_only ? "read-only analysis; do not modify project files" : "work only inside the provided workspace and complete the task acceptance criteria"}.\nContext files:\n${contextIndex}\n\nComplete the task and report the key result, checks, constraints, and remaining risks in the final message. The final message is saved to the task discussion; mention @负责人 when human attention or a decision is required.`,
+        prompt,
+        ...(initialAttachments.length ? { input: [{ type: "text" as const, text: prompt }, ...localImageInputs(initialAttachments)] } : {}),
         ...(typeof config.model === "string" ? { model: config.model } : {}),
         ...(typeof config.reasoningEffort === "string" ? { effort: config.reasoningEffort } : {})
       });
@@ -171,17 +210,43 @@ export class CodexRunController {
         config.model = handle.model;
         this.database.prepare("UPDATE runs SET config_snapshot_json = ? WHERE id = ?").run(JSON.stringify(config), runId);
       }
-      this.active.set(runId, { client, handle, cleanupContext: context.cleanup });
+      this.active.set(runId, { client, handle, contextDirectory: context.directory, cleanupContext: context.cleanup });
       this.database.prepare("UPDATE runs SET status = 'running' WHERE id = ? AND status = 'preparing'").run(runId);
       appendRunEvent(this.database, this.hub, runId, "run.status", "Run running", { status: "running" });
+      await this.flushPendingSteers(runId, client, handle);
       void handle.completed.then(
         (event) => this.trackCompletion(this.complete(runId, event)),
         (error) => this.trackCompletion(this.fail(runId, error))
       );
     } catch (error) {
+      this.releasePendingSteers(runId);
+      releaseRunAttachments(this.database, runId, initialSourceAttachments);
       await this.fail(runId, error);
       throw error;
     }
+  }
+
+  private async flushPendingSteers(runId: string, client: RunClient, handle: CodexRunHandle): Promise<void> {
+    const pending = this.pendingSteers.get(runId) ?? [];
+    this.pendingSteers.delete(runId);
+    for (const item of pending) {
+      try {
+        const run = this.activeRun(runId);
+        const copies = await materializeRunAttachments(item.attachments, this.attachmentsRoot, run.contextDirectory);
+        const input: CodexInput[] = [{ type: "text", text: attachmentMessage(item.message, copies) }, ...localImageInputs(copies)];
+        await client.steer(handle.threadId, handle.turnId, item.attachments.length ? input : item.message);
+      }
+      catch (error) {
+        releaseRunAttachments(this.database, runId, item.attachments);
+        appendRunEvent(this.database, this.hub, runId, "human.message.failed", "Queued human message could not be delivered", { message: item.message, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+  }
+
+  private releasePendingSteers(runId: string): void {
+    const pending = this.pendingSteers.get(runId) ?? [];
+    this.pendingSteers.delete(runId);
+    for (const item of pending) releaseRunAttachments(this.database, runId, item.attachments);
   }
 
   async decideApproval(runId: string, requestId: string, decision: "accepted" | "declined", details?: JsonObject): Promise<void> {
@@ -309,6 +374,7 @@ export class CodexRunController {
     const run = this.active.get(runId);
     this.active.delete(runId);
     this.interruptModes.delete(runId);
+    this.releasePendingSteers(runId);
     for (const key of this.approvalResponders.keys()) if (key.startsWith(`${runId}:`)) this.approvalResponders.delete(key);
     for (const key of this.inputResponders.keys()) if (key.startsWith(`${runId}:`)) this.inputResponders.delete(key);
     if (run) await Promise.allSettled([run.client.close(), run.cleanupContext()]);
@@ -345,9 +411,9 @@ export function appendRunEvent(database: DatabaseSync, hub: EventHub, runId: str
   return event;
 }
 
-function runContextFiles(database: DatabaseSync, run: RunRow, task: TaskContext): RunContextFiles {
+function runContextFiles(database: DatabaseSync, run: RunRow, task: TaskContext, sourceAttachments: AttachmentRow[], commentAttachments: AttachmentRow[]): RunContextFiles {
   const saved = storedContextFiles(run.context_snapshot_json);
-  if (saved) return saved;
+  if (saved) return remapAttachmentPaths(saved, sourceAttachments, commentAttachments);
   const dependencies = database.prepare(`
     SELECT task.number_path, task.title, task.description, task.status, task.acceptance_json
     FROM task_dependencies AS dependency
@@ -365,16 +431,23 @@ function runContextFiles(database: DatabaseSync, run: RunRow, task: TaskContext)
   `).all(run.trigger_ref_id) as Array<Record<string, unknown>> : [];
   const requirementMessages = database.prepare("SELECT role, content, created_at FROM requirement_messages WHERE commission_id = ? ORDER BY created_at, rowid").all(run.commission_id) as Array<{ role: string; content: string; created_at: string }>;
   const comments = database.prepare("SELECT id, parent_id, run_id, author_type, agent_role, kind, content, created_at FROM comments WHERE task_id = ? AND deleted_at IS NULL ORDER BY created_at, rowid").all(run.task_id) as Array<{ id: string; parent_id: string | null; run_id: string | null; author_type: string; agent_role: string | null; kind: string; content: string; created_at: string }>;
+  const attachmentsByComment = new Map<string, typeof commentAttachments>();
+  for (const attachment of commentAttachments) if (attachment.comment_id) attachmentsByComment.set(attachment.comment_id, [...attachmentsByComment.get(attachment.comment_id) ?? [], attachment]);
   const files: RunContextFiles = {
     "requirement.md": `# Requirement: ${task.commission_title}\n\n${task.requirement}\n\n## Acceptance\n\n\`\`\`json\n${prettyJson(task.requirement_acceptance)}\n\`\`\`\n`,
     "task.md": `# Task: ${task.title}\n\n${task.description || "No description."}\n\n- Run role: ${run.role}\n- Trigger: ${run.trigger_type}\n- Read only: ${Boolean(task.read_only)}\n\n## Acceptance\n\n\`\`\`json\n${prettyJson(task.acceptance_json)}\n\`\`\`\n`,
     "dependencies.md": `# Dependencies\n\n${dependencies.length ? dependencies.map((item) => `## ${item.number_path} ${item.title}\n\n- Status: ${item.status}\n- Description: ${item.description || "No description."}\n- Acceptance: ${prettyJson(item.acceptance_json)}`).join("\n\n") : "No task dependencies."}\n`,
     "previous-runs.md": `# Previous Runs\n\n${previousRuns.length ? previousRuns.map((item) => `- Attempt ${item.attempt_no} · ${item.role} · ${item.status} · ${item.trigger_type}${item.failure_summary ? ` · ${item.failure_summary}` : ""}`).join("\n") : "No previous Runs."}${evidence.length ? `\n\n## Trigger Run Evidence\n\n${evidence.map((item) => `- ${item.created_at} · ${item.event_type} · ${item.summary}\n  ${item.payload_json}`).join("\n")}` : ""}\n`,
     "project-profile.md": `# Project: ${task.project_name}\n\n- Root: ${task.project_root}\n- VCS: ${task.vcs_type}\n- VCS root: ${task.vcs_root ?? "none"}\n\n## Profile\n\n\`\`\`json\n${prettyJson(task.profile_json ?? "{}")}\n\`\`\`\n`,
-    "messages.md": `# Messages\n\n${requirementMessages.length ? requirementMessages.map((item) => `## ${item.role} · ${item.created_at}\n\n${item.content}`).join("\n\n") : "No requirement messages."}${comments.length ? `\n\n# Task Comments\n\n${comments.map((item) => `## ${item.id} · ${item.author_type}${item.agent_role ? `/${item.agent_role}` : ""} · ${item.kind} · ${item.created_at}${item.parent_id ? ` · reply-to:${item.parent_id}` : ""}${item.run_id ? ` · run:${item.run_id}` : ""}\n\n${item.content}`).join("\n\n")}` : ""}\n`
+    "messages.md": `# Messages\n\n${requirementMessages.length ? requirementMessages.map((item) => `## ${item.role} · ${item.created_at}\n\n${item.content}`).join("\n\n") : "No requirement messages."}${comments.length ? `\n\n# Task Comments\n\n${comments.map((item) => `## ${item.id} · ${item.author_type}${item.agent_role ? `/${item.agent_role}` : ""} · ${item.kind} · ${item.created_at}${item.parent_id ? ` · reply-to:${item.parent_id}` : ""}${item.run_id ? ` · run:${item.run_id}` : ""}\n\n${attachmentMessage(item.content, attachmentsByComment.get(item.id) ?? [])}`).join("\n\n")}` : ""}\n`
   };
   database.prepare("UPDATE runs SET context_snapshot_json = ? WHERE id = ?").run(JSON.stringify({ version: 1, files }), run.id);
   return files;
+}
+
+function remapAttachmentPaths(files: RunContextFiles, sources: readonly AttachmentRow[], copies: readonly AttachmentRow[]): RunContextFiles {
+  const paths = new Map(copies.map((copy) => [copy.id, copy.storage_path]));
+  return Object.fromEntries(Object.entries(files).map(([name, content]) => [name, sources.reduce((value, source) => value.replaceAll(source.storage_path, paths.get(source.id) ?? source.storage_path), content)])) as RunContextFiles;
 }
 
 function storedContextFiles(snapshot: string): RunContextFiles | undefined {
@@ -391,15 +464,15 @@ function prettyJson(value: string): string {
   catch { return value; }
 }
 
-export async function registerProductionRunRoutes(server: FastifyInstance, database: DatabaseSync, launch: RunClientLauncher): Promise<AgentMentionHandler> {
+export async function registerProductionRunRoutes(server: FastifyInstance, database: DatabaseSync, launch: RunClientLauncher, attachmentsRoot = "attachments"): Promise<AgentMentionHandler> {
   const hub = new EventHub();
   const projectRoots = database.prepare("SELECT real_path FROM projects WHERE archived_at IS NULL").all() as Array<{ real_path: string }>;
   await Promise.all(projectRoots.map(({ real_path }) => recoverRunContexts(real_path)));
   let scheduler!: Scheduler;
-  const controller = new CodexRunController(database, hub, launch, (runId) => scheduler.terminal(runId));
+  const controller = new CodexRunController(database, hub, launch, (runId) => scheduler.terminal(runId), attachmentsRoot);
   scheduler = new Scheduler(database, controller);
   const controls: RunController = {
-    steer: (runId, message) => controller.steer(runId, message),
+    steer: (runId, message, attachmentIds) => controller.steer(runId, message, attachmentIds),
     interrupt: (runId, mode) => controller.interrupt(runId, mode),
     resume: (taskId, previousRunId) => scheduler.resume(taskId, previousRunId),
     decideApproval: (runId, requestId, decision, details) => controller.decideApproval(runId, requestId, decision, details),
@@ -409,26 +482,75 @@ export async function registerProductionRunRoutes(server: FastifyInstance, datab
   registerSchedulerRoutes(server, scheduler);
   await scheduler.recover();
   server.addHook("onClose", () => controller.close());
-  return async (taskId, message) => {
+  return async (taskId, message, attachmentIds = []) => {
     const reserved = database.prepare("SELECT id, status FROM runs WHERE task_id = ? AND status IN ('queued', 'preparing', 'running', 'waiting_approval', 'waiting_input') ORDER BY rowid DESC LIMIT 1").get(taskId) as { id: string; status: RunStatus } | undefined;
     if (reserved && ["running", "waiting_approval", "waiting_input"].includes(reserved.status)) {
       try {
-        await controller.steer(reserved.id, message);
-        appendRunEvent(database, hub, reserved.id, "human.message", "Human mentioned Agent", { message });
+        await controller.steer(reserved.id, message, attachmentIds);
+        appendRunEvent(database, hub, reserved.id, "human.message", "Human mentioned Agent", { message, attachmentIds });
         return { action: "steered", runId: reserved.id };
       } catch (error) { return { action: "unavailable", runId: reserved.id, message: error instanceof Error ? error.message : String(error) }; }
     }
-    if (reserved) return { action: "queued", runId: reserved.id };
+    if (reserved?.status === "preparing") {
+      try {
+        controller.queuePreparingSteer(reserved.id, message, attachmentIds);
+        return { action: "queued", runId: reserved.id };
+      } catch (error) {
+        const current = database.prepare("SELECT status FROM runs WHERE id = ?").get(reserved.id) as { status: RunStatus } | undefined;
+        if (current && ["running", "waiting_approval", "waiting_input"].includes(current.status)) {
+          try {
+            await controller.steer(reserved.id, message, attachmentIds);
+            appendRunEvent(database, hub, reserved.id, "human.message", "Human mentioned Agent", { message, attachmentIds });
+            return { action: "steered", runId: reserved.id };
+          } catch (steerError) { return { action: "unavailable", runId: reserved.id, message: steerError instanceof Error ? steerError.message : String(steerError) }; }
+        }
+        return { action: "unavailable", runId: reserved.id, message: error instanceof Error ? error.message : String(error) };
+      }
+    }
+    if (reserved) {
+      try {
+        const attachments = selectedTaskAttachments(database, taskId, attachmentIds, "not-run");
+        claimRunAttachments(database, reserved.id, taskId, attachments);
+        return { action: "queued", runId: reserved.id };
+      } catch (error) { return { action: "unavailable", runId: reserved.id, message: error instanceof Error ? error.message : String(error) }; }
+    }
     const task = database.prepare("SELECT owner_type, status FROM tasks WHERE id = ? AND archived_at IS NULL").get(taskId) as { owner_type: string; status: string } | undefined;
     if (!task) return { action: "unavailable", message: "Task not found" };
     if (task.owner_type !== "ai") return { action: "unavailable", message: "人工任务没有可唤起的执行 Agent" };
     if (["done", "archived"].includes(task.status)) return { action: "unavailable", message: "已完成或归档任务不能启动 Agent" };
     if (["in_progress", "blocked"].includes(task.status)) database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(new Date().toISOString(), taskId);
     try {
-      const result = await scheduler.trigger(taskId);
+      const attachments = selectedTaskAttachments(database, taskId, attachmentIds, "not-run");
+      const result = await scheduler.trigger(taskId, (runIds) => {
+        const runId = runIds.length ? (database.prepare(`SELECT id FROM runs WHERE task_id = ? AND id IN (${runIds.map(() => "?").join(", ")}) ORDER BY rowid LIMIT 1`).get(taskId, ...runIds) as { id: string } | undefined)?.id : undefined;
+        if (attachments.length && !runId) throw Object.assign(new Error("Task did not reserve a Run for the mentioned Agent"), { statusCode: 409 });
+        if (runId) claimRunAttachments(database, runId, taskId, attachments);
+      });
       return { action: "triggered", ...(result.runIds[0] ? { runId: result.runIds[0] } : {}) };
     } catch (error) { return { action: "unavailable", message: error instanceof Error ? error.message : String(error) }; }
   };
+}
+
+function databaseRunAttachments(database: DatabaseSync, runId: string): AttachmentRow[] {
+  return database.prepare("SELECT * FROM attachments WHERE run_id = ? ORDER BY created_at, rowid").all(runId) as AttachmentRow[];
+}
+
+function databaseContextAttachments(database: DatabaseSync, run: RunRow): AttachmentRow[] {
+  return database.prepare(`SELECT attachment.* FROM attachments AS attachment
+    LEFT JOIN comments AS comment ON comment.id = attachment.comment_id
+    WHERE attachment.task_id = ? AND (attachment.run_id = ? OR (attachment.comment_id IS NOT NULL AND comment.deleted_at IS NULL))
+    ORDER BY attachment.created_at, attachment.rowid`).all(run.task_id, run.id) as AttachmentRow[];
+}
+
+function claimRunAttachments(database: DatabaseSync, runId: string, taskId: string, attachments: readonly AttachmentRow[]): void {
+  if (!attachments.length) return;
+  const claimed = database.prepare(`UPDATE attachments SET run_id = ? WHERE task_id = ? AND run_id IS NULL AND id IN (${attachments.map(() => "?").join(", ")})`)
+    .run(runId, taskId, ...attachments.map((attachment) => attachment.id));
+  if (Number(claimed.changes) !== attachments.length) throw conflict("Attachment was already used by another Run");
+}
+
+function releaseRunAttachments(database: DatabaseSync, runId: string, attachments: readonly AttachmentRow[]): void {
+  if (attachments.length) database.prepare(`UPDATE attachments SET run_id = NULL WHERE run_id = ? AND id IN (${attachments.map(() => "?").join(", ")})`).run(runId, ...attachments.map((attachment) => attachment.id));
 }
 
 export function registerRunRoutes(server: FastifyInstance, database: DatabaseSync, controller: RunController, hub: EventHub): void {
@@ -453,11 +575,13 @@ export function registerRunRoutes(server: FastifyInstance, database: DatabaseSyn
   server.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/runs/:id/events", async (request) =>
     eventsAfter(database, cursor(request.query.after), "run_id = ?", request.params.id));
 
-  server.post<{ Params: { id: string }; Body: { message?: unknown } }>("/api/runs/:id/steer", async (request) => {
+  server.post<{ Params: { id: string }; Body: { message?: unknown; attachmentIds?: unknown; attachment_ids?: unknown } }>("/api/runs/:id/steer", async (request) => {
     const run = activeRun(database, request.params.id);
-    const message = requiredString(request.body?.message, "message");
-    await controller.steer(run.id, message);
-    appendRunEvent(database, hub, run.id, "human.message", "Human intervention", { message });
+    const message = optionalString(request.body?.message, "message") ?? "";
+    const attachmentIds = request.body?.attachmentIds === undefined && request.body?.attachment_ids === undefined ? [] : stringArray(request.body?.attachmentIds ?? request.body?.attachment_ids, "attachmentIds");
+    if (!message && !attachmentIds.length) throw badRequest("message or attachmentIds is required");
+    await controller.steer(run.id, message, attachmentIds);
+    appendRunEvent(database, hub, run.id, "human.message", "Human intervention", { message, attachmentIds });
     return { ok: true };
   });
 
@@ -647,6 +771,12 @@ function cursor(value: unknown): number {
 
 function requiredString(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim()) throw badRequest(`${name} must be a non-empty string`);
+  return value.trim();
+}
+
+function optionalString(value: unknown, name: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") throw badRequest(`${name} must be a string`);
   return value.trim();
 }
 

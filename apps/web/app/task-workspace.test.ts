@@ -1,6 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, taskMentionParts, tokenPrice, tokenUsageTotals } from "./task-run.ts";
+import { clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, taskMentionParts, tokenPrice, tokenUsageTotals } from "./task-run.ts";
+
+test("recognizes supported clipboard images and generates readable screenshot names", () => {
+  assert.equal(clipboardImageExtension("image/png"), "png");
+  assert.equal(clipboardImageExtension("IMAGE/JPEG"), "jpg");
+  assert.equal(clipboardImageExtension("image/gif"), "gif");
+  assert.equal(clipboardImageExtension("image/webp"), "webp");
+  assert.equal(clipboardImageExtension("text/plain"), null);
+  assert.equal(screenshotFileName("image/png", new Date(2026, 7, 12, 16, 30, 45)), "截图-20260812-163045.png");
+});
+
+test("recognizes Ctrl or Command plus Enter as the comment submit shortcut", () => {
+  assert.equal(isCommentSubmitShortcut({ key: "Enter", ctrlKey: true, metaKey: false }), true);
+  assert.equal(isCommentSubmitShortcut({ key: "Enter", ctrlKey: false, metaKey: true }), true);
+  assert.equal(isCommentSubmitShortcut({ key: "Enter", ctrlKey: false, metaKey: false }), false);
+  assert.equal(isCommentSubmitShortcut({ key: "Enter", ctrlKey: true, metaKey: false, isComposing: true }), false);
+  assert.equal(isCommentSubmitShortcut({ key: "NumpadEnter", ctrlKey: true, metaKey: false }), false);
+});
 
 test("formats Agent Run elapsed time", () => {
   assert.equal(formatRunDuration(3_723_000), "01:02:03");

@@ -8,6 +8,29 @@ export type CodeChange = { id: string; path: string; kind: string; movePath: str
 export type DiffLine = { text: string; kind: "add" | "remove" | "hunk" | "context" };
 export type TokenUsageSource = { token_input: number | null; token_output: number | null; token_cached: number | null; configSnapshot?: { model?: string } };
 
+const CLIPBOARD_IMAGE_EXTENSIONS: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp"
+};
+
+export function clipboardImageExtension(mediaType: string): string | null {
+  return CLIPBOARD_IMAGE_EXTENSIONS[mediaType.toLowerCase()] ?? null;
+}
+
+export function screenshotFileName(mediaType: string, now = new Date()): string {
+  const extension = clipboardImageExtension(mediaType);
+  if (!extension) throw new Error(`不支持的剪贴板图片类型：${mediaType}`);
+  const date = [now.getFullYear(), now.getMonth() + 1, now.getDate()].map((value) => String(value).padStart(2, "0")).join("");
+  const time = [now.getHours(), now.getMinutes(), now.getSeconds()].map((value) => String(value).padStart(2, "0")).join("");
+  return `截图-${date}-${time}.${extension}`;
+}
+
+export function isCommentSubmitShortcut(event: { key: string; ctrlKey: boolean; metaKey: boolean; isComposing?: boolean }): boolean {
+  return event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.isComposing;
+}
+
 const TOKEN_PRICES: Record<string, { input: number; cached: number; output: number }> = {
   "gpt-5.6-sol": { input: 5, cached: 0.5, output: 30 },
   "gpt-5.6-terra": { input: 2, cached: 0.2, output: 12 },

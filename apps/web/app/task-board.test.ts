@@ -48,17 +48,20 @@ test("groups visible tasks under a commission swimlane without consuming the mai
   assert.deepEqual(taskSwimlanes(tasks, tasks)[0]?.tasks.map((task) => task.id), ["main", "same", "cross"]);
 });
 
-test("separates running tasks from tasks waiting for human attention", () => {
+test("counts complete active trees while excluding an archived main task and all descendants", () => {
   const overviewTasks = [
     { ...base, id: "running", parent_id: null, number_path: "1", title: "Running", status: "in_progress", latestRunStatus: "running" },
     { ...base, id: "approval", parent_id: null, number_path: "2", title: "Approval", status: "in_progress", latestRunStatus: "waiting_approval" },
     { ...base, id: "input", parent_id: null, number_path: "3", title: "Input", status: "in_progress", latestRunStatus: "waiting_input" },
     { ...base, id: "blocked", parent_id: null, number_path: "4", title: "Blocked", status: "blocked" },
     { ...base, id: "done", parent_id: null, number_path: "5", title: "Done", status: "done" },
-    { ...base, id: "archived", parent_id: null, number_path: "6", title: "Archived", status: "archived" }
+    { ...base, id: "active-main", parent_id: null, number_path: "6", title: "Active main", status: "done" },
+    { ...base, id: "archived-child", parent_id: "active-main", number_path: "6.1", title: "Archived child", status: "archived" },
+    { ...base, id: "archived-main", parent_id: null, number_path: "7", title: "Archived main", status: "archived" },
+    { ...base, id: "stale-child", parent_id: "archived-main", number_path: "7.1", title: "Stale child", status: "done" }
   ] as Task[];
 
-  assert.deepEqual(workspaceOverviewStats(overviewTasks), { total: 5, completed: 1, running: 1, attention: 3, completion: 20 });
+  assert.deepEqual(workspaceOverviewStats(overviewTasks), { total: 7, completed: 3, running: 1, attention: 3, completion: 43 });
 });
 
 test("moves a swimlane into the archived group when its main task is archived", () => {

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import type { FastifyInstance } from "fastify";
+import { attachmentData, registerAttachmentParsers, removePendingAttachment, selectedTaskAttachments, storeAttachment } from "./attachments.ts";
 import { addMainTaskComment, addTaskComment, mentionsAgent, type AgentMentionHandler } from "./comments.ts";
 import { generateAcceptanceDocuments } from "./documents.ts";
 import { notify } from "./notifications.ts";
@@ -48,7 +49,8 @@ class CycleError extends Error {
   }
 }
 
-export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSync, mentionAgent?: AgentMentionHandler): void {
+export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSync, mentionAgent?: AgentMentionHandler, attachmentsRoot = "attachments"): void {
+  registerAttachmentParsers(server);
   server.get<{ Params: { id: string }; Querystring: Record<string, string | undefined> }>("/api/projects/:id/tasks", async (request) => {
     projectExists(database, request.params.id);
     const tasks = queryTasks(database, request.params.id, request.query);
@@ -188,18 +190,61 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
 
   server.get<{ Params: { id: string } }>("/api/tasks/:id/comments", async (request) => {
     taskById(database, request.params.id);
-    return database.prepare("SELECT * FROM comments WHERE task_id = ? ORDER BY created_at, rowid").all(request.params.id);
+    return commentsWithAttachments(database, request.params.id);
   });
 
   server.post<{ Params: { id: string }; Body: Record<string, unknown> }>("/api/tasks/:id/comments", async (request, reply) => {
     const task = activeTask(database, request.params.id);
-    const content = requiredString(request.body?.content, "content");
+    const content = optionalString(request.body?.content, "content") ?? "";
     const parentId = nullableString(request.body?.parentId ?? request.body?.parent_id, "parentId", null);
-    const comment = addTaskComment(database, { taskId: task.id, authorType: "human", content, parentId });
-    const agentMention = mentionsAgent(content)
-      ? mentionAgent ? await mentionAgent(task.id, content) : { action: "unavailable" as const, message: "Agent runtime is unavailable" }
-      : undefined;
-    return reply.code(201).send({ ...comment, ...(agentMention ? { agentMention } : {}) });
+    const attachmentIds = request.body?.attachmentIds === undefined && request.body?.attachment_ids === undefined ? [] : stringArray(request.body?.attachmentIds ?? request.body?.attachment_ids, "attachmentIds");
+    const attachments = selectedTaskAttachments(database, task.id, attachmentIds, "unlinked");
+    if (!content && !attachments.length) throw badRequest("content or attachmentIds is required");
+    const comment = transaction(database, () => {
+      const created = addTaskComment(database, { taskId: task.id, authorType: "human", content, parentId });
+      if (attachments.length) {
+        const claimed = database.prepare(`UPDATE attachments SET comment_id = ? WHERE task_id = ? AND comment_id IS NULL AND run_id IS NULL AND id IN (${attachments.map(() => "?").join(", ")})`)
+          .run(String(created.id), task.id, ...attachments.map((attachment) => attachment.id));
+        if (Number(claimed.changes) !== attachments.length) throw conflict("Attachment was already used by another request");
+      }
+      return created;
+    });
+    let agentMention;
+    if (mentionsAgent(content)) {
+      try {
+        agentMention = mentionAgent
+          ? await mentionAgent(task.id, content, attachments.map((attachment) => attachment.id))
+          : { action: "unavailable" as const, message: "Agent runtime is unavailable" };
+      } catch {
+        agentMention = { action: "unavailable" as const, message: "Agent routing failed after the comment was saved" };
+      }
+    }
+    return reply.code(201).send({ ...comment, attachments, ...(agentMention ? { agentMention } : {}) });
+  });
+
+  server.post<{ Params: { id: string }; Body: Buffer | string }>("/api/tasks/:id/attachments", async (request, reply) => {
+    const task = activeTask(database, request.params.id);
+    const originalName = decodedFileName(requiredHeader(request.headers["x-file-name"], "x-file-name"));
+    const mediaType = String(request.headers["content-type"] ?? "application/octet-stream").split(";", 1)[0]!.toLowerCase();
+    const data = Buffer.isBuffer(request.body) ? request.body : Buffer.from(request.body ?? "", "utf8");
+    return reply.code(201).send(await storeAttachment(database, attachmentsRoot, { commissionId: task.commission_id, taskId: task.id, originalName, mediaType, data }));
+  });
+
+  server.get<{ Params: { id: string; attachmentId: string } }>("/api/tasks/:id/attachments/:attachmentId", async (request, reply) => {
+    taskById(database, request.params.id);
+    const attachment = selectedTaskAttachments(database, request.params.id, [request.params.attachmentId])[0]!;
+    if (attachment.comment_id && !attachment.run_id && database.prepare("SELECT deleted_at FROM comments WHERE id = ?").get(attachment.comment_id)?.deleted_at) throw notFound("Attachment not found");
+    reply
+      .header("Content-Type", attachment.media_type)
+      .header("X-Content-Type-Options", "nosniff")
+      .header("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(attachment.original_name)}`);
+    return reply.send(await attachmentData(attachment, attachmentsRoot));
+  });
+
+  server.delete<{ Params: { id: string; attachmentId: string } }>("/api/tasks/:id/attachments/:attachmentId", async (request, reply) => {
+    activeTask(database, request.params.id);
+    await removePendingAttachment(database, attachmentsRoot, request.params.id, request.params.attachmentId);
+    return reply.code(204).send();
   });
 
   server.delete<{ Params: { id: string; commentId: string } }>("/api/tasks/:id/comments/:commentId", async (request, reply) => {
@@ -649,6 +694,19 @@ function activeTask(database: DatabaseSync, id: string): TaskRow {
   return task;
 }
 
+function commentsWithAttachments(database: DatabaseSync, taskId: string): Array<Record<string, unknown>> {
+  const comments = database.prepare("SELECT * FROM comments WHERE task_id = ? ORDER BY created_at, rowid").all(taskId) as Array<Record<string, unknown>>;
+  const attachments = database.prepare("SELECT * FROM attachments WHERE task_id = ? AND comment_id IS NOT NULL ORDER BY created_at, rowid").all(taskId) as Array<Record<string, unknown>>;
+  const grouped = new Map<string, Array<Record<string, unknown>>>();
+  for (const attachment of attachments) {
+    const commentId = String(attachment.comment_id);
+    const items = grouped.get(commentId) ?? [];
+    items.push(attachment);
+    grouped.set(commentId, items);
+  }
+  return comments.map((comment) => ({ ...comment, attachments: comment.deleted_at ? [] : grouped.get(String(comment.id)) ?? [] }));
+}
+
 function assertParent(database: DatabaseSync, id: string, commissionId: string): TaskRow {
   const parent = activeTask(database, id);
   if (parent.commission_id !== commissionId) throw conflict("Parent task must belong to the same commission");
@@ -696,6 +754,8 @@ function array(value: unknown, name: string): unknown[] {
 }
 
 function stringArray(value: unknown, name: string): string[] { return array(value, name).map((item, index) => requiredString(item, `${name}[${index}]`)); }
+function requiredHeader(value: string | string[] | undefined, name: string): string { if (Array.isArray(value)) value = value[0]; return requiredString(value, name); }
+function decodedFileName(value: string): string { try { return decodeURIComponent(value); } catch { throw badRequest("x-file-name must be URI encoded"); } }
 function requiredString(value: unknown, name: string): string { if (typeof value !== "string" || !value.trim()) throw badRequest(`${name} must be a non-empty string`); return value.trim(); }
 function optionalString(value: unknown, name: string): string | undefined { if (value === undefined || value === null) return undefined; if (typeof value !== "string") throw badRequest(`${name} must be a string`); return value.trim(); }
 function nullableString(value: unknown, name: string, fallback: string | null): string | null { if (value === undefined) return fallback; if (value === null) return null; return requiredString(value, name); }

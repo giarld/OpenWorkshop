@@ -7,6 +7,7 @@ import { deflateSync } from "node:zlib";
 import test from "node:test";
 import Fastify from "fastify";
 import { archiveCommission, reactivateCommission, recoverCommissionLifecycleOperations } from "./commission-archive.ts";
+import { MAX_COMMISSION_ATTACHMENT_BYTES, storeAttachment } from "./attachments.ts";
 import { extractAttachmentText, registerCommissionRoutes, type RequirementAnalyzer } from "./commissions.ts";
 import { openWorkshopDatabase } from "./database.ts";
 import type { TaskPlanner } from "./planner-agent.ts";
@@ -387,6 +388,13 @@ test("stores extracted text under generated paths and enforces attachment limits
     assert.equal(attachment.extracted_text, "hello");
     assert.equal(await readFile(attachment.storage_path, "utf8"), "hello");
     assert.equal(attachment.storage_path.includes("notes.txt"), false);
+    const unknownMime = await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/attachments`, headers: { "content-type": "application/octet-stream", "x-file-name": "browser-empty-type.md" }, payload: Buffer.from("# Markdown") });
+    assert.equal(unknownMime.statusCode, 201);
+    assert.equal(unknownMime.json().media_type, "text/markdown");
+    assert.equal(unknownMime.json().extracted_text, "# Markdown");
+    const markdownAlias = await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/attachments`, headers: { "content-type": "text/x-markdown", "x-file-name": "alias.md" }, payload: Buffer.from("alias") });
+    assert.equal(markdownAlias.statusCode, 201);
+    assert.equal(markdownAlias.json().media_type, "text/markdown");
     assert.equal((await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/attachments`, headers: { "content-type": "text/plain", "x-file-name": "../bad.txt" }, payload: "bad" })).statusCode, 400);
     assert.equal((await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/attachments`, headers: { "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "x-file-name": "broken.docx" }, payload: Buffer.alloc(4) })).statusCode, 400);
     assert.equal((await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/attachments`, headers: { "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "x-file-name": "bomb.docx" }, payload: storedDocx("x", 5 * 1024 * 1024 + 1) })).statusCode, 400);
@@ -402,6 +410,30 @@ test("stores extracted text under generated paths and enforces attachment limits
     assert.throws(() => insertAttachment.run(randomUUID(), commissionId, "large.txt", "text/plain", 50 * 1024 * 1024 + 1, "large", "large", now), /CHECK constraint failed/);
   } finally {
     await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("serializes concurrent uploads so the commission attachment limit cannot be exceeded", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-concurrent-attachments-"));
+  const database = await openWorkshopDatabase(home);
+  try {
+    const projectId = seedProject(database);
+    const now = new Date().toISOString();
+    const commissionId = randomUUID();
+    database.prepare("INSERT INTO commissions (id, project_id, title, status, created_at, updated_at) VALUES (?, ?, 'Concurrent files', 'draft', ?, ?)").run(commissionId, projectId, now, now);
+    const seedAttachment = database.prepare("INSERT INTO attachments (id, commission_id, original_name, media_type, size_bytes, storage_path, sha256, created_at) VALUES (?, ?, ?, 'text/plain', ?, ?, ?, ?)");
+    for (let index = 0; index < 4; index += 1) seedAttachment.run(randomUUID(), commissionId, `existing-${index}.txt`, 40 * 1024 * 1024, `existing-${index}`, `existing-${index}`, now);
+    const data = Buffer.alloc(30 * 1024 * 1024, "x");
+    const results = await Promise.allSettled([
+      storeAttachment(database, join(home, "attachments"), { commissionId, originalName: "first.txt", mediaType: "text/plain", data }),
+      storeAttachment(database, join(home, "attachments"), { commissionId, originalName: "second.txt", mediaType: "text/plain", data })
+    ]);
+    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+    assert.equal(results.filter((result) => result.status === "rejected" && result.reason instanceof Error && result.reason.message === "Commission attachments exceed 200 MB").length, 1);
+    assert.equal((database.prepare("SELECT SUM(size_bytes) AS bytes FROM attachments WHERE commission_id = ?").get(commissionId) as { bytes: number }).bytes, MAX_COMMISSION_ATTACHMENT_BYTES - 10 * 1024 * 1024);
+  } finally {
     database.close();
     await rm(home, { recursive: true, force: true });
   }

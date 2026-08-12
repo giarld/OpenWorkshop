@@ -103,8 +103,17 @@ export function taskSwimlaneGroups(tasks: Task[], visibleTasks: Task[]): TaskSwi
 }
 
 export function workspaceOverviewStats(tasks: Task[]): WorkspaceOverviewStats {
-  const current = tasks.filter((task) => task.status !== "archived");
-  const completed = current.filter((task) => task.status === "done").length;
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const current = tasks.filter((task) => {
+    const visited = new Set<string>();
+    let root = task;
+    while (root.parent_id && byId.has(root.parent_id) && !visited.has(root.id)) {
+      visited.add(root.id);
+      root = byId.get(root.parent_id)!;
+    }
+    return root.status !== "archived";
+  });
+  const completed = current.filter((task) => task.status === "done" || task.status === "archived").length;
   const running = current.filter((task) => ["queued", "preparing", "running"].includes(task.latestRunStatus ?? "")).length;
   const attention = current.filter((task) => task.status === "blocked" || ["waiting_approval", "waiting_input"].includes(task.latestRunStatus ?? "")).length;
   return {

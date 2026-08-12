@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import Fastify from "fastify";
 import { openWorkshopDatabase } from "./database.ts";
-import { browseDirectory, detectVcs, ensureWorkshopOwnership, registerProjectRoutes, resolveWithinRoot, scanProject, type CommandRunner } from "./projects.ts";
+import { PROJECT_NAME_MAX_LENGTH, browseDirectory, detectVcs, ensureWorkshopOwnership, registerProjectRoutes, resolveWithinRoot, scanProject, type CommandRunner } from "./projects.ts";
 
 test("rejects lexical and realpath escapes from an allowed root", async () => {
   const home = await mkdtemp(join(tmpdir(), "project-workshop-paths-"));
@@ -135,6 +135,35 @@ test("associates and archives a project without deleting its record", async () =
     assert.equal(restored.name, "Restored");
     assert.equal(restored.archived_at, null);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM projects WHERE id = ?").get(associated.id) as { count: number }).count, 1);
+  } finally {
+    await server.close();
+    database?.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("rejects project names over the configured length limit", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-project-name-"));
+  const allowed = join(home, "allowed");
+  const project = join(allowed, "project");
+  const data = join(home, "data");
+  const server = Fastify();
+  let database;
+  try {
+    await Promise.all([mkdir(project, { recursive: true }), mkdir(data)]);
+    database = await openWorkshopDatabase(data);
+    registerProjectRoutes(server, database);
+    const root = (await server.inject({ method: "POST", url: "/api/roots", payload: { path: allowed } })).json() as { id: string };
+    const tooLong = "P".repeat(PROJECT_NAME_MAX_LENGTH + 1);
+    const create = await server.inject({ method: "POST", url: "/api/projects", payload: { name: tooLong, path: project, rootPathId: root.id } });
+    assert.equal(create.statusCode, 400);
+    assert.match(create.json().message as string, new RegExp(`at most ${PROJECT_NAME_MAX_LENGTH}`));
+
+    const created = await server.inject({ method: "POST", url: "/api/projects", payload: { name: "Valid", path: project, rootPathId: root.id } });
+    assert.equal(created.statusCode, 201);
+    const update = await server.inject({ method: "PUT", url: `/api/projects/${created.json().id as string}`, payload: { name: tooLong } });
+    assert.equal(update.statusCode, 400);
+    assert.match(update.json().message as string, new RegExp(`at most ${PROJECT_NAME_MAX_LENGTH}`));
   } finally {
     await server.close();
     database?.close();

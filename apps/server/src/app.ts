@@ -35,8 +35,8 @@ export async function createServer(database: DatabaseSync, webRoot = DEFAULT_WEB
   registerDocumentRoutes(server, database);
   registerNotificationRoutes(server, database);
   registerUsageStatisticsRoutes(server, database);
-  const mentionAgent = await registerProductionRunRoutes(server, database, launchRunClient ?? ((options) => CodexAppServer.launch(options)));
-  registerTaskRoutes(server, database, mentionAgent);
+  const mentionAgent = await registerProductionRunRoutes(server, database, launchRunClient ?? ((options) => CodexAppServer.launch(options)), attachmentsRoot);
+  registerTaskRoutes(server, database, mentionAgent, attachmentsRoot);
   server.get("/api/health", async () => ({ status: "ok" }));
   await server.register(fastifyStatic, { root: webRoot, wildcard: false });
   server.setNotFoundHandler((request, reply) => {

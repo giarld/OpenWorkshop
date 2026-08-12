@@ -1,9 +1,8 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { inflateRawSync, inflateSync } from "node:zlib";
 import type { FastifyInstance } from "fastify";
+import { registerAttachmentParsers, storeAttachment } from "./attachments.ts";
 import { resolvedRoleConfig } from "./agent-settings.ts";
 import { archiveCommission, deleteClarifyingCommission, reactivateCommission } from "./commission-archive.ts";
 import type { CodexRoleConfig } from "./codex.ts";
@@ -12,21 +11,8 @@ import type { RequirementTokenUsage } from "./requirement-token-usage.js";
 import { createTaskPlan } from "./tasks.ts";
 
 const CLARIFICATION_COMPLETION_QUESTION = "需求信息已经足够。是否确认结束需求澄清并生成需求文档？";
-const MAX_FILE_BYTES = 50 * 1024 * 1024;
-const MAX_COMMISSION_BYTES = 200 * 1024 * 1024;
 // ponytail: cap in-process extraction at 5 MiB; move parsing to isolated streaming workers if larger documents become required.
 const MAX_EXTRACTED_BYTES = 5 * 1024 * 1024;
-const SUPPORTED_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".txt", ".md", ".pdf", ".docx"]);
-const RAW_MEDIA_TYPES = [
-  "application/pdf",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "image/png",
-  "image/jpeg",
-  "image/gif",
-  "image/webp",
-  "text/markdown",
-  "text/plain"
-];
 
 type CommissionRow = {
   id: string;
@@ -66,10 +52,7 @@ export type RequirementAnalyzer = (input: {
 }) => Promise<RequirementAnalysis>;
 
 export function registerCommissionRoutes(server: FastifyInstance, database: DatabaseSync, attachmentsRoot: string, analyze?: RequirementAnalyzer, plan?: TaskPlanner): void {
-  for (const mediaType of RAW_MEDIA_TYPES) {
-    if (mediaType === "text/plain" && server.hasContentTypeParser(mediaType)) server.removeContentTypeParser(mediaType);
-    if (!server.hasContentTypeParser(mediaType)) server.addContentTypeParser(mediaType, { parseAs: "buffer", bodyLimit: MAX_FILE_BYTES }, (_request, body, done) => done(null, body));
-  }
+  registerAttachmentParsers(server);
 
   server.get<{ Params: { id: string }; Querystring: { archived?: string } }>("/api/projects/:id/commissions", async (request) => {
     projectExists(database, request.params.id);
@@ -121,29 +104,9 @@ export function registerCommissionRoutes(server: FastifyInstance, database: Data
   server.post<{ Params: { id: string }; Body: Buffer | string }>("/api/commissions/:id/attachments", async (request, reply) => {
     const commission = mutableCommission(database, request.params.id);
     const originalName = decodedFileName(requiredHeader(request.headers["x-file-name"], "x-file-name"));
-    const extension = extname(originalName).toLowerCase();
-    if (basename(originalName) !== originalName || !SUPPORTED_EXTENSIONS.has(extension)) throw badRequest("Unsupported or unsafe attachment name");
     const mediaType = String(request.headers["content-type"] ?? "application/octet-stream").split(";", 1)[0]!.toLowerCase();
     const data = Buffer.isBuffer(request.body) ? request.body : Buffer.from(request.body ?? "", "utf8");
-    if (data.length > MAX_FILE_BYTES) throw tooLarge("Attachment exceeds 50 MB");
-    const used = (database.prepare("SELECT COALESCE(SUM(size_bytes), 0) AS bytes FROM attachments WHERE commission_id = ?").get(commission.id) as { bytes: number }).bytes;
-    if (used + data.length > MAX_COMMISSION_BYTES) throw tooLarge("Commission attachments exceed 200 MB");
-
-    const id = randomUUID();
-    const directory = join(attachmentsRoot, commission.id);
-    const storagePath = join(directory, id);
-    await mkdir(directory, { recursive: true });
-    await writeFile(storagePath, data, { flag: "wx" });
-    try {
-      database.prepare(`
-        INSERT INTO attachments (id, commission_id, original_name, media_type, size_bytes, storage_path, sha256, extracted_text, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(id, commission.id, originalName, mediaType, data.length, storagePath, createHash("sha256").update(data).digest("hex"), extractAttachmentText(extension, data), new Date().toISOString());
-    } catch (error) {
-      await rm(storagePath, { force: true });
-      throw error;
-    }
-    return reply.code(201).send(database.prepare("SELECT * FROM attachments WHERE id = ?").get(id));
+    return reply.code(201).send(await storeAttachment(database, attachmentsRoot, { commissionId: commission.id, originalName, mediaType, data }));
   });
 
   server.post<{ Params: { id: string }; Body: { content?: unknown } }>("/api/commissions/:id/messages", async (request, reply) => {
@@ -469,5 +432,4 @@ const badRequest = (message: string, cause?: unknown) => statusError(message, 40
 const badGateway = (message: string) => statusError(message, 502);
 const notFound = (message: string) => statusError(message, 404);
 const conflict = (message: string) => statusError(message, 409);
-const tooLarge = (message: string) => statusError(message, 413);
 const unavailable = (message: string) => statusError(message, 503);

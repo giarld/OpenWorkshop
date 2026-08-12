@@ -245,8 +245,8 @@ function clearCommissionRows(database: DatabaseSync, commissionId: string, notif
   database.prepare("UPDATE documents SET current_version_id = NULL WHERE commission_id = ?").run(commissionId);
   database.prepare("DELETE FROM document_versions WHERE document_id IN (SELECT id FROM documents WHERE commission_id = ?)").run(commissionId);
   database.prepare("DELETE FROM documents WHERE commission_id = ?").run(commissionId);
-  database.prepare("DELETE FROM tasks WHERE commission_id = ?").run(commissionId);
   database.prepare("DELETE FROM attachments WHERE commission_id = ?").run(commissionId);
+  database.prepare("DELETE FROM tasks WHERE commission_id = ?").run(commissionId);
   database.prepare("DELETE FROM requirement_messages WHERE commission_id = ?").run(commissionId);
   database.prepare("DELETE FROM requirement_versions WHERE commission_id = ?").run(commissionId);
 }
@@ -255,13 +255,13 @@ function restoreCommissionRows(database: DatabaseSync, snapshot: ArchiveSnapshot
   const tables = snapshot.tables;
   insertRows(database, "requirement_versions", tables.requirementVersions);
   insertRows(database, "requirement_messages", tables.requirementMessages);
-  insertRows(database, "attachments", tables.attachments.map((row) => ({ ...row, storage_path: join(attachmentsRoot, commissionId, String(row.id)) })));
   if (tables.tasks.length) {
     database.prepare("UPDATE commissions SET status = 'planned', active_requirement_version_id = ? WHERE id = ?")
       .run(snapshot.commission.active_requirement_version_id ?? null, commissionId);
   }
   insertRows(database, "tasks", tables.tasks.map((row) => ({ ...row, parent_id: null })));
   for (const row of tables.tasks) if (row.parent_id) database.prepare("UPDATE tasks SET parent_id = ? WHERE id = ?").run(sqlValue(row, "parent_id"), sqlValue(row, "id"));
+  insertRows(database, "attachments", tables.attachments.map((row) => ({ ...row, storage_path: join(attachmentsRoot, commissionId, String(row.id)), comment_id: null, run_id: null })));
   insertRows(database, "task_dependencies", tables.taskDependencies);
   insertRows(database, "task_labels", tables.taskLabels);
   insertRows(database, "execution_grants", tables.executionGrants);
@@ -269,6 +269,7 @@ function restoreCommissionRows(database: DatabaseSync, snapshot: ArchiveSnapshot
   for (const row of tables.runs) if (row.retry_root_run_id) database.prepare("UPDATE runs SET retry_root_run_id = ? WHERE id = ?").run(sqlValue(row, "retry_root_run_id"), sqlValue(row, "id"));
   insertRows(database, "comments", tables.comments.map((row) => ({ ...row, parent_id: null })));
   for (const row of tables.comments) if (row.parent_id) database.prepare("UPDATE comments SET parent_id = ? WHERE id = ?").run(sqlValue(row, "parent_id"), sqlValue(row, "id"));
+  for (const row of tables.attachments) database.prepare("UPDATE attachments SET comment_id = ?, run_id = ? WHERE id = ?").run(row.comment_id ?? null, row.run_id ?? null, sqlValue(row, "id"));
   insertRows(database, "run_events", tables.runEvents);
   insertRows(database, "approvals", tables.approvals);
   insertRows(database, "evidence", tables.evidence);

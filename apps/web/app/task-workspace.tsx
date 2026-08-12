@@ -17,11 +17,12 @@ import { Children, useEffect, useMemo, useRef, useState, type FormEvent, type Re
 import ReactMarkdown from "react-markdown";
 import webPackage from "../package.json";
 import { AVATAR_SETTINGS_EVENT, DEFAULT_AVATARS, avatarSettings, isImageAvatar, type AvatarSettings } from "./avatar-settings";
+import { browserNotificationRuntime, notificationHashTarget, notificationNavigation, pushBrowserNotifications, type AppNotification } from "./browser-notifications";
 import { DeliveryWorkspace } from "./delivery-workspace";
 import { CommissionWorkspace } from "./commission-workspace";
 import { UsageStatisticsWorkspace } from "./usage-statistics-workspace";
-import { activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, projectIdAfterArchive, storedWorkspaceView, workspaceContentState, type ManagedProject, type WorkspaceView } from "./project-management";
-import { commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, tokenPrice, tokenUsageTotals, type CodeChange, type MentionTrigger, type ReviewFinding, type RunEvent, type RunQuestion } from "./task-run";
+import { PROJECT_NAME_MAX_LENGTH, activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, initialWorkspaceView, projectIdAfterArchive, projectNameError, workspaceContentState, type ManagedProject, type WorkspaceView } from "./project-management";
+import { clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, tokenPrice, tokenUsageTotals, type CodeChange, type MentionTrigger, type ReviewFinding, type RunEvent, type RunQuestion } from "./task-run";
 import {
   TASK_STATUSES,
   canDropTask,
@@ -42,7 +43,9 @@ type Project = ManagedProject;
 type RootPath = { id: string; path: string; real_path: string };
 type Commission = { id: string; title: string; status: string };
 type Run = { id: string; task_id: string; role: string; status: string; attempt_no: number; started_at: string | null; finished_at: string | null; failure_summary: string | null; token_input: number | null; token_output: number | null; token_cached: number | null; configSnapshot?: { model?: string } };
-type TaskComment = { id: string; task_id: string; parent_id: string | null; run_id: string | null; author_type: "human" | "agent" | "system"; agent_role: string | null; kind: string; content: string; created_at: string; deleted_at: string | null };
+type TaskAttachment = { id: string; task_id: string; comment_id: string | null; run_id: string | null; original_name: string; media_type: string; size_bytes: number };
+type AttachmentUploadProgress = { phase: "uploading" | "complete"; current: number; total: number; fileName: string };
+type TaskComment = { id: string; task_id: string; parent_id: string | null; run_id: string | null; author_type: "human" | "agent" | "system"; agent_role: string | null; kind: string; content: string; created_at: string; deleted_at: string | null; attachments: TaskAttachment[] };
 type CommentPostResponse = TaskComment & { agentMention?: { action: "steered" | "queued" | "triggered" | "unavailable"; message?: string } };
 type View = WorkspaceView;
 type BoardView = "board" | "list";
@@ -102,6 +105,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
   const [taskTokenRuns, setTaskTokenRuns] = useState<Run[]>([]);
   const [taskRunEvents, setTaskRunEvents] = useState<Record<string, RunEvent[]>>({});
   const [taskBusy, setTaskBusy] = useState(false);
+  const [notificationTarget, setNotificationTarget] = useState<{ entityType: "task" | "approval"; entityId: string; projectId: string | null } | null>(null);
   const taskDialog = useRef<HTMLDialogElement>(null);
   const propertyDialog = useRef<HTMLDialogElement>(null);
   const projectManagementDialog = useRef<HTMLDialogElement>(null);
@@ -112,11 +116,12 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { delay: 180, tolerance: 8 } }), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
 
   useEffect(() => {
-    setView(storedWorkspaceView(localStorage.getItem(SELECTED_VIEW_KEY)));
+    setView(initialWorkspaceView(localStorage.getItem(SELECTED_VIEW_KEY), location.hash));
     setViewLoaded(true);
     void api<Project[]>("/api/projects").then((items) => {
       const active = activeProjects(items);
-      const preferredId = preferredProjectId(active, localStorage.getItem(SELECTED_PROJECT_KEY));
+      const notificationProjectId = notificationHashTarget(location.hash)?.projectId;
+      const preferredId = notificationProjectId && active.some((project) => project.id === notificationProjectId) ? notificationProjectId : preferredProjectId(active, localStorage.getItem(SELECTED_PROJECT_KEY));
       setProjects(active);
       setProjectId(preferredId);
       if (!preferredId) setLoading(false);
@@ -168,15 +173,32 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
 
   useEffect(() => {
     const routeNotification = () => {
-      if (location.hash.startsWith("#task-")) {
-        setView("board");
-        window.setTimeout(() => focusTask(location.hash.slice(6)), 0);
-      } else if (location.hash.startsWith("#approval-")) setView("notifications");
+      const target = notificationHashTarget(location.hash);
+      if (target) navigateNotificationTarget(target);
     };
     routeNotification();
     window.addEventListener("hashchange", routeNotification);
     return () => window.removeEventListener("hashchange", routeNotification);
   }, []);
+
+  useEffect(() => {
+    const target = notificationTarget;
+    if (target?.entityType !== "task" || loading || view !== "board" || (target.projectId && target.projectId !== projectId) || !tasks.some((task) => task.id === target.entityId)) return;
+    window.setTimeout(() => focusTask(target.entityId), 0);
+    if (notificationTarget) setNotificationTarget(null);
+  }, [loading, notificationTarget, projectId, tasks, view]);
+
+  function navigateNotificationTarget(target: { entityType: "task" | "approval"; entityId: string; projectId: string | null }) {
+    if (target.projectId) setProjectId(target.projectId);
+    setView(target.entityType === "task" ? "board" : "notifications");
+    setNotificationTarget(target.entityType === "task" ? target : null);
+  }
+
+  function navigateNotification(item: AppNotification) {
+    const target = notificationNavigation(item, location.hash, projectIdRef.current);
+    if (target.updateHash) history.pushState(null, "", target.hash);
+    navigateNotificationTarget(target);
+  }
 
   const visibleTasks = useMemo(() => filterAndSortTasks(tasks, filters, sort, descending), [tasks, filters, sort, descending]);
   const labels = useMemo(() => [...new Set(tasks.flatMap((task) => task.labels.map((label) => label.name)))].sort(), [tasks]);
@@ -288,6 +310,8 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     const name = String(data.get("name") ?? "").trim() || path.split(/[\\/]/).filter(Boolean).at(-1) || "本地项目";
     setMessage("");
     setAssociationError("");
+    const nameError = projectNameError(name);
+    if (nameError) { setAssociationError(nameError); return; }
     try {
       // ponytail: one root per project; add shared-root selection when the settings page exists.
       const roots = await api<RootPath[]>("/api/roots");
@@ -314,7 +338,8 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     event.preventDefault();
     if (!managedProject) return;
     const name = String(new FormData(event.currentTarget).get("name") ?? "").trim();
-    if (!name) { setProjectManagementError("项目名称不能为空。"); return; }
+    const nameError = projectNameError(name);
+    if (nameError) { setProjectManagementError(nameError); return; }
     setProjectManagementBusy(true); setProjectManagementError("");
     try {
       const updated = await api<Project>(`/api/projects/${managedProject.id}`, { method: "PUT", body: JSON.stringify({ name }) });
@@ -404,7 +429,15 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
   }
 
   async function refreshNotificationCount() {
-    try { setUnreadNotifications((await api<Array<{ id: string }>>("/api/notifications?unread=true")).length); }
+    try {
+      const items = await api<AppNotification[]>("/api/notifications?unread=true");
+      setUnreadNotifications(items.length);
+      await pushBrowserNotifications(items, browserNotificationRuntime((item) => {
+        window.focus();
+        navigateNotification(item);
+        void api(`/api/notifications/${item.id}/read`, { method: "POST" }).then(() => refreshNotificationCount()).catch(() => undefined);
+      }));
+    }
     catch {}
   }
 
@@ -466,18 +499,6 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     await api(`/api/tasks/${task.id}/trigger`, { method: "POST" });
   }
 
-  async function steerRun(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const message = String(new FormData(form).get("message") ?? "").trim();
-    const run = taskRuns[0];
-    if (!run || !message) return;
-    setTaskBusy(true);
-    try { await api(`/api/runs/${run.id}/steer`, { method: "POST", body: JSON.stringify({ message }) }); form.reset(); await refreshTaskDialog(run.task_id); setMessage("已向当前 Run 发送补充指令。"); }
-    catch (error) { setMessage((error as Error).message); }
-    finally { setTaskBusy(false); }
-  }
-
   async function answerRunInput(event: FormEvent<HTMLFormElement>, requestId: string, questions: RunQuestion[]) {
     event.preventDefault();
     const run = taskRuns[0];
@@ -493,7 +514,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
   const associate = <details className="associate-project">
     <summary>关联本地项目</summary>
     <form onSubmit={associateProject}>
-      <label>项目名称（可选）<input name="name" placeholder="默认使用目录名" /></label>
+      <label>项目名称（可选）<input name="name" maxLength={PROJECT_NAME_MAX_LENGTH} placeholder="默认使用目录名" /><small>最多 {PROJECT_NAME_MAX_LENGTH} 个字符。</small></label>
       <label>项目绝对路径<input name="path" placeholder="/Users/me/Codes/project" required /></label>
       {associationError && <p className="workspace-message" role="alert">{associationError}</p>}
       <div className="associate-actions">
@@ -548,7 +569,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
         {showOverview && <WorkspaceOverview total={overview.total} completed={overview.completed} running={overview.running} attention={overview.attention} completion={overview.completion} />}
         {view === "projects" && <ProjectManagementPage projects={projects} projectId={projectId} associate={associate} onSelect={selectProject} onManage={openProjectManagement} />}
         <CommissionWorkspace projectId={projectId} section={view === "requirements" ? "requirements" : "commissions"} hidden={!(["commissions", "requirements"] as View[]).includes(view)} onChanged={() => void refreshProject()} onStageChange={(stage) => setView(stage)} />
-        <DeliveryWorkspace projectId={projectId} tasks={tasks} section={view === "notifications" ? "notifications" : "delivery"} hidden={!(["delivery", "notifications"] as View[]).includes(view)} onChanged={() => { void loadCurrentProjectTasks(); void refreshNotificationCount(); }} />
+        <DeliveryWorkspace projectId={projectId} tasks={tasks} section={view === "notifications" ? "notifications" : "delivery"} hidden={!(["delivery", "notifications"] as View[]).includes(view)} onChanged={() => { void loadCurrentProjectTasks(); void refreshNotificationCount(); }} onNavigateNotification={navigateNotification} />
         {view === "usage" && <UsageStatisticsWorkspace />}
         {view === "board" && <><div className="filters">
           <div className="view-switch" aria-label="看板显示方式"><button className={boardView === "board" ? "active" : ""} onClick={() => setBoardView("board")}>看板</button><button className={boardView === "list" ? "active" : ""} onClick={() => setBoardView("list")}>列表</button></div>
@@ -565,7 +586,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
         </>}
       </section>
     </div>
-    <TaskRunDialog dialog={taskDialog} task={taskDialogTask} tasks={tasks} runs={taskRuns} tokenRuns={taskTokenRuns} eventsByRun={taskRunEvents} busy={taskBusy} message={message} onClose={() => setTaskDialogTask(null)} onOpenTask={openTask} onProperties={(task) => { setPropertyError(""); setPropertyTask(task); }} onArchive={(task) => archiveTasks([task.id])} onUnarchive={unarchiveTask} onAction={taskAction} onSteer={steerRun} onAnswer={answerRunInput} onApprovals={() => { setTaskDialogTask(null); setView("notifications"); }} />
+    <TaskRunDialog dialog={taskDialog} task={taskDialogTask} tasks={tasks} runs={taskRuns} tokenRuns={taskTokenRuns} eventsByRun={taskRunEvents} busy={taskBusy} message={message} onClose={() => setTaskDialogTask(null)} onOpenTask={openTask} onProperties={(task) => { setPropertyError(""); setPropertyTask(task); }} onArchive={(task) => archiveTasks([task.id])} onUnarchive={unarchiveTask} onAction={taskAction} onAnswer={answerRunInput} onApprovals={() => { setTaskDialogTask(null); setView("notifications"); }} />
     <TaskPropertyDialog dialog={propertyDialog} task={propertyTask} busy={propertyBusy} error={propertyError} onClose={() => setPropertyTask(null)} onSubmit={saveTaskProperties} />
     <ProjectManagementDialog dialog={projectManagementDialog} project={managedProject} busy={projectManagementBusy} error={projectManagementError} onClose={() => setManagedProject(null)} onSubmit={saveManagedProject} onArchive={archiveManagedProject} />
   </section>;
@@ -591,7 +612,7 @@ function ProjectManagementDialog({ dialog, project, busy, error, onClose, onSubm
   return <dialog ref={dialog} className="commission-dialog project-management-dialog" onClose={onClose}>
     <header className="commission-dialog-header"><div><p className="eyebrow">Project Management</p><h2>管理项目</h2>{project && <p>{project.name}</p>}</div><button type="button" className="secondary dialog-close" onClick={onClose}>关闭</button></header>
     {project && <form key={project.id} className="commission-dialog-body commission-form" onSubmit={onSubmit}>
-      <label>项目名称<input name="name" defaultValue={project.name} required disabled={busy} /></label>
+      <label>项目名称<input name="name" defaultValue={project.name} maxLength={PROJECT_NAME_MAX_LENGTH} required disabled={busy} /><small>最多 {PROJECT_NAME_MAX_LENGTH} 个字符。</small></label>
       <label>项目路径<input value={project.real_path || project.path} readOnly aria-readonly="true" /></label>
       {error && <p className="workspace-message" role="alert">{error}</p>}
       <div className="project-management-dialog-actions"><button type="button" className="project-unlink" disabled={busy} onClick={onArchive}>解除关联</button><span><button type="button" className="secondary" disabled={busy} onClick={onClose}>取消</button><button disabled={busy}>{busy ? "保存中…" : "保存名称"}</button></span></div>
@@ -732,18 +753,21 @@ function TaskRow({ task, tasks, depth, collapsed, selected, onToggle, onSelect, 
   </>;
 }
 
-function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, eventsByRun, busy, message, onClose, onOpenTask, onProperties, onArchive, onUnarchive, onAction, onSteer, onAnswer, onApprovals }: { dialog: React.RefObject<HTMLDialogElement | null>; task: Task | null; tasks: Task[]; runs: Run[]; tokenRuns: Run[]; eventsByRun: Record<string, RunEvent[]>; busy: boolean; message: string; onClose(): void; onOpenTask(task: Task): Promise<void>; onProperties(task: Task): void; onArchive(task: Task): void; onUnarchive(task: Task): void; onAction(path: "trigger" | "pause" | "resume" | "cancel", success: string): Promise<void>; onSteer(event: FormEvent<HTMLFormElement>): Promise<void>; onAnswer(event: FormEvent<HTMLFormElement>, requestId: string, questions: RunQuestion[]): Promise<void>; onApprovals(): void }) {
+function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, eventsByRun, busy, message, onClose, onOpenTask, onProperties, onArchive, onUnarchive, onAction, onAnswer, onApprovals }: { dialog: React.RefObject<HTMLDialogElement | null>; task: Task | null; tasks: Task[]; runs: Run[]; tokenRuns: Run[]; eventsByRun: Record<string, RunEvent[]>; busy: boolean; message: string; onClose(): void; onOpenTask(task: Task): Promise<void>; onProperties(task: Task): void; onArchive(task: Task): void; onUnarchive(task: Task): void; onAction(path: "trigger" | "pause" | "resume" | "cancel", success: string): Promise<void>; onAnswer(event: FormEvent<HTMLFormElement>, requestId: string, questions: RunQuestion[]): Promise<void>; onApprovals(): void }) {
   const [activeTab, setActiveTab] = useState<"comments" | "runs" | "changes">("comments");
   const [openRunIds, setOpenRunIds] = useState<Set<string>>(new Set());
   const [comments, setComments] = useState<TaskComment[]>([]);
+  const [commentsLoaded, setCommentsLoaded] = useState(false);
   const [commentBusy, setCommentBusy] = useState(false);
   const [commentError, setCommentError] = useState("");
+  const [commentUploadProgress, setCommentUploadProgress] = useState<AttachmentUploadProgress | null>(null);
   useEffect(() => {
     setActiveTab("comments");
     setCommentError("");
-    if (!task) return setComments([]);
+    setCommentsLoaded(false);
+    if (!task) { setComments([]); return; }
     let current = true;
-    const load = () => void api<TaskComment[]>(`/api/tasks/${task.id}/comments`).then((items) => { if (current) setComments(items); }).catch((error: Error) => { if (current && !comments.length) setCommentError(error.message); });
+    const load = () => void api<TaskComment[]>(`/api/tasks/${task.id}/comments`).then((items) => { if (current) { setComments(items); setCommentsLoaded(true); } }).catch((error: Error) => { if (current && !comments.length) setCommentError(error.message); });
     load();
     const timer = window.setInterval(load, 2000);
     return () => { current = false; window.clearInterval(timer); };
@@ -766,16 +790,19 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, eventsByRun, busy
     const form = event.currentTarget;
     const data = new FormData(form);
     const content = String(data.get("content") ?? "").trim();
-    if (!content) return false;
+    const files = data.getAll("attachments").filter((item): item is File => item instanceof File && item.size > 0);
+    if (!content && !files.length) return false;
     setCommentBusy(true); setCommentError("");
+    let uploaded: TaskAttachment[] = [];
     try {
-      const comment = await api<CommentPostResponse>(`/api/tasks/${task.id}/comments`, { method: "POST", body: JSON.stringify({ content, parentId: data.get("parentId") || null }) });
+      uploaded = await uploadTaskAttachments(task.id, files, setCommentUploadProgress);
+      const comment = await api<CommentPostResponse>(`/api/tasks/${task.id}/comments`, { method: "POST", body: JSON.stringify({ content, parentId: data.get("parentId") || null, attachmentIds: uploaded.map((item) => item.id) }) });
       setComments((current) => [...current, comment]);
       form.reset();
       if (comment.agentMention?.action === "unavailable") setCommentError(`评论已保存，但 Agent 未响应：${comment.agentMention.message ?? "当前不可用"}`);
       return true;
-    } catch (error) { setCommentError((error as Error).message); return false; }
-    finally { setCommentBusy(false); }
+    } catch (error) { await discardTaskAttachments(task.id, uploaded); setCommentError((error as Error).message); return false; }
+    finally { setCommentUploadProgress(null); setCommentBusy(false); }
   }
   async function deleteComment(comment: TaskComment) {
     if (!task || !window.confirm("删除这条评论？其回复会保留。")) return;
@@ -800,7 +827,6 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, eventsByRun, busy
         {task.status === "done" && <button className="secondary" disabled={busy} onClick={() => onArchive(task)}>{task.parent_id ? "归档任务" : "归档任务组"}</button>}
         {task.status === "archived" && <button className="secondary" disabled={busy} onClick={() => onUnarchive(task)}>{task.parent_id ? "解除归档" : "解除任务组归档"}</button>}
       </div>
-      {active && latest?.status !== "waiting_input" && <form className="task-steer-form" onSubmit={onSteer}><input name="message" autoComplete="off" placeholder="向当前 Agent 补充指令" required disabled={busy} /><button className="secondary" disabled={busy}>发送介入</button></form>}
       {latest?.status === "waiting_input" && requestId && questions.length > 0 && <form className="run-input-form" onSubmit={(event) => void onAnswer(event, requestId, questions)}><h3>Agent 等待你的输入</h3>{questions.map((question) => <fieldset key={question.id}><legend>{question.header || question.question}</legend>{question.options.length ? question.options.map((option) => <label key={option.label}><input type="radio" name={question.id} value={option.label} required disabled={busy} /><span><strong>{option.label}</strong>{option.description && <small>{option.description}</small>}</span></label>) : <label>{question.question}<input name={question.id} required disabled={busy} /></label>}</fieldset>)}<button disabled={busy}>提交并继续</button></form>}
       {latest?.failure_summary && <p className="workspace-message" role="alert">失败原因：{latest.failure_summary}</p>}
       {message && <p className="workspace-message" role="status">{message}</p>}
@@ -810,7 +836,7 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, eventsByRun, busy
         {([['comments', '评论'], ['runs', '运行记录'], ['changes', '修改记录']] as const).map(([id, label]) => <button key={id} type="button" role="tab" aria-selected={activeTab === id} className={activeTab === id ? "active" : ""} onClick={() => setActiveTab(id)}>{label}{id === "comments" && comments.length > 0 ? ` ${comments.length}` : id === "runs" && runs.length > 0 ? ` ${runs.length}` : id === "changes" && codeChanges.length > 0 ? ` ${codeChanges.length}` : ""}</button>)}
       </div>
       <div className="task-run-tab-panel" role="tabpanel">
-        {activeTab === "comments" && <TaskComments comments={comments} tasks={tasks.filter((item) => item.commission_id === task.commission_id)} mentionTasks={tasks.filter((item) => item.commission_id === task.commission_id && item.status !== "archived")} readOnly={task.status === "archived"} busy={commentBusy} error={commentError} onSubmit={submitComment} onDelete={deleteComment} onOpenTask={onOpenTask} />}
+        {activeTab === "comments" && <TaskComments key={task.id} comments={comments} loaded={commentsLoaded} tasks={tasks.filter((item) => item.commission_id === task.commission_id)} mentionTasks={tasks.filter((item) => item.commission_id === task.commission_id && item.status !== "archived")} readOnly={task.status === "archived"} busy={commentBusy} error={commentError} uploadProgress={commentUploadProgress} onSubmit={submitComment} onDelete={deleteComment} onOpenTask={onOpenTask} />}
         {activeTab === "runs" && <div className="run-records">{runs.length ? runs.map((run, index) => <RunTimelineGroup key={run.id} run={run} events={eventsByRun[run.id] ?? []} current={index === 0} open={openRunIds.has(run.id)} onToggle={(nextOpen) => setOpenRunIds((current) => { const next = new Set(current); if (nextOpen) next.add(run.id); else next.delete(run.id); return next; })} />) : <p className="task-tab-empty">启动任务后可在这里跟进执行过程。</p>}</div>}
         {activeTab === "changes" && <CodeChanges changes={codeChanges} />}
       </div>
@@ -819,11 +845,13 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, eventsByRun, busy
   </dialog>;
 }
 
-function TaskComments({ comments, tasks, mentionTasks, readOnly, busy, error, onSubmit, onDelete, onOpenTask }: { comments: TaskComment[]; tasks: Task[]; mentionTasks: Task[]; readOnly: boolean; busy: boolean; error: string; onSubmit(event: FormEvent<HTMLFormElement>): Promise<boolean>; onDelete(comment: TaskComment): Promise<void>; onOpenTask(task: Task): Promise<void> }) {
+function TaskComments({ comments, loaded, tasks, mentionTasks, readOnly, busy, error, uploadProgress, onSubmit, onDelete, onOpenTask }: { comments: TaskComment[]; loaded: boolean; tasks: Task[]; mentionTasks: Task[]; readOnly: boolean; busy: boolean; error: string; uploadProgress: AttachmentUploadProgress | null; onSubmit(event: FormEvent<HTMLFormElement>): Promise<boolean>; onDelete(comment: TaskComment): Promise<void>; onOpenTask(task: Task): Promise<void> }) {
   const [replyTo, setReplyTo] = useState<TaskComment | null>(null);
   const [mention, setMention] = useState<MentionTrigger | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const textarea = useRef<HTMLTextAreaElement>(null);
+  const commentList = useRef<HTMLDivElement>(null);
+  const initialScrollDone = useRef(false);
   const mentionOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [avatars, setAvatars] = useState<AvatarSettings>(DEFAULT_AVATARS);
   const rows = commentThreadRows(comments);
@@ -833,6 +861,15 @@ function TaskComments({ comments, tasks, mentionTasks, readOnly, busy, error, on
     window.addEventListener(AVATAR_SETTINGS_EVENT, update);
     return () => window.removeEventListener(AVATAR_SETTINGS_EVENT, update);
   }, []);
+  useEffect(() => {
+    if (!loaded || initialScrollDone.current) return;
+    initialScrollDone.current = true;
+    const frame = window.requestAnimationFrame(() => {
+      const target = commentList.current;
+      if (target) target.scrollTop = target.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [loaded]);
   const mentionOptions = useMemo(() => {
     const options = [
       { id: "role-agent", group: "角色", value: "@Agent", label: "AI Agent", description: "执行或介入当前任务" },
@@ -858,26 +895,33 @@ function TaskComments({ comments, tasks, mentionTasks, readOnly, busy, error, on
     window.requestAnimationFrame(() => { target.focus(); target.setSelectionRange(next.cursor, next.cursor); });
   };
   return <div className="task-comments">
-    <div className="task-comment-list">{rows.length ? rows.map(({ comment, depth }) => <article key={comment.id} className={`task-comment comment-${comment.author_type}`} style={{ "--comment-depth": Math.min(depth, 4) } as React.CSSProperties}>
+    <div ref={commentList} className="task-comment-list">{rows.length ? rows.map(({ comment, depth }) => <article key={comment.id} className={`task-comment comment-${comment.author_type}`} style={{ "--comment-depth": Math.min(depth, 4) } as React.CSSProperties}>
       <CommentAvatar value={comment.author_type === "human" ? avatars.humanAvatar : comment.author_type === "agent" ? avatars.agentAvatar : "系"} />
-      <div className={`comment-card ${comment.deleted_at ? "deleted" : ""}`}><header><span><strong>{comment.author_type === "human" ? "人工负责人" : comment.agent_role ? ROLE_LABELS[comment.agent_role] ?? comment.agent_role : comment.author_type === "agent" ? "AI Agent" : "系统"}</strong>{comment.author_type === "agent" && <small>Agent</small>}{comment.run_id && <small>Run</small>}</span><time>{new Date(comment.created_at).toLocaleString()}</time></header>{comment.deleted_at ? <p className="comment-deleted">评论已删除</p> : <CommentMarkdown content={comment.content} tasks={tasks} onOpenTask={onOpenTask} />}{!readOnly && !comment.deleted_at && <footer><button type="button" className="comment-reply" onClick={() => { setReplyTo(comment); window.setTimeout(() => textarea.current?.focus(), 0); }}>回复</button><button type="button" className="comment-delete" onClick={() => void onDelete(comment)}>删除</button></footer>}</div>
+      <div className={`comment-card ${comment.deleted_at ? "deleted" : ""}`}><header><span><strong>{comment.author_type === "human" ? "人工负责人" : comment.agent_role ? ROLE_LABELS[comment.agent_role] ?? comment.agent_role : comment.author_type === "agent" ? "AI Agent" : "系统"}</strong>{comment.author_type === "agent" && <small>Agent</small>}{comment.run_id && <small>Run</small>}</span><time>{new Date(comment.created_at).toLocaleString()}</time></header>{comment.deleted_at ? <p className="comment-deleted">评论已删除</p> : <>{comment.content && <CommentMarkdown content={comment.content} tasks={tasks} onOpenTask={onOpenTask} />}<AttachmentList taskId={comment.task_id} attachments={comment.attachments ?? []} /></>}{!readOnly && !comment.deleted_at && <footer><button type="button" className="comment-reply" onClick={() => { setReplyTo(comment); window.setTimeout(() => textarea.current?.focus(), 0); }}>回复</button><button type="button" className="comment-delete" onClick={() => void onDelete(comment)}>删除</button></footer>}</div>
     </article>) : <p className="task-tab-empty">{readOnly ? "该归档任务没有历史评论。" : "暂无评论，输入一条协作信息开始讨论。"}</p>}</div>
     {readOnly ? <p className="task-tab-empty">归档任务的评论为只读，历史记录仍会保留。</p> : <form className="task-comment-form" onSubmit={(event) => void submit(event)}>
       {replyTo && <div className="comment-replying"><span>回复 {replyTo.author_type === "human" ? "人工负责人" : replyTo.agent_role ? ROLE_LABELS[replyTo.agent_role] ?? replyTo.agent_role : "系统"}：{replyTo.content.slice(0, 60)}</span><button type="button" className="secondary compact" onClick={() => setReplyTo(null)}>取消回复</button></div>}
       <input type="hidden" name="parentId" value={replyTo?.id ?? ""} />
       <div className="task-comment-editor">
-        <textarea ref={textarea} name="content" rows={3} autoComplete="off" placeholder={replyTo ? "写下回复，输入 @ 提及角色或任务…" : "发起新评论，输入 @ 提及角色或任务…"} required disabled={busy} aria-autocomplete="list" aria-expanded={Boolean(mention)} aria-controls={mention ? "task-mention-menu" : undefined} aria-activedescendant={mention && mentionOptions[mentionIndex] ? `task-mention-option-${mentionIndex}` : undefined} onChange={(event) => refreshMention(event.currentTarget)} onClick={(event) => refreshMention(event.currentTarget)} onBlur={() => window.setTimeout(() => setMention(null), 100)} onKeyDown={(event) => {
-          if (!mention) return;
-          if (event.key === "Escape") { event.preventDefault(); setMention(null); return; }
-          if (!mentionOptions.length) return;
-          if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); setMentionIndex((current) => (current + (event.key === "ArrowDown" ? 1 : -1) + mentionOptions.length) % mentionOptions.length); }
-          else if (event.key === "Enter" || event.key === "Tab") { event.preventDefault(); chooseMention(mentionOptions[mentionIndex]?.value ?? mentionOptions[0]!.value); }
+        <textarea ref={textarea} name="content" rows={3} autoComplete="off" placeholder={replyTo ? "写下回复或添加附件，输入 @ 提及角色或任务…" : "发送评论，输入 @ 提及角色或任务，@Agent 可以介入会话..."} disabled={busy} aria-autocomplete="list" aria-expanded={Boolean(mention)} aria-controls={mention ? "task-mention-menu" : undefined} aria-activedescendant={mention && mentionOptions[mentionIndex] ? `task-mention-option-${mentionIndex}` : undefined} onChange={(event) => refreshMention(event.currentTarget)} onClick={(event) => refreshMention(event.currentTarget)} onBlur={() => window.setTimeout(() => setMention(null), 100)} onKeyDown={(event) => {
+          if (mention) {
+            if (event.key === "Escape") { event.preventDefault(); setMention(null); return; }
+            if (!mentionOptions.length) return;
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); setMentionIndex((current) => (current + (event.key === "ArrowDown" ? 1 : -1) + mentionOptions.length) % mentionOptions.length); }
+            else if (event.key === "Enter" || event.key === "Tab") { event.preventDefault(); chooseMention(mentionOptions[mentionIndex]?.value ?? mentionOptions[0]!.value); }
+            return;
+          }
+          if (isCommentSubmitShortcut({ key: event.key, ctrlKey: event.ctrlKey, metaKey: event.metaKey, isComposing: event.nativeEvent.isComposing })) {
+            event.preventDefault();
+            event.currentTarget.form?.requestSubmit();
+          }
         }} />
         {mention && <div id="task-mention-menu" className="task-mention-menu" role="listbox" aria-label="选择要提及的角色或任务">
           {mentionOptions.length ? ["角色", "任务"].map((group) => { const items = mentionOptions.filter((option) => option.group === group); return items.length ? <div key={group} role="group" aria-label={group}><strong>{group}</strong>{items.map((option) => { const index = mentionOptions.indexOf(option); return <button ref={(element) => { mentionOptionRefs.current[index] = element; }} id={`task-mention-option-${index}`} key={option.id} type="button" role="option" aria-selected={index === mentionIndex} className={index === mentionIndex ? "active" : ""} onMouseDown={(event) => event.preventDefault()} onClick={() => chooseMention(option.value)} onMouseEnter={() => setMentionIndex(index)}><span>{option.value}</span><small>{option.label} · {option.description}</small></button>; })}</div> : null; }) : <p>没有匹配的角色或任务</p>}
         </div>}
       </div>
-      <button className="task-comment-submit" disabled={busy}>{busy ? "发送中…" : replyTo ? "回复" : "评论"}</button>
+      <AttachmentPicker disabled={busy} progress={uploadProgress} />
+      <button className="task-comment-submit" disabled={busy}>{busy ? "发送中…" : replyTo ? "回复" : "发送"}</button>
       {error && <p className="workspace-message" role="alert">{error}</p>}
     </form>}
   </div>;
@@ -885,6 +929,87 @@ function TaskComments({ comments, tasks, mentionTasks, readOnly, busy, error, on
 
 function CommentAvatar({ value }: { value: string }) {
   return <span className="comment-avatar" aria-hidden="true">{isImageAvatar(value) ? <img src={value} alt="" /> : value}</span>;
+}
+
+function AttachmentPicker({ disabled, progress }: { disabled: boolean; progress?: AttachmentUploadProgress | null }) {
+  const input = useRef<HTMLInputElement>(null);
+  const [files, setFiles] = useState<File[]>([]);
+  function syncFiles(next: File[]) {
+    const transfer = new DataTransfer();
+    for (const file of next) transfer.items.add(file);
+    if (input.current) input.current.files = transfer.files;
+    setFiles(next);
+  }
+  useEffect(() => {
+    const form = input.current?.form;
+    if (!form) return;
+    const reset = () => setFiles([]);
+    const paste = (event: ClipboardEvent) => {
+      if (input.current?.disabled) return;
+      const images = Array.from(event.clipboardData?.items ?? []).flatMap((item) => {
+        if (item.kind !== "file" || !clipboardImageExtension(item.type)) return [];
+        const image = item.getAsFile();
+        return image ? [new File([image], screenshotFileName(item.type), { type: item.type, lastModified: Date.now() })] : [];
+      });
+      if (!images.length) return;
+      event.preventDefault();
+      setFiles((current) => {
+        const next = [...current, ...images];
+        const transfer = new DataTransfer();
+        for (const file of next) transfer.items.add(file);
+        if (input.current) input.current.files = transfer.files;
+        return next;
+      });
+    };
+    form.addEventListener("reset", reset);
+    form.addEventListener("paste", paste);
+    return () => {
+      form.removeEventListener("reset", reset);
+      form.removeEventListener("paste", paste);
+    };
+  }, []);
+  function removeFile(index: number) {
+    syncFiles(files.filter((_file, fileIndex) => fileIndex !== index));
+  }
+  return <div className="task-attachment-control">
+    <label className="task-attachment-picker">上传附件<input ref={input} name="attachments" type="file" multiple accept=".png,.jpg,.jpeg,.gif,.webp,.txt,.md,.pdf,.docx" disabled={disabled} onChange={(event) => setFiles(Array.from(event.currentTarget.files ?? []))} /></label>
+    {files.length > 0 && <ul className="task-selected-attachments" aria-label="已选择附件">{files.map((file, index) => <li key={`${file.name}:${file.size}:${file.lastModified}:${index}`}><span title={file.name}>{file.name}</span><small>{formatAttachmentSize(file.size)}</small><button type="button" aria-label={`移除 ${file.name}`} disabled={disabled} onClick={() => removeFile(index)}>×</button></li>)}</ul>}
+    {progress && <p className="task-attachment-progress" role="status" aria-live="polite">{progress.phase === "uploading" ? `正在上传 ${progress.current}/${progress.total}：${progress.fileName}` : `附件上传完成，共 ${progress.total} 个，正在发送…`}</p>}
+  </div>;
+}
+
+function AttachmentList({ taskId, attachments }: { taskId: string; attachments: TaskAttachment[] }) {
+  if (!attachments.length) return null;
+  return <ul className="task-attachment-list">{attachments.map((attachment) => <li key={attachment.id}><a href={`/api/tasks/${taskId}/attachments/${attachment.id}`} target="_blank" rel="noreferrer">{attachment.original_name}</a><small>{formatAttachmentSize(attachment.size_bytes)}</small></li>)}</ul>;
+}
+
+async function uploadTaskAttachments(taskId: string, files: File[], onProgress?: (progress: AttachmentUploadProgress) => void): Promise<TaskAttachment[]> {
+  const uploaded: TaskAttachment[] = [];
+  try {
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index]!;
+      onProgress?.({ phase: "uploading", current: index + 1, total: files.length, fileName: file.name });
+      const response = await fetch(`/api/tasks/${taskId}/attachments`, { method: "POST", headers: { "Content-Type": file.type || "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) }, body: file });
+      const result = await response.json().catch(() => ({})) as TaskAttachment & { message?: string; error?: string };
+      if (!response.ok) throw new Error(result.message || result.error || `附件上传失败 (${response.status})`);
+      uploaded.push(result);
+    }
+    if (files.length) onProgress?.({ phase: "complete", current: files.length, total: files.length, fileName: files.at(-1)!.name });
+    return uploaded;
+  } catch (error) {
+    await discardTaskAttachments(taskId, uploaded);
+    throw error;
+  }
+}
+
+async function discardTaskAttachments(taskId: string, attachments: TaskAttachment[]): Promise<void> {
+  await Promise.all(attachments.map((attachment) => fetch(`/api/tasks/${taskId}/attachments/${attachment.id}`, { method: "DELETE" }).catch(() => undefined)));
+}
+
+function formatAttachmentSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function CommentMarkdown({ content, tasks, onOpenTask }: { content: string; tasks: Task[]; onOpenTask(task: Task): Promise<void> }) {
@@ -902,7 +1027,7 @@ function CommentMarkdown({ content, tasks, onOpenTask }: { content: string; task
     blockquote: ({ children }) => <blockquote>{mentions(children)}</blockquote>,
     a: ({ children, href }) => commentLinkUrl(href) ? <a href={href} target="_blank" rel="noreferrer">{mentions(children)}</a> : <>{mentions(children)}</>
   }}>{review?.markdown ?? content}</ReactMarkdown>;
-  return <div className="comment-markdown">{markdown}{review && <ReviewFindings findings={review.findings} />}</div>;
+  return <div className="markdown-content">{markdown}{review && <ReviewFindings findings={review.findings} />}</div>;
 }
 
 function ReviewFindings({ findings }: { findings: ReviewFinding[] }) {
@@ -930,13 +1055,32 @@ function RunTimelineGroup({ run, events, current, open, onToggle }: { run: Run; 
   const timelineEvents = runTimelineEvents(events);
   const tokens = tokenUsageTotals([run]);
   const price = tokenPrice([run]);
+  const timeline = useRef<HTMLDivElement>(null);
+  const wasOpen = useRef(false);
+  const pendingInitialScroll = useRef(false);
+  useEffect(() => {
+    if (!open) {
+      wasOpen.current = false;
+      pendingInitialScroll.current = false;
+      return;
+    }
+    if (!wasOpen.current) pendingInitialScroll.current = true;
+    wasOpen.current = open;
+    if (!pendingInitialScroll.current || !timelineEvents.length) return;
+    pendingInitialScroll.current = false;
+    const frame = window.requestAnimationFrame(() => {
+      const target = timeline.current;
+      if (target) target.scrollTop = target.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [open, timelineEvents.length]);
   return <section className={`run-record ${open ? "open" : ""}`}>
     <button className="run-record-toggle" aria-expanded={open} onClick={() => onToggle(!open)}>
       <span className="run-record-chevron" aria-hidden="true">{open ? "▾" : "▸"}</span>
       <span><small>{current ? "当前执行" : "历史执行"}</small><strong>Run #{run.attempt_no} · {run.role}</strong><RunRecordDuration run={run} /><small className="run-record-tokens" title={tokens ? `输入 ${formatTokenCount(tokens.input)}，输出 ${formatTokenCount(tokens.output)}，缓存 ${formatTokenCount(tokens.cached)}` : undefined}>Token {tokens ? formatTokenCount(tokens.total) : "—"} · {price === null ? "价格不可用" : `约 ${formatTokenPrice(price)}`}</small></span>
       <span className={`run-record-status status-${run.status}`}>{RUN_STATUS_LABELS[run.status] ?? run.status}</span>
     </button>
-    {open && <div className="run-timeline">{timelineEvents.length ? timelineEvents.map((event) => <RunTimelineEvent key={event.id} event={event} />) : <p>此 Run 尚未产生事件。</p>}</div>}
+    {open && <div ref={timeline} className="run-timeline">{timelineEvents.length ? timelineEvents.map((event) => <RunTimelineEvent key={event.id} event={event} />) : <p>此 Run 尚未产生事件。</p>}</div>}
   </section>;
 }
 

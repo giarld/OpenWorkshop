@@ -3,6 +3,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import { SettingsWorkspace } from "./settings-workspace";
 import { TaskWorkspace } from "./task-workspace";
+import { watchSystemColorTheme } from "./theme-settings";
 
 type Screen = "loading" | "initialize" | "login" | "settings";
 type AgentHealth = { ok: boolean; version?: string; error?: string };
@@ -13,10 +14,12 @@ export default function Home() {
   const [message, setMessage] = useState("");
 
   useEffect(() => {
+    const stopWatchingTheme = watchSystemColorTheme();
     void fetch("/api/system/status").then(async (response) => {
       const status = await response.json() as { initialized: boolean; authenticated: boolean };
       setScreen(status.authenticated ? "settings" : status.initialized ? "login" : "initialize");
     }).catch(() => setMessage("无法连接本地服务。"));
+    return stopWatchingTheme;
   }, []);
 
   async function submitPin(event: FormEvent<HTMLFormElement>) {

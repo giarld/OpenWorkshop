@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -167,6 +167,76 @@ test("supports issue-style replies, @Agent routing, and AI mentions of the human
   } finally { await fixture.close(); }
 });
 
+test("uploads attachments for comments and forwards them with @Agent mentions", async () => {
+  const mentions: Array<{ message: string; attachmentIds: readonly string[] }> = [];
+  const fixture = await taskFixture(async (_taskId, message, attachmentIds = []) => { mentions.push({ message, attachmentIds }); return { action: "steered", runId: "run-1" }; });
+  try {
+    const task = (await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: { title: "Discuss files", ownerType: "ai" } })).json() as { id: string };
+    const uploaded = await fixture.server.inject({ method: "POST", url: `/api/tasks/${task.id}/attachments`, headers: { "content-type": "text/plain", "x-file-name": encodeURIComponent("notes.txt") }, payload: Buffer.from("attachment body") });
+    assert.equal(uploaded.statusCode, 201);
+    const attachment = uploaded.json() as { id: string };
+    const comment = await fixture.server.inject({ method: "POST", url: `/api/tasks/${task.id}/comments`, payload: { content: "@Agent 请阅读附件", attachmentIds: [attachment.id] } });
+    assert.equal(comment.statusCode, 201);
+    assert.equal(comment.json().attachments[0].original_name, "notes.txt");
+    assert.deepEqual(mentions, [{ message: "@Agent 请阅读附件", attachmentIds: [attachment.id] }]);
+
+    const comments = await fixture.server.inject({ method: "GET", url: `/api/tasks/${task.id}/comments` });
+    assert.equal(comments.json().at(-1).attachments[0].id, attachment.id);
+    const downloaded = await fixture.server.inject({ method: "GET", url: `/api/tasks/${task.id}/attachments/${attachment.id}` });
+    assert.equal(downloaded.body, "attachment body");
+    assert.equal(downloaded.headers["x-content-type-options"], "nosniff");
+    const storedPath = (fixture.database.prepare("SELECT storage_path FROM attachments WHERE id = ?").get(attachment.id) as { storage_path: string }).storage_path;
+    assert.equal((await readFile(storedPath, "utf8")), "attachment body");
+    assert.equal((await fixture.server.inject({ method: "DELETE", url: `/api/tasks/${task.id}/attachments/${attachment.id}` })).statusCode, 400);
+  } finally { await fixture.close(); }
+});
+
+test("rejects attachment MIME spoofing and prevents reusing a comment attachment", async () => {
+  const fixture = await taskFixture();
+  try {
+    const task = (await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: { title: "Attachment ownership" } })).json() as { id: string };
+    const spoofed = await fixture.server.inject({ method: "POST", url: `/api/tasks/${task.id}/attachments`, headers: { "content-type": "image/png", "x-file-name": encodeURIComponent("notes.txt") }, payload: Buffer.from("not an image") });
+    assert.equal(spoofed.statusCode, 400);
+    const fakeImage = await fixture.server.inject({ method: "POST", url: `/api/tasks/${task.id}/attachments`, headers: { "content-type": "image/png", "x-file-name": encodeURIComponent("screen.png") }, payload: Buffer.from("not an image") });
+    assert.equal(fakeImage.statusCode, 400);
+
+    const uploaded = await fixture.server.inject({ method: "POST", url: `/api/tasks/${task.id}/attachments`, headers: { "content-type": "text/plain", "x-file-name": encodeURIComponent("notes.txt") }, payload: Buffer.from("attachment body") });
+    const attachmentId = String(uploaded.json().id);
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${task.id}/comments`, payload: { content: "First", attachmentIds: [attachmentId] } })).statusCode, 201);
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${task.id}/comments`, payload: { content: "Second", attachmentIds: [attachmentId] } })).statusCode, 400);
+  } finally { await fixture.close(); }
+});
+
+test("hides attachments that only belong to a deleted comment", async () => {
+  const fixture = await taskFixture();
+  try {
+    const task = (await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: { title: "Deleted attachment" } })).json() as { id: string };
+    const uploaded = await fixture.server.inject({ method: "POST", url: `/api/tasks/${task.id}/attachments`, headers: { "content-type": "text/plain", "x-file-name": encodeURIComponent("notes.txt") }, payload: Buffer.from("attachment body") });
+    const attachmentId = String(uploaded.json().id);
+    const comment = await fixture.server.inject({ method: "POST", url: `/api/tasks/${task.id}/comments`, payload: { content: "Temporary", attachmentIds: [attachmentId] } });
+    assert.equal((await fixture.server.inject({ method: "GET", url: `/api/tasks/${task.id}/attachments/${attachmentId}` })).statusCode, 200);
+    assert.equal((await fixture.server.inject({ method: "DELETE", url: `/api/tasks/${task.id}/comments/${comment.json().id}` })).statusCode, 204);
+    assert.equal((await fixture.server.inject({ method: "GET", url: `/api/tasks/${task.id}/attachments/${attachmentId}` })).statusCode, 404);
+    const deleted = (await fixture.server.inject({ method: "GET", url: `/api/tasks/${task.id}/comments` })).json().find((item: { id: string }) => item.id === comment.json().id);
+    assert.deepEqual(deleted.attachments, []);
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM attachments WHERE id = ?").get(attachmentId) as { count: number }).count, 1);
+  } finally { await fixture.close(); }
+});
+
+test("keeps a saved comment and its attachments when @Agent routing fails", async () => {
+  const fixture = await taskFixture(async () => { throw new Error("runtime offline"); });
+  try {
+    const task = (await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: { title: "Unavailable Agent", ownerType: "ai" } })).json() as { id: string };
+    const uploaded = await fixture.server.inject({ method: "POST", url: `/api/tasks/${task.id}/attachments`, headers: { "content-type": "text/plain", "x-file-name": encodeURIComponent("notes.txt") }, payload: Buffer.from("attachment body") });
+    const attachmentId = String(uploaded.json().id);
+    const comment = await fixture.server.inject({ method: "POST", url: `/api/tasks/${task.id}/comments`, payload: { content: "@Agent 稍后处理", attachmentIds: [attachmentId] } });
+    assert.equal(comment.statusCode, 201);
+    assert.equal(comment.json().agentMention.action, "unavailable");
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM comments WHERE task_id = ? AND content = ?").get(task.id, "@Agent 稍后处理") as { count: number }).count, 1);
+    assert.ok((fixture.database.prepare("SELECT comment_id FROM attachments WHERE id = ?").get(attachmentId) as { comment_id: string | null }).comment_id);
+  } finally { await fixture.close(); }
+});
+
 test("allows cross-commission dependencies and rolls back cycles with their path", async () => {
   const fixture = await taskFixture();
   try {
@@ -244,7 +314,7 @@ async function taskFixture(mentionAgent?: AgentMentionHandler) {
   const home = await mkdtemp(join(tmpdir(), "project-workshop-tasks-"));
   const database = await openWorkshopDatabase(home);
   const server = Fastify();
-  registerTaskRoutes(server, database, mentionAgent);
+  registerTaskRoutes(server, database, mentionAgent, join(home, "attachments"));
   const rootId = randomUUID();
   const projectId = randomUUID();
   const commissionA = seedApprovedCommission(database, rootId, projectId);

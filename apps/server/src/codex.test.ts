@@ -118,7 +118,7 @@ test("streams a fake Run through approval, steer, and interrupt", async () => {
     assert.equal((await client.models())[0]?.id, "fake-model");
     const run = await client.startRun({ cwd: process.cwd(), prompt: "Do the work", model: "fake-model", effort: "medium" });
     assert.equal(run.model, "fake-model");
-    await client.steer(run.threadId, run.turnId, "Focus on tests");
+    await client.steer(run.threadId, run.turnId, [{ type: "text", text: "Focus on tests" }, { type: "localImage", path: join(process.cwd(), "screenshot.png") }]);
     await client.interrupt(run.threadId, run.turnId);
     assert.equal((await run.completed).type, "turn.interrupted");
     assert.equal(approval?.type, "approval.requested");

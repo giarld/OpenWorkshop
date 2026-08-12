@@ -6,11 +6,25 @@ export type ManagedProject = {
   archived_at: string | null;
 };
 
+export const PROJECT_NAME_MAX_LENGTH = 100;
+
+export function projectNameError(name: string): string | null {
+  if (!name.trim()) return "项目名称不能为空。";
+  return name.length > PROJECT_NAME_MAX_LENGTH ? `项目名称不能超过 ${PROJECT_NAME_MAX_LENGTH} 个字符。` : null;
+}
+
 export const WORKSPACE_VIEW_IDS = ["projects", "commissions", "requirements", "board", "delivery", "notifications", "usage", "settings"] as const;
 export type WorkspaceView = typeof WORKSPACE_VIEW_IDS[number];
 
 export function storedWorkspaceView(value: string | null): WorkspaceView {
   return WORKSPACE_VIEW_IDS.includes(value as WorkspaceView) ? value as WorkspaceView : "commissions";
+}
+
+export function initialWorkspaceView(storedValue: string | null, hash: string): WorkspaceView {
+  if (WORKSPACE_VIEW_IDS.includes(storedValue as WorkspaceView)) return storedValue as WorkspaceView;
+  if (hash.startsWith("#task-")) return "board";
+  if (hash.startsWith("#approval-")) return "notifications";
+  return "commissions";
 }
 
 export type WorkspaceContentState = "settings" | "loading" | "ready";

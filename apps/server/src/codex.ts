@@ -53,12 +53,15 @@ export type CodexRoleConfig = {
 export type CodexRunOptions = {
   cwd: string;
   prompt: string;
+  input?: CodexInput[];
   threadId?: string;
   model?: string;
   effort?: string;
   approvalPolicy?: ApprovalPolicy;
   sandbox?: SandboxMode;
 };
+
+export type CodexInput = { type: "text"; text: string } | { type: "localImage"; path: string };
 
 export type CodexRunHandle = {
   threadId: string;
@@ -143,7 +146,7 @@ export class CodexAppServer {
     const threadId = options.threadId ?? requiredString(asObject(started?.thread).id, "thread id");
     const turn = asObject(asObject(await this.request("turn/start", compact({
       threadId,
-      input: [{ type: "text", text: options.prompt }],
+      input: options.input ?? [{ type: "text", text: options.prompt }],
       cwd: options.cwd,
       model,
       effort: options.effort
@@ -154,8 +157,8 @@ export class CodexAppServer {
     return { threadId, turnId, ...(model ? { model } : {}), completed: this.waitForTurn(turnId) };
   }
 
-  async steer(threadId: string, turnId: string, text: string): Promise<void> {
-    await this.request("turn/steer", { threadId, expectedTurnId: turnId, input: [{ type: "text", text }] });
+  async steer(threadId: string, turnId: string, input: string | CodexInput[]): Promise<void> {
+    await this.request("turn/steer", { threadId, expectedTurnId: turnId, input: typeof input === "string" ? [{ type: "text", text: input }] : input });
   }
 
   async interrupt(threadId: string, turnId: string, timeoutMs = 5_000): Promise<void> {

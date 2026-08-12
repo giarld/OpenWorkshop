@@ -497,6 +497,14 @@ const MIGRATIONS = [
   ALTER TABLE commissions ADD COLUMN lifecycle_operation TEXT CHECK (lifecycle_operation IN ('archiving', 'reactivating'));
   ALTER TABLE commissions ADD COLUMN lifecycle_token TEXT;
   ${lifecycleGuardTriggers()}
+  `,
+  `
+  ALTER TABLE attachments ADD COLUMN task_id TEXT REFERENCES tasks(id);
+  ALTER TABLE attachments ADD COLUMN comment_id TEXT REFERENCES comments(id);
+  ALTER TABLE attachments ADD COLUMN run_id TEXT REFERENCES runs(id);
+  CREATE INDEX attachments_task_created ON attachments(task_id, created_at);
+  CREATE INDEX attachments_comment_created ON attachments(comment_id, created_at);
+  CREATE INDEX attachments_run_created ON attachments(run_id, created_at);
   `
 ];
 
