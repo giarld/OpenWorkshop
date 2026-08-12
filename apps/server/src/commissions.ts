@@ -49,6 +49,7 @@ export type RequirementAnalyzer = (input: {
   messages: Array<{ role: string; content: string }>;
   attachments: Array<{ original_name: string; extracted_text: string | null }>;
   activeRequirement: { content_markdown: string; acceptance_json: string } | null;
+  onProgress?: (message: string) => void;
 }) => Promise<RequirementAnalysis>;
 
 export function registerCommissionRoutes(server: FastifyInstance, database: DatabaseSync, attachmentsRoot: string, analyze?: RequirementAnalyzer, plan?: TaskPlanner): void {
@@ -132,50 +133,69 @@ export function registerCommissionRoutes(server: FastifyInstance, database: Data
     assertNoPendingRequirement(database, commission.id);
     const messages = database.prepare("SELECT role, content FROM requirement_messages WHERE commission_id = ? ORDER BY created_at, rowid").all(commission.id) as Array<{ role: string; content: string }>;
     if (messages.at(-1)?.role === "agent") throw conflict("Reply to the Requirement Agent before continuing analysis");
-    const result = await analyze({
-      commission,
-      projectRoot: (database.prepare("SELECT project.real_path FROM projects AS project JOIN commissions AS commission ON commission.project_id = project.id WHERE commission.id = ?").get(commission.id) as { real_path: string }).real_path,
-      agentConfig: resolvedRoleConfig(database, commission.project_id, "supervisor"),
-      messages,
-      attachments: database.prepare("SELECT original_name, extracted_text FROM attachments WHERE commission_id = ? ORDER BY created_at, rowid").all(commission.id) as Array<{ original_name: string; extracted_text: string | null }>,
-      activeRequirement: commission.active_requirement_version_id
-        ? database.prepare("SELECT content_markdown, acceptance_json FROM requirement_versions WHERE id = ?").get(commission.active_requirement_version_id) as { content_markdown: string; acceptance_json: string }
-        : null
-    });
-    const now = new Date().toISOString();
-    const usage = result.tokenUsage ?? { input: 0, output: 0, cached: 0 };
-    if ("question" in result || "completionQuestion" in result) {
-      const question = "completionQuestion" in result ? CLARIFICATION_COMPLETION_QUESTION : requiredString(result.question, "question");
-      const options = "question" in result && result.options ? validateOptions(result.options) : undefined;
-      const id = insertMessage(database, commission.id, "agent", question, now, options);
-      database.prepare(`UPDATE commissions SET status = 'clarifying', updated_at = ?,
-        clarification_token_input = clarification_token_input + ?,
-        clarification_token_output = clarification_token_output + ?,
-        clarification_token_cached = clarification_token_cached + ?
-        WHERE id = ?`).run(now, usage.input, usage.output, usage.cached, commission.id);
-      return reply.send({ kind: "question", message: database.prepare("SELECT * FROM requirement_messages WHERE id = ?").get(id) });
-    }
-
-    const content = requiredString(result.contentMarkdown, "contentMarkdown");
-    if (!Array.isArray(result.acceptanceCriteria)) throw badRequest("Requirement Agent returned invalid acceptanceCriteria");
-    database.exec("BEGIN IMMEDIATE");
+    const streaming = request.headers.accept === "application/x-ndjson";
+    let streamStarted = false;
+    const write = (value: unknown) => {
+      if (!streaming || reply.raw.destroyed || reply.raw.writableEnded) return;
+      if (!streamStarted) {
+        streamStarted = true;
+        reply.hijack();
+        reply.raw.writeHead(200, { "Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no" });
+      }
+      reply.raw.write(`${JSON.stringify(value)}\n`);
+    };
     try {
-      assertNoPendingRequirement(database, commission.id);
-      const id = randomUUID();
-      const version = (database.prepare("SELECT COALESCE(MAX(version_no), 0) + 1 AS version FROM requirement_versions WHERE commission_id = ?").get(commission.id) as { version: number }).version;
-      database.prepare(`
-        INSERT INTO requirement_versions (id, commission_id, version_no, content_markdown, acceptance_json, status, created_by, created_at)
-        VALUES (?, ?, ?, ?, ?, 'awaiting_approval', 'requirement_agent', ?)
-      `).run(id, commission.id, version, content, JSON.stringify(result.acceptanceCriteria), now);
-      database.prepare(`UPDATE commissions SET status = 'awaiting_requirement_approval', updated_at = ?,
-        clarification_token_input = clarification_token_input + ?,
-        clarification_token_output = clarification_token_output + ?,
-        clarification_token_cached = clarification_token_cached + ?
-        WHERE id = ?`).run(now, usage.input, usage.output, usage.cached, commission.id);
-      database.exec("COMMIT");
-      return reply.code(201).send({ kind: "requirement", requirement: requirementById(database, id) });
+      const result = await analyze({
+        commission,
+        projectRoot: (database.prepare("SELECT project.real_path FROM projects AS project JOIN commissions AS commission ON commission.project_id = project.id WHERE commission.id = ?").get(commission.id) as { real_path: string }).real_path,
+        agentConfig: resolvedRoleConfig(database, commission.project_id, "supervisor"),
+        messages,
+        attachments: database.prepare("SELECT original_name, extracted_text FROM attachments WHERE commission_id = ? ORDER BY created_at, rowid").all(commission.id) as Array<{ original_name: string; extracted_text: string | null }>,
+        activeRequirement: commission.active_requirement_version_id
+          ? database.prepare("SELECT content_markdown, acceptance_json FROM requirement_versions WHERE id = ?").get(commission.active_requirement_version_id) as { content_markdown: string; acceptance_json: string }
+          : null,
+        ...(streaming ? { onProgress: (message: string) => write({ type: "progress", message }) } : {})
+      });
+      const now = new Date().toISOString();
+      const usage = result.tokenUsage ?? { input: 0, output: 0, cached: 0 };
+      let response: unknown;
+      let status = 200;
+      if ("question" in result || "completionQuestion" in result) {
+        const question = "completionQuestion" in result ? CLARIFICATION_COMPLETION_QUESTION : requiredString(result.question, "question");
+        const options = "question" in result && result.options ? validateOptions(result.options) : undefined;
+        const id = insertMessage(database, commission.id, "agent", question, now, options);
+        database.prepare(`UPDATE commissions SET status = 'clarifying', updated_at = ?, clarification_token_input = clarification_token_input + ?, clarification_token_output = clarification_token_output + ?, clarification_token_cached = clarification_token_cached + ? WHERE id = ?`).run(now, usage.input, usage.output, usage.cached, commission.id);
+        response = { kind: "question", message: database.prepare("SELECT * FROM requirement_messages WHERE id = ?").get(id) };
+      } else {
+        const content = requiredString(result.contentMarkdown, "contentMarkdown");
+        if (!Array.isArray(result.acceptanceCriteria)) throw badGateway("Requirement Agent returned invalid acceptanceCriteria");
+        database.exec("BEGIN IMMEDIATE");
+        try {
+          assertNoPendingRequirement(database, commission.id);
+          const id = randomUUID();
+          const version = (database.prepare("SELECT COALESCE(MAX(version_no), 0) + 1 AS version FROM requirement_versions WHERE commission_id = ?").get(commission.id) as { version: number }).version;
+          database.prepare(`INSERT INTO requirement_versions (id, commission_id, version_no, content_markdown, acceptance_json, status, created_by, created_at) VALUES (?, ?, ?, ?, ?, 'awaiting_approval', 'requirement_agent', ?)`).run(id, commission.id, version, content, JSON.stringify(result.acceptanceCriteria), now);
+          database.prepare(`UPDATE commissions SET status = 'awaiting_requirement_approval', updated_at = ?, clarification_token_input = clarification_token_input + ?, clarification_token_output = clarification_token_output + ?, clarification_token_cached = clarification_token_cached + ? WHERE id = ?`).run(now, usage.input, usage.output, usage.cached, commission.id);
+          database.exec("COMMIT");
+          status = 201;
+          response = { kind: "requirement", requirement: requirementById(database, id) };
+        } catch (error) {
+          database.exec("ROLLBACK");
+          throw error;
+        }
+      }
+      if (!streaming) return reply.code(status).send(response);
+      write({ type: "result", result: response });
+      reply.raw.end();
+      return reply;
     } catch (error) {
-      database.exec("ROLLBACK");
+      if (streaming) {
+        if (!streamStarted) throw error;
+        const status = errorStatus(error);
+        write({ type: "error", status, error: status ? errorMessage(error) : "需求分析失败，请重试或检查 Codex 配置。" });
+        if (!reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.end();
+        return reply;
+      }
       throw error;
     }
   });
@@ -426,6 +446,16 @@ function decodedFileName(value: string): string {
 
 function statusError(message: string, statusCode: number, cause?: unknown): Error {
   return Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { statusCode });
+}
+
+function errorStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object" || !("statusCode" in error)) return undefined;
+  const status = (error as { statusCode?: unknown }).statusCode;
+  return typeof status === "number" && status >= 400 && status < 600 ? status : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error && error.message ? error.message : "需求分析失败，请重试。";
 }
 
 const badRequest = (message: string, cause?: unknown) => statusError(message, 400, cause);

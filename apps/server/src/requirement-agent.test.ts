@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CLARIFICATION_COMPLETION_QUESTION, completionWasConfirmed, parseRequirementAnalysis } from "./requirement-analysis.ts";
+import { CLARIFICATION_COMPLETION_QUESTION, completionWasConfirmed, parseRequirementAnalysis, requirementProgress } from "./requirement-analysis.ts";
 import { requirementTokenUsage, requirementUsageDelta } from "./requirement-token-usage.ts";
 
 test("keeps clarifying while a generated requirement still has open questions", () => {
@@ -30,4 +30,10 @@ test("reads cumulative requirement token usage and calculates the current turn d
   assert.ok(usage);
   assert.deepEqual(usage, { input: 180, output: 45, cached: 120 });
   assert.deepEqual(requirementUsageDelta({ input: 100, output: 20, cached: 80 }, usage), { input: 80, output: 25, cached: 40 });
+});
+
+test("maps Codex events to safe requirement progress without exposing payloads", () => {
+  assert.equal(requirementProgress({ type: "command_execution.started", summary: "secret command", method: "item/started", payload: { command: "secret" } }), "正在执行只读项目检查");
+  assert.equal(requirementProgress({ type: "agent.message.delta", summary: "Agent message", method: "item/agentMessage/delta", payload: { delta: "secret output" } }), "正在组织澄清问题");
+  assert.equal(requirementProgress({ type: "turn.started", summary: "Turn started", method: "turn/started", payload: {} }), undefined);
 });

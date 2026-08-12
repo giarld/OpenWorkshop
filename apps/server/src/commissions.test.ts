@@ -264,6 +264,65 @@ test("accumulates requirement clarification token usage on the commission", asyn
   }
 });
 
+test("streams sanitized requirement progress before the final result", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-clarification-progress-"));
+  const server = Fastify();
+  const database = await openWorkshopDatabase(home);
+  const analyzer: RequirementAnalyzer = async (input) => {
+    input.onProgress?.("正在检查项目");
+    return { question: "Which platform?" };
+  };
+  try {
+    const projectId = seedProject(database);
+    registerCommissionRoutes(server, database, join(home, "attachments"), analyzer);
+    const commissionId = (await server.inject({ method: "POST", url: `/api/projects/${projectId}/commissions`, payload: { title: "Progress", message: "Build it" } })).json().id;
+    const response = await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/analyze`, headers: { accept: "application/x-ndjson" } });
+    const events = response.body.trim().split("\n").map((line) => JSON.parse(line) as { type: string; message?: string; result?: { kind: string } });
+    assert.deepEqual(events.map((event) => event.type), ["progress", "result"]);
+    assert.equal(events[0]?.message, "正在检查项目");
+    assert.equal(events[1]?.result?.kind, "question");
+  } finally {
+    await server.close(); database.close(); await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("preserves requirement analysis errors before and after streaming starts", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-clarification-errors-"));
+  const server = Fastify();
+  const database = await openWorkshopDatabase(home);
+  let analysis = 0;
+  let lateProgress: ((message: string) => void) | undefined;
+  const analyzer: RequirementAnalyzer = async (input) => {
+    analysis++;
+    if (analysis === 1) throw Object.assign(new Error("Requirement analysis is already running"), { statusCode: 409 });
+    input.onProgress?.("正在检查项目");
+    if (analysis === 2) throw Object.assign(new Error("Requirement Agent returned invalid acceptanceCriteria"), { statusCode: 502 });
+    lateProgress = input.onProgress;
+    return { question: "Which platform?" };
+  };
+  try {
+    const projectId = seedProject(database);
+    registerCommissionRoutes(server, database, join(home, "attachments"), analyzer);
+    const commissionId = (await server.inject({ method: "POST", url: `/api/projects/${projectId}/commissions`, payload: { title: "Errors", message: "Build it" } })).json().id;
+    const beforeStream = await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/analyze`, headers: { accept: "application/x-ndjson" } });
+    assert.equal(beforeStream.statusCode, 409);
+    assert.match(beforeStream.body, /already running/);
+
+    const afterStream = await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/analyze`, headers: { accept: "application/x-ndjson" } });
+    assert.equal(afterStream.statusCode, 200);
+    assert.deepEqual(afterStream.body.trim().split("\n").map((line) => JSON.parse(line)), [
+      { type: "progress", message: "正在检查项目" },
+      { type: "error", status: 502, error: "Requirement Agent returned invalid acceptanceCriteria" }
+    ]);
+
+    const completed = await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/analyze`, headers: { accept: "application/x-ndjson" } });
+    assert.equal(completed.statusCode, 200);
+    assert.doesNotThrow(() => lateProgress?.("延迟事件"));
+  } finally {
+    await server.close(); database.close(); await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("creates an approved requirement directly before manual task planning", async () => {
   const home = await mkdtemp(join(tmpdir(), "project-workshop-direct-requirement-"));
   const server = Fastify();

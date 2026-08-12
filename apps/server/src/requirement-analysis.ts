@@ -35,6 +35,14 @@ export function completionWasConfirmed(messages: Array<{ role: string; content: 
   return proposal >= 0 && messages.slice(proposal + 1).some((message) => message.role === "human");
 }
 
+export function requirementProgress(event: { type: string }): string | undefined {
+  if (event.type === "command_execution.started") return "正在执行只读项目检查";
+  if (event.type === "command_execution.completed") return "已完成一项项目检查";
+  if (event.type === "agent.message.delta") return "正在组织澄清问题";
+  if (event.type === "token.usage") return "正在更新 Token 使用量";
+  return undefined;
+}
+
 function firstOpenQuestion(markdown: string): string | undefined {
   const section = /^##\s+(?:Open questions|未决问题)\s*$([\s\S]*?)(?=^##\s+)/im.exec(`${markdown}\n## __end__`)?.[1]?.trim();
   if (!section) return undefined;

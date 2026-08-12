@@ -1,9 +1,9 @@
 import { CodexAppServer, codexAppServerArgs, validateCustomArgs, type CodexRoleConfig, type NormalizedCodexEvent } from "./codex.js";
 import type { RequirementAnalyzer } from "./commissions.js";
-import { completionWasConfirmed, parseRequirementAnalysis } from "./requirement-analysis.js";
+import { completionWasConfirmed, parseRequirementAnalysis, requirementProgress } from "./requirement-analysis.js";
 import { requirementTokenUsage, requirementUsageDelta, type RequirementTokenUsage } from "./requirement-token-usage.js";
 
-type RequirementSession = { client: CodexAppServer; configKey: string; threadId?: string; output: string; tokenUsage: RequirementTokenUsage; idleTimer?: NodeJS.Timeout };
+type RequirementSession = { client: CodexAppServer; configKey: string; threadId?: string; output: string; tokenUsage: RequirementTokenUsage; onProgress?: (message: string) => void; lastProgress?: string; idleTimer?: NodeJS.Timeout };
 
 const sessions = new Map<string, RequirementSession>();
 const running = new Set<string>();
@@ -16,7 +16,9 @@ export const analyzeRequirementWithCodex: RequirementAnalyzer = async (input) =>
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       let session = sessions.get(commissionId);
+      let progressSession: RequirementSession | undefined;
       try {
+        input.onProgress?.("正在连接需求分析 Agent");
         const configKey = JSON.stringify(input.agentConfig);
         if (session && session.configKey !== configKey) {
           await discardSession(commissionId, session);
@@ -27,7 +29,12 @@ export const analyzeRequirementWithCodex: RequirementAnalyzer = async (input) =>
           await session.client.initialize();
           sessions.set(commissionId, session);
         }
+        input.onProgress?.("正在读取项目与委托上下文");
         session.output = "";
+        if (input.onProgress) session.onProgress = input.onProgress;
+        else delete session.onProgress;
+        progressSession = session;
+        delete session.lastProgress;
         const usageBefore = { ...session.tokenUsage };
         const run = await session.client.startRun({
           cwd: input.projectRoot,
@@ -39,7 +46,9 @@ export const analyzeRequirementWithCodex: RequirementAnalyzer = async (input) =>
           prompt: requirementPrompt(input)
         });
         session.threadId = run.threadId;
+        input.onProgress?.("正在分析需求并检查项目信息");
         await run.completed;
+        input.onProgress?.("正在整理澄清结果");
         const parsed = parseRequirementAnalysis(session.output);
         const result = "contentMarkdown" in parsed && !completionWasConfirmed(input.messages) ? { completionQuestion: true } as const : parsed;
         keepSessionAlive(commissionId, session);
@@ -47,6 +56,8 @@ export const analyzeRequirementWithCodex: RequirementAnalyzer = async (input) =>
       } catch (error) {
         if (session) await discardSession(commissionId, session);
         if (attempt) throw error;
+      } finally {
+        if (input.onProgress && progressSession?.onProgress === input.onProgress) delete progressSession.onProgress;
       }
     }
     throw new Error("Requirement analysis failed");
@@ -64,6 +75,11 @@ function createSession(config: Readonly<CodexRoleConfig>, configKey: string): Re
     if (usage) session.tokenUsage = usage;
     const text = agentText(event);
     if (event.method === "item/agentMessage/delta" || !session.output) session.output += text;
+    const progress = requirementProgress(event);
+    if (progress && progress !== session.lastProgress) {
+      session.lastProgress = progress;
+      session.onProgress?.(progress);
+    }
   } });
   session = { client, configKey, output: "", tokenUsage: { input: 0, output: 0, cached: 0 } };
   return session;

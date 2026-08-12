@@ -11,6 +11,7 @@ type Attachment = { id: string; original_name: string; size_bytes: number };
 type Requirement = { id: string; version_no: number; content_markdown: string; acceptance_json: string; status: string };
 type CommissionDetails = Commission & { messages: Message[]; attachments: Attachment[]; requirements: Requirement[] };
 type AnalysisResult = { kind: "question" | "requirement" };
+type AnalysisStreamEvent = { type: "progress"; message: string } | { type: "result"; result: AnalysisResult } | { type: "error"; status?: number; error: string };
 type DialogMode = "create" | "details" | "clarification" | "requirement" | "archives" | null;
 
 const STATUS_LABELS: Record<string, string> = {
@@ -26,6 +27,7 @@ export function CommissionWorkspace({ projectId, section, hidden, onChanged, onS
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
+  const [analysisProgress, setAnalysisProgress] = useState<string[]>([]);
   const [copiedRequirementId, setCopiedRequirementId] = useState<string | null>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const timeline = useRef<HTMLDivElement>(null);
@@ -37,7 +39,7 @@ export function CommissionWorkspace({ projectId, section, hidden, onChanged, onS
     if (!dialogMode && element?.open) element.close();
   }, [dialogMode]);
   useEffect(() => { if (hidden) setDialogMode(null); }, [hidden]);
-  useEffect(() => { if (dialogMode === "clarification" && timeline.current) timeline.current.scrollTop = timeline.current.scrollHeight; }, [dialogMode, selected?.id, selected?.messages.length, analyzing]);
+  useEffect(() => { if (dialogMode === "clarification" && timeline.current) timeline.current.scrollTop = timeline.current.scrollHeight; }, [dialogMode, selected?.id, selected?.messages.length, analyzing, analysisProgress.length]);
 
   async function loadCommissions(preferredId?: string) {
     try {
@@ -123,7 +125,34 @@ export function CommissionWorkspace({ projectId, section, hidden, onChanged, onS
 
   async function continueAnalysis(commissionId: string): Promise<AnalysisResult> {
     setAnalyzing(true);
-    try { return await api<AnalysisResult>(`/api/commissions/${commissionId}/analyze`, { method: "POST" }); }
+    setAnalysisProgress([]);
+    try {
+      const response = await fetch(`/api/commissions/${commissionId}/analyze`, { method: "POST", headers: { Accept: "application/x-ndjson" } });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({})) as { message?: string; error?: string };
+        throw new Error(error.message || error.error || `请求失败 (${response.status})`);
+      }
+      if (!response.body) throw new Error("需求分析未返回响应流");
+      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buffer = "";
+      let result: AnalysisResult | undefined;
+      while (true) {
+        const { value = "", done } = await reader.read();
+        buffer += value;
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line) continue;
+          const event = JSON.parse(line) as AnalysisStreamEvent;
+          if (event.type === "progress") setAnalysisProgress((current) => current.at(-1) === event.message ? current : [...current, event.message].slice(-8));
+          else if (event.type === "result") result = event.result;
+          else throw new Error(event.error);
+        }
+        if (done) break;
+      }
+      if (!result) throw new Error("需求分析未返回结果");
+      return result;
+    }
     finally { try { await loadCommissions(commissionId); } finally { setAnalyzing(false); } }
   }
 
@@ -232,7 +261,7 @@ export function CommissionWorkspace({ projectId, section, hidden, onChanged, onS
 
       {dialogMode === "clarification" && selected && <div className="clarification-body commission-dialog-body">
         <p className="clarification-token">Token: 输入 {formatTokenCount(selected.clarification_token_input)} · 输出 {formatTokenCount(selected.clarification_token_output)}</p>
-        <div className="commission-timeline" ref={timeline}>{selected.messages.length ? selected.messages.map((item) => <article key={item.id} className={`commission-message ${item.role}`}><strong>{item.role === "human" ? "你" : item.role === "agent" ? "需求分析 Agent" : "系统"}</strong><p>{item.content}</p></article>) : <p>尚无澄清消息。</p>}{analyzing && <article className="commission-message agent thinking-message" role="status" aria-live="polite"><strong>需求分析 Agent</strong><span>正在思考</span><span className="thinking-dots" aria-hidden="true"><i /><i /><i /></span></article>}</div>
+        <div className="commission-timeline" ref={timeline}>{selected.messages.length ? selected.messages.map((item) => <article key={item.id} className={`commission-message ${item.role}`}><strong>{item.role === "human" ? "你" : item.role === "agent" ? "需求分析 Agent" : "系统"}</strong><p>{item.content}</p></article>) : <p>尚无澄清消息。</p>}{analyzing && <article className="commission-message agent thinking-message" role="status" aria-live="polite"><strong>需求分析 Agent</strong><div className="analysis-progress">{analysisProgress.slice(0, -1).map((item, index) => <span key={`${index}:${item}`}>{item}</span>)}<span>{analysisProgress.at(-1) ?? "正在启动分析"}<span className="thinking-dots" aria-hidden="true"><i /><i /><i /></span></span></div></article>}</div>
         <div className="clarification-controls">
           {nextClarification === "reply" && (latestOptions.length ? <form className="clarification-choice-form" onSubmit={sendChoice}>{latestOptions.map((option, index) => <label key={option}><input type="radio" name="choice" value={option} required disabled={busy} />{clarificationOptionLabel(option, index === 0)}</label>)}<label><input type="radio" name="choice" value="__custom__" required disabled={busy} />其他（自定义）</label><input name="custom" autoComplete="off" placeholder="输入自定义答案" disabled={busy} /><button disabled={busy}>{busy ? "分析中…" : "提交选择并继续分析"}</button></form> : <form className="commission-message-form" onSubmit={sendMessage}><input name="content" placeholder="回复需求分析 Agent" required disabled={busy} /><button disabled={busy}>{busy ? "分析中…" : "回复并继续分析"}</button></form>)}
           <form className="commission-message-form" onSubmit={uploadAttachment}><input name="file" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,.txt,.md,.pdf,.docx" required disabled={busy} /><button className="secondary" disabled={busy}>上传附件</button></form>
