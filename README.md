@@ -66,7 +66,7 @@ OpenWorkshop 将现有本地代码库、固定角色 Codex Agent 和人工决策
 - 汇总任务状态、Run、评审结果和证据，形成最终验收视图。
 - 人工批准后关闭主任务和委托；拒绝后重新进入返工流程。
 - 自动生成需求、计划、评审报告和交付文档，并保留历史版本。
-- 提供通知、数据库备份恢复和运行日志保留机制。
+- Windows 后台服务直接投递系统通知，浏览器通知作为其他平台和投递失败时的补偿；同时提供数据库备份恢复和运行日志保留机制。
 
 ## 快速开始
 
@@ -209,7 +209,7 @@ workshop api GET /api/health --output json
 | `workshop log [-n 100]` | 输出最新服务日志的最后若干行 |
 | `workshop restart` | 优雅重启服务 |
 | `workshop stop` | 优雅停止服务 |
-| `workshop doctor` | 检查数据库、项目根目录、Git、SVN、Codex 和端口 |
+| `workshop doctor` | 检查数据库、项目根目录、Git、Codex 和端口 |
 | `workshop backup [path]` | 备份 SQLite 数据库 |
 | `workshop restore <path>` | 恢复数据库，并先保存当前数据库 |
 | `workshop pin set` | 修改 PIN 并撤销已有会话 |

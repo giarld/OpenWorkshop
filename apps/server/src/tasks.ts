@@ -86,7 +86,10 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
       const before = activeTask(database, request.params.id);
       moveTask(database, request.params.id, request.body ?? {});
       const after = activeTask(database, request.params.id);
-      if (before.status !== after.status && after.status === "done") addMainTaskComment(database, { sourceTaskId: after.id, content: "子任务已由人工标记为完成。" });
+      if (before.status !== after.status && after.status === "done") {
+        addMainTaskComment(database, { sourceTaskId: after.id, content: "子任务已由人工标记为完成。" });
+        updateCommissionAcceptance(database, after.commission_id);
+      }
       if (before.status !== after.status && after.status === "blocked") addMainTaskComment(database, { sourceTaskId: after.id, kind: "blocker", content: "子任务已由人工标记为阻塞。" });
     });
     return taskView(database, request.params.id, true);

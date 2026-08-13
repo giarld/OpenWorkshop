@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deflateSync } from "node:zlib";
+import { deflateSync, gzipSync, gunzipSync } from "node:zlib";
 import test from "node:test";
 import Fastify from "fastify";
 import { archiveCommission, reactivateCommission, recoverCommissionLifecycleOperations } from "./commission-archive.ts";
@@ -67,6 +67,8 @@ test("compresses a clarified commission and restores its documents, tasks, histo
     const now = new Date().toISOString();
     database.prepare("UPDATE commissions SET main_task_id = ? WHERE id = ?").run(taskId, commissionId);
     database.prepare("INSERT INTO comments (id, task_id, author_type, kind, content, created_at) VALUES (?, ?, 'human', 'normal', 'history', ?)").run(randomUUID(), taskId, now);
+    const notificationId = randomUUID();
+    database.prepare("INSERT INTO notifications (id, kind, title, body, entity_type, entity_id, created_at) VALUES (?, 'blocked', 'Historical', 'Do not replay', 'task', ?, ?)").run(notificationId, taskId, now);
     const runId = randomUUID();
     database.prepare(`INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json)
       VALUES (?, ?, ?, ?, 'developer', 'manual', 'running', 1, '{}', '{}')`)
@@ -99,6 +101,13 @@ test("compresses a clarified commission and restores its documents, tasks, histo
     assert.equal(archivedCommission.status, "archived");
     assert.ok(archivedCommission.archive_size_bytes > 0);
     await access(join(archivedCommission.archive_path, "metadata.json.gz"));
+    const metadataPath = join(archivedCommission.archive_path, "metadata.json.gz");
+    const legacySnapshot = JSON.parse(gunzipSync(await readFile(metadataPath)).toString("utf8")) as { tables: { notifications: Array<Record<string, unknown>> } };
+    for (const notification of legacySnapshot.tables.notifications) delete notification.system_notified_at;
+    const legacyMetadata = gzipSync(Buffer.from(JSON.stringify(legacySnapshot), "utf8"));
+    await writeFile(metadataPath, legacyMetadata);
+    database.prepare("UPDATE commissions SET archive_sha256 = ?, archive_size_bytes = ? WHERE id = ?")
+      .run(createHash("sha256").update(legacyMetadata).digest("hex"), legacyMetadata.length, commissionId);
     await assert.rejects(access(attachment.storage_path));
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM tasks WHERE commission_id = ?").get(commissionId) as { count: number }).count, 0);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM documents WHERE commission_id = ?").get(commissionId) as { count: number }).count, 0);
@@ -126,6 +135,7 @@ test("compresses a clarified commission and restores its documents, tasks, histo
     const restored = reactivationResults.find((result): result is PromiseFulfilledResult<Record<string, unknown>> => result.status === "fulfilled")!.value as { status: string; active_requirement_version_id: string; main_task_id: string; archive_path: null };
     assert.deepEqual({ status: restored.status, requirement: restored.active_requirement_version_id, task: restored.main_task_id, archive: restored.archive_path }, { status: "planned", requirement: requirement.id, task: taskId, archive: null });
     assert.equal((database.prepare("SELECT content FROM comments WHERE task_id = ?").get(taskId) as { content: string }).content, "history");
+    assert.equal((database.prepare("SELECT system_notified_at FROM notifications WHERE id = ?").get(notificationId) as { system_notified_at: string }).system_notified_at, now);
     assert.equal((database.prepare("SELECT summary FROM run_events WHERE run_id = ?").get(runId) as { summary: string }).summary, "done");
     assert.equal((database.prepare("SELECT content_markdown FROM document_versions WHERE id = ?").get(versionId) as { content_markdown: string }).content_markdown, "# Document");
     assert.equal(await readFile(attachment.storage_path, "utf8"), "compressible content ".repeat(100));

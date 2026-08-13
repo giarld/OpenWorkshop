@@ -193,7 +193,9 @@ export class CodexRunController {
     try {
       await client.initialize();
       const prompt = run.role === "supervisor"
-        ? `You are the project supervisor Agent. Reconcile the current task before it is executed again so completed work is not repeated. Read every context file, inspect the current workspace without modifying it, distinguish infrastructure interruption from implementation or review failure, and choose exactly one next action.\n\nCurrent objective: ${task.title}\nExecution boundary: read-only coordination; do not modify project files, run destructive commands, or perform the task itself.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"action":"resume_reviewer|resume_developer|rework_developer|restart_developer|replan|wait_human","summary":"string"}. Use resume_reviewer when review was interrupted or failed for infrastructure reasons; resume_developer when an interrupted developer should continue; rework_developer when review findings require code changes; restart_developer only when prior development cannot be reused; replan when the task definition or dependencies must change; wait_human when a human decision or operation is required.`
+        ? run.trigger_type === "coordinate"
+          ? `You are the project scheduling Agent. Analyze the approved requirement, the complete task tree, dependencies, statuses, Runs, and main-task comments before any work proceeds. Do not modify project files or perform implementation. Decide exactly which tasks the service should start, retry, or resume now.\n\nCurrent objective: ${task.title}\nExecution boundary: read-only scheduling and coordination.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"action":"proceed|replan|wait_human","summary":"string","tasks":[{"taskId":"uuid","action":"start|retry|resume"}]}. proceed requires at least one immediately executable task: start for a Todo task, retry for a Blocked task, resume for a task whose latest Run is interrupted. Include only task IDs from task-tree.md whose dependencies are already Done. Use replan when the approved work cannot be completed with the current plan. Use wait_human when a concrete human decision or missing answer is required; summary must state the exact question that should be asked in the main-task comments. Omit tasks for replan and wait_human.`
+          : `You are the project supervisor Agent. Reconcile the current task before it is executed again so completed work is not repeated. Read every context file, inspect the current workspace without modifying it, distinguish infrastructure interruption from implementation or review failure, and choose exactly one next action.\n\nCurrent objective: ${task.title}\nExecution boundary: read-only coordination; do not modify project files, run destructive commands, or perform the task itself.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"action":"resume_reviewer|resume_developer|rework_developer|restart_developer|replan|wait_human","summary":"string"}. Use resume_reviewer when review was interrupted or failed for infrastructure reasons; resume_developer when an interrupted developer should continue; rework_developer when review findings require code changes; restart_developer only when prior development cannot be reused; replan when the task definition or dependencies must change; wait_human when a human decision or operation is required.`
         : run.role === "reviewer"
           ? `You are the independent test/review Agent. Verify the current task against its acceptance criteria and project instructions. Read every context file before acting.\n\nCurrent objective: ${task.title}\nExecution boundary: inspect the current workspace; do not implement fixes.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"passed":boolean,"summary":"string","checks":[],"findings":[{"severity":"blocking|warning","file":"path","line":null,"message":"string"}]}. Only blocking findings make passed false.`
           : `You are the developer Agent. Read every context file before acting.\n\nCurrent objective: ${task.title}\nExecution boundary: ${task.read_only ? "read-only analysis; do not modify project files" : "work only inside the provided workspace and complete the task acceptance criteria"}.\nContext files:\n${contextIndex}\n\nComplete the task and report the key result, checks, constraints, and remaining risks in the final message. The final message is saved to the task discussion; mention @负责人 when human attention or a decision is required.`;
@@ -431,12 +433,18 @@ function runContextFiles(database: DatabaseSync, run: RunRow, task: TaskContext,
   `).all(run.trigger_ref_id) as Array<Record<string, unknown>> : [];
   const requirementMessages = database.prepare("SELECT role, content, created_at FROM requirement_messages WHERE commission_id = ? ORDER BY created_at, rowid").all(run.commission_id) as Array<{ role: string; content: string; created_at: string }>;
   const comments = database.prepare("SELECT id, parent_id, run_id, author_type, agent_role, kind, content, created_at FROM comments WHERE task_id = ? AND deleted_at IS NULL ORDER BY created_at, rowid").all(run.task_id) as Array<{ id: string; parent_id: string | null; run_id: string | null; author_type: string; agent_role: string | null; kind: string; content: string; created_at: string }>;
+  const taskTree = run.trigger_type === "coordinate" ? database.prepare(`SELECT task.id, task.number_path, task.title, task.description, task.status, task.owner_type, task.blocked_reason, task.acceptance_json, latest.id AS latest_run_id, latest.role AS latest_run_role, latest.status AS latest_run_status
+    FROM tasks AS task
+    LEFT JOIN runs AS latest ON latest.rowid = (SELECT MAX(candidate.rowid) FROM runs AS candidate WHERE candidate.task_id = task.id AND candidate.id <> ?)
+    WHERE task.commission_id = ? AND task.archived_at IS NULL ORDER BY task.number_path`).all(run.id, run.commission_id) as Array<{ id: string; number_path: string; title: string; description: string; status: string; owner_type: string; blocked_reason: string | null; acceptance_json: string; latest_run_id: string | null; latest_run_role: string | null; latest_run_status: string | null }> : [];
+  const taskTreeDependencies = run.trigger_type === "coordinate" ? database.prepare("SELECT task.number_path AS task_path, required.number_path AS dependency_path FROM task_dependencies AS dependency JOIN tasks AS task ON task.id = dependency.task_id JOIN tasks AS required ON required.id = dependency.depends_on_task_id WHERE task.commission_id = ? ORDER BY task.number_path, required.number_path").all(run.commission_id) as Array<{ task_path: string; dependency_path: string }> : [];
   const attachmentsByComment = new Map<string, typeof commentAttachments>();
   for (const attachment of commentAttachments) if (attachment.comment_id) attachmentsByComment.set(attachment.comment_id, [...attachmentsByComment.get(attachment.comment_id) ?? [], attachment]);
   const files: RunContextFiles = {
     "requirement.md": `# Requirement: ${task.commission_title}\n\n${task.requirement}\n\n## Acceptance\n\n\`\`\`json\n${prettyJson(task.requirement_acceptance)}\n\`\`\`\n`,
     "task.md": `# Task: ${task.title}\n\n${task.description || "No description."}\n\n- Run role: ${run.role}\n- Trigger: ${run.trigger_type}\n- Read only: ${Boolean(task.read_only)}\n\n## Acceptance\n\n\`\`\`json\n${prettyJson(task.acceptance_json)}\n\`\`\`\n`,
     "dependencies.md": `# Dependencies\n\n${dependencies.length ? dependencies.map((item) => `## ${item.number_path} ${item.title}\n\n- Status: ${item.status}\n- Description: ${item.description || "No description."}\n- Acceptance: ${prettyJson(item.acceptance_json)}`).join("\n\n") : "No task dependencies."}\n`,
+    ...(taskTree.length ? { "task-tree.md": `# Task Tree\n\n${taskTree.map((item) => `## ${item.number_path} ${item.title}\n\n- ID: ${item.id}\n- Status: ${item.status}\n- Owner: ${item.owner_type}\n- Latest Run: ${item.latest_run_id ? `${item.latest_run_id} · ${item.latest_run_role} · ${item.latest_run_status}` : "none"}\n- Depends on: ${taskTreeDependencies.filter((dependency) => dependency.task_path === item.number_path).map((dependency) => dependency.dependency_path).join(", ") || "none"}\n- Blocked: ${item.blocked_reason ?? "no"}\n- Description: ${item.description || "No description."}\n- Acceptance: ${prettyJson(item.acceptance_json)}`).join("\n\n")}\n` } : {}),
     "previous-runs.md": `# Previous Runs\n\n${previousRuns.length ? previousRuns.map((item) => `- Attempt ${item.attempt_no} · ${item.role} · ${item.status} · ${item.trigger_type}${item.failure_summary ? ` · ${item.failure_summary}` : ""}`).join("\n") : "No previous Runs."}${evidence.length ? `\n\n## Trigger Run Evidence\n\n${evidence.map((item) => `- ${item.created_at} · ${item.event_type} · ${item.summary}\n  ${item.payload_json}`).join("\n")}` : ""}\n`,
     "project-profile.md": `# Project: ${task.project_name}\n\n- Root: ${task.project_root}\n- VCS: ${task.vcs_type}\n- VCS root: ${task.vcs_root ?? "none"}\n\n## Profile\n\n\`\`\`json\n${prettyJson(task.profile_json ?? "{}")}\n\`\`\`\n`,
     "messages.md": `# Messages\n\n${requirementMessages.length ? requirementMessages.map((item) => `## ${item.role} · ${item.created_at}\n\n${item.content}`).join("\n\n") : "No requirement messages."}${comments.length ? `\n\n# Task Comments\n\n${comments.map((item) => `## ${item.id} · ${item.author_type}${item.agent_role ? `/${item.agent_role}` : ""} · ${item.kind} · ${item.created_at}${item.parent_id ? ` · reply-to:${item.parent_id}` : ""}${item.run_id ? ` · run:${item.run_id}` : ""}\n\n${attachmentMessage(item.content, attachmentsByComment.get(item.id) ?? [])}`).join("\n\n")}` : ""}\n`
@@ -518,14 +526,19 @@ export async function registerProductionRunRoutes(server: FastifyInstance, datab
     if (!task) return { action: "unavailable", message: "Task not found" };
     if (task.owner_type !== "ai") return { action: "unavailable", message: "人工任务没有可唤起的执行 Agent" };
     if (["done", "archived"].includes(task.status)) return { action: "unavailable", message: "已完成或归档任务不能启动 Agent" };
-    if (["in_progress", "blocked"].includes(task.status)) database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(new Date().toISOString(), taskId);
     try {
       const attachments = selectedTaskAttachments(database, taskId, attachmentIds, "not-run");
-      const result = await scheduler.trigger(taskId, (runIds) => {
+      const mainTask = database.prepare("SELECT 1 FROM commissions WHERE main_task_id = ?").get(taskId);
+      if (!mainTask && ["in_progress", "blocked"].includes(task.status)) database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(new Date().toISOString(), taskId);
+      const result = await (mainTask ? scheduler.coordinate(taskId, (runIds) => {
+        const runId = runIds[0];
+        if (attachments.length && !runId) throw Object.assign(new Error("Main task did not reserve a scheduling Run"), { statusCode: 409 });
+        if (runId) claimRunAttachments(database, runId, taskId, attachments);
+      }) : scheduler.trigger(taskId, (runIds) => {
         const runId = runIds.length ? (database.prepare(`SELECT id FROM runs WHERE task_id = ? AND id IN (${runIds.map(() => "?").join(", ")}) ORDER BY rowid LIMIT 1`).get(taskId, ...runIds) as { id: string } | undefined)?.id : undefined;
         if (attachments.length && !runId) throw Object.assign(new Error("Task did not reserve a Run for the mentioned Agent"), { statusCode: 409 });
         if (runId) claimRunAttachments(database, runId, taskId, attachments);
-      });
+      }));
       return { action: "triggered", ...(result.runIds[0] ? { runId: result.runIds[0] } : {}) };
     } catch (error) { return { action: "unavailable", message: error instanceof Error ? error.message : String(error) }; }
   };
@@ -554,11 +567,17 @@ function releaseRunAttachments(database: DatabaseSync, runId: string, attachment
 }
 
 export function registerRunRoutes(server: FastifyInstance, database: DatabaseSync, controller: RunController, hub: EventHub): void {
-  server.get("/api/runtime/run-status", async () => database.prepare(`SELECT
-    COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued,
-    COALESCE(SUM(CASE WHEN status IN ('preparing', 'running') THEN 1 ELSE 0 END), 0) AS active,
-    COALESCE(SUM(CASE WHEN status IN ('waiting_approval', 'waiting_input') THEN 1 ELSE 0 END), 0) AS waiting
-    FROM runs`).get());
+  server.get("/api/runtime/run-status", async () => ({
+    ...database.prepare(`SELECT
+      COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued,
+      COALESCE(SUM(CASE WHEN status IN ('preparing', 'running') THEN 1 ELSE 0 END), 0) AS active,
+      COALESCE(SUM(CASE WHEN status IN ('waiting_approval', 'waiting_input') THEN 1 ELSE 0 END), 0) AS waiting
+      FROM runs`).get(),
+    tasks: database.prepare(`SELECT run.task_id AS taskId, run.status, task.number_path AS numberPath, task.title, task.description, project.name AS projectName
+      FROM runs AS run JOIN tasks AS task ON task.id = run.task_id JOIN projects AS project ON project.id = run.project_id
+      WHERE run.status IN ('queued', 'preparing', 'running', 'waiting_approval', 'waiting_input')
+      ORDER BY CASE run.status WHEN 'waiting_approval' THEN 0 WHEN 'waiting_input' THEN 1 WHEN 'running' THEN 2 WHEN 'preparing' THEN 3 ELSE 4 END, run.rowid`).all()
+  }));
 
   server.get<{ Params: { id: string }; Querystring: { scope?: string } }>("/api/tasks/:id/runs", async (request) => {
     const rows = request.query.scope === "tree"

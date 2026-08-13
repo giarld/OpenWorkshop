@@ -3,7 +3,7 @@ import test from "node:test";
 import { notificationEntityHash, notificationHashTarget, notificationNavigation, pushBrowserNotifications, type AppNotification, type BrowserNotificationRuntime } from "./browser-notifications.ts";
 
 function item(overrides: Partial<AppNotification> = {}): AppNotification {
-  return { id: "notification-1", kind: "blocked", title: "Task blocked", body: "Needs attention", entity_type: "task", entity_id: "task-1", project_id: "project-1", read_at: null, ...overrides };
+  return { id: "notification-1", kind: "blocked", title: "Task blocked", body: "Needs attention", entity_type: "task", entity_id: "task-1", project_id: "project-1", read_at: null, system_notified_at: null, ...overrides };
 }
 
 test("pushes unread notifications while another workspace page is visible", async () => {
@@ -48,7 +48,8 @@ test("does not repeat shown, read, or currently open notifications", async () =>
   await pushBrowserNotifications([
     item({ id: "shown" }),
     item({ id: "current" }),
-    item({ id: "read", read_at: "2026-08-12T00:00:00.000Z" })
+    item({ id: "read", read_at: "2026-08-12T00:00:00.000Z" }),
+    item({ id: "system-notified", system_notified_at: "2026-08-12T00:00:00.000Z" })
   ], runtime);
   assert.deepEqual(shown, []);
   assert.equal(notificationEntityHash(item()), "#task-task-1?project=project-1");

@@ -23,7 +23,7 @@ test("aggregates token, cost, runtime, tasks, and daily activity", () => {
   const insert = database.prepare("INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?)");
   insert.run("task-a", "2026-08-09T01:00:00.000Z", "2026-08-09T01:30:00.000Z", 1_000_000, 100_000, 200_000, JSON.stringify({ model: "gpt-5.6-terra" }));
   insert.run("task-a", "2026-08-10T01:00:00.000Z", "2026-08-10T02:00:00.000Z", 200_000, 50_000, 20_000, JSON.stringify({ model: "gpt-5.6-terra" }));
-  insert.run("task-b", "2026-08-10T03:00:00.000Z", null, 300_000, 70_000, 30_000, JSON.stringify({ model: "gpt-5.6-terra" }));
+  insert.run("task-b", "2026-08-10T03:00:00.000Z", null, 300_000, 70_000, 30_000, JSON.stringify({ model: "echo/gpt-5.6-terra" }));
 
   const result = usageStatistics(database, "7d", new Date("2026-08-10T04:00:00.000Z"));
   assert.equal(result.summary.totalTokens, 1_720_000);
@@ -46,5 +46,14 @@ test("rejects unsupported ranges and reports unknown model cost as unavailable",
   const response = await server.inject({ method: "GET", url: "/api/usage?range=90d" });
   assert.equal(response.statusCode, 400);
   await server.close();
+  database.close();
+});
+
+test("estimates DeepSeek V4 model costs", () => {
+  const database = fixture();
+  const insert = database.prepare("INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?)");
+  insert.run("task-flash", "2026-08-10T01:00:00.000Z", null, 1_000_000, 1_000_000, 1_000_000, JSON.stringify({ model: "deepseek/deepseek-v4-flash" }));
+  insert.run("task-pro", "2026-08-10T02:00:00.000Z", null, 1_000_000, 1_000_000, 1_000_000, JSON.stringify({ model: "deepseek/deepseek-v4-pro" }));
+  assert.equal(usageStatistics(database, "1d", new Date("2026-08-10T04:00:00.000Z")).summary.estimatedCostUsd, 1.156425);
   database.close();
 });

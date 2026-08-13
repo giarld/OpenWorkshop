@@ -32,6 +32,8 @@ export function isCommentSubmitShortcut(event: { key: string; ctrlKey: boolean; 
 }
 
 const TOKEN_PRICES: Record<string, { input: number; cached: number; output: number }> = {
+  "deepseek-v4-flash": { input: 0.14, cached: 0.0028, output: 0.28 },
+  "deepseek-v4-pro": { input: 0.435, cached: 0.003625, output: 0.87 },
   "gpt-5.6-sol": { input: 5, cached: 0.5, output: 30 },
   "gpt-5.6-terra": { input: 2, cached: 0.2, output: 12 },
   "gpt-5.6-luna": { input: 0.2, cached: 0.02, output: 1.2 },
@@ -82,7 +84,7 @@ export function tokenPrice(runs: TokenUsageSource[]): number | null {
   if (!used.length) return null;
   let dollars = 0;
   for (const run of used) {
-    const price = run.configSnapshot?.model ? TOKEN_PRICES[run.configSnapshot.model] : undefined;
+    const price = run.configSnapshot?.model ? TOKEN_PRICES[run.configSnapshot.model.split("/").at(-1)!] : undefined;
     if (!price) return null;
     const input = run.token_input ?? 0;
     const cached = Math.min(input, run.token_cached ?? 0);
@@ -182,6 +184,10 @@ export function commentThreadRows<T extends ThreadedComment>(comments: T[]): Arr
   };
   visit(null, 0);
   return rows;
+}
+
+export function upsertComment<T extends { id: string }>(comments: T[], comment: T): T[] {
+  return comments.some((item) => item.id === comment.id) ? comments.map((item) => item.id === comment.id ? comment : item) : [...comments, comment];
 }
 
 export function taskMentionParts(content: string): TaskMentionPart[] {

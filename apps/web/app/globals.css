@@ -75,6 +75,18 @@ aside { padding: .8rem 1rem; border-left: .25rem solid #c47a2c; background: #fff
 .agent-indicator.busy i { background: #3977b8; }
 .agent-indicator.queued i, .agent-indicator.checking i { background: #b26b1d; }
 .agent-indicator.warning i, .agent-indicator.unhealthy i { background: #b53d35; }
+.agent-run-indicator { position: relative; outline: none; }
+.agent-run-indicator:focus-visible > .agent-indicator { outline: 3px solid #3977b84d; outline-offset: 2px; }
+.agent-run-popover { position: absolute; z-index: 30; top: calc(100% + .55rem); right: 0; width: min(28rem, calc(100vw - 2rem)); max-height: min(26rem, 70vh); display: none; overflow-y: auto; padding: .75rem; border: 1px solid var(--line-strong); border-radius: .3rem; background: var(--surface); color: var(--ink); box-shadow: 0 1rem 3rem #17201b2b; }
+.agent-run-indicator:hover .agent-run-popover, .agent-run-indicator:focus-within .agent-run-popover { display: block; }
+.agent-run-popover > strong { display: block; margin-bottom: .5rem; font-size: .78rem; }
+.agent-run-popover > p { font-size: .72rem; }
+.agent-run-popover ul { display: grid; gap: .5rem; margin: 0; padding: 0; list-style: none; }
+.agent-run-popover li { display: grid; gap: .2rem; padding: .55rem; border: 1px solid var(--line); border-radius: .2rem; background: var(--surface-muted); }
+.agent-run-popover li > span { display: flex; align-items: start; justify-content: space-between; gap: .75rem; }
+.agent-run-popover b { overflow-wrap: anywhere; font-size: .72rem; }
+.agent-run-popover small { flex: none; color: var(--accent-strong); font-size: .64rem; font-weight: 850; }
+.agent-run-popover li p { display: -webkit-box; margin: 0; overflow: hidden; color: var(--muted); font-size: .68rem; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .header-actions { position: relative; display: flex; align-items: center; gap: .65rem; }
 .associate-project summary, .create-task summary { padding: .75rem 1rem; border-radius: .275rem; background: #e7e2d6; color: #17201b; font-weight: 800; cursor: pointer; list-style: none; white-space: nowrap; }
 .associate-project[open] form, .create-task[open] form { position: absolute; z-index: 20; right: 0; top: calc(100% + .5rem); width: min(22rem, calc(100vw - 2rem)); display: grid; gap: .8rem; padding: 1rem; border: 1px solid #d9d2c1; border-radius: .4rem; background: #fffdf7; box-shadow: 0 1rem 3rem #17201b2b; }
@@ -260,6 +272,8 @@ aside { padding: .8rem 1rem; border-left: .25rem solid #c47a2c; background: #fff
 .task-card-heading { min-width: 0; }
 .task-card-heading strong { display: block; overflow-wrap: anywhere; font-size: .87rem; }
 .task-card-heading p { display: -webkit-box; margin-top: .2rem; overflow: hidden; -webkit-line-clamp: 2; -webkit-box-orient: vertical; font-size: .74rem; }
+.main-task-crown { display: inline-flex; margin-right: .3rem; color: #a76600; vertical-align: -.16em; }
+.main-task-crown svg { width: 1rem; height: 1rem; fill: #f2c14e; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
 .icon-button { padding: .15rem; background: transparent; color: #536057; line-height: 1; }
 .icon-button:hover { background: #e7e2d6; color: #17201b; }
 .indent-spacer { width: 1.1rem; }
@@ -332,8 +346,17 @@ aside { padding: .8rem 1rem; border-left: .25rem solid #c47a2c; background: #fff
 .commission-card-main { min-width: 0; display: grid; gap: .45rem; padding: .2rem; background: transparent; color: #17201b; text-align: left; }
 .commission-card-main:hover { background: transparent; }
 .project-card { padding: 0; }
-.project-card .commission-card-main { align-self: stretch; padding: .8rem; }
+.project-card .commission-card-main { align-self: stretch; grid-template-columns: minmax(9rem, .35fr) minmax(18rem, 1fr); align-items: center; gap: 1.5rem; padding: 1rem 1.2rem; }
 .project-card > .secondary { margin-right: .8rem; }
+.project-card-identity, .project-card-overview { min-width: 0; display: grid; gap: .55rem; }
+.project-card-identity > strong { overflow: hidden; font-size: .9rem; text-overflow: ellipsis; white-space: nowrap; }
+.project-card-statuses { display: flex; align-items: center; flex-wrap: wrap; gap: .45rem; }
+.project-card-statuses small { padding: .28rem .7rem; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface); color: var(--muted); font-size: .66rem; font-weight: 800; white-space: nowrap; }
+.project-task-progress { position: relative; width: 33.333%; min-width: 8rem; height: .4rem; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--muted) 32%, transparent); box-shadow: inset 0 0 0 1px var(--line-strong); }
+.project-task-progress-fill { position: absolute; inset: 0 auto 0 0; background: var(--accent); }
+.project-task-progress-label { color: var(--muted); font-size: .68rem; font-variant-numeric: tabular-nums; font-weight: 750; }
+.project-run-status { background: #e9f1f8 !important; color: #174d78 !important; }
+.project-current-status { border-color: var(--accent) !important; background: var(--accent) !important; color: white !important; }
 .commission-card-actions, .commission-index-actions { display: flex; align-items: center; gap: .5rem; }
 .commission-card-actions button { white-space: nowrap; }
 .archived-commission-list { display: grid; align-content: start; gap: .65rem; }
@@ -881,6 +904,9 @@ aside { padding: .8rem 1rem; border-left: .25rem solid #c47a2c; background: #fff
   .delivery-dialog-body .delivery-panel { grid-row: auto; overflow: visible; }
   .commission-index-header { align-items: stretch; flex-direction: column; }
   .commission-card { grid-template-columns: 1fr; }
+  .project-card .commission-card-main { grid-template-columns: 1fr; gap: .8rem; }
+  .project-task-progress { width: 100%; }
+  .project-card > .secondary { margin: 0 .8rem .8rem; }
   .commission-card > button:last-child, .commission-card-actions, .commission-index-actions { width: 100%; }
   .commission-card-actions, .commission-index-actions { display: grid; grid-template-columns: 1fr 1fr; }
   .commission-message-form { flex-direction: column; }

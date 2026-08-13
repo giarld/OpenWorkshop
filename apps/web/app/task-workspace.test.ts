@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, taskMentionParts, tokenPrice, tokenUsageTotals } from "./task-run.ts";
+import { clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, taskMentionParts, tokenPrice, tokenUsageTotals, upsertComment } from "./task-run.ts";
 
 test("recognizes supported clipboard images and generates readable screenshot names", () => {
   assert.equal(clipboardImageExtension("image/png"), "png");
@@ -29,6 +29,9 @@ test("totals task tokens while keeping cached input as a subset", () => {
   assert.equal(tokenUsageTotals([{ token_input: null, token_output: null, token_cached: null }]), null);
   assert.equal(formatTokenCount(12345), "12,345");
   assert.equal(tokenPrice([{ token_input: 100, token_output: 40, token_cached: 80, configSnapshot: { model: "gpt-5.6-sol" } }]), 0.00134);
+  assert.equal(tokenPrice([{ token_input: 100, token_output: 40, token_cached: 80, configSnapshot: { model: "echo/gpt-5.6-sol" } }]), 0.00134);
+  assert.equal(tokenPrice([{ token_input: 1_000_000, token_output: 1_000_000, token_cached: 1_000_000, configSnapshot: { model: "deepseek/deepseek-v4-flash" } }]), 0.2828);
+  assert.equal(tokenPrice([{ token_input: 1_000_000, token_output: 1_000_000, token_cached: 1_000_000, configSnapshot: { model: "deepseek/deepseek-v4-pro" } }]), 0.873625);
   assert.equal(tokenPrice([{ token_input: 100, token_output: 40, token_cached: 80 }]), null);
   assert.equal(formatTokenPrice(1.23456), "$1.2346");
 });
@@ -90,6 +93,13 @@ test("orders issue comments with their replies", () => {
   const reply = { id: "reply", parent_id: "root", content: "reply" };
   const nested = { id: "nested", parent_id: "reply", content: "nested" };
   assert.deepEqual(commentThreadRows([root, nested, reply]).map(({ comment, depth }) => [comment.id, depth]), [["root", 0], ["reply", 1], ["nested", 2]]);
+});
+
+test("does not duplicate a comment already loaded by polling", () => {
+  const polled = { id: "comment-1", content: "已保存" };
+  const posted = { id: "comment-1", content: "已保存", agentMention: { action: "triggered" } };
+  assert.deepEqual(upsertComment([polled], posted), [posted]);
+  assert.deepEqual(upsertComment([], posted), [posted]);
 });
 
 test("parses clickable task mentions without matching ordinary version text", () => {

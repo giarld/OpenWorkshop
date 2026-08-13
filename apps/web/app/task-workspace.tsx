@@ -21,8 +21,8 @@ import { browserNotificationRuntime, notificationHashTarget, notificationNavigat
 import { DeliveryWorkspace } from "./delivery-workspace";
 import { CommissionWorkspace } from "./commission-workspace";
 import { UsageStatisticsWorkspace } from "./usage-statistics-workspace";
-import { PROJECT_NAME_MAX_LENGTH, activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, initialWorkspaceView, projectIdAfterArchive, projectNameError, workspaceContentState, type ManagedProject, type WorkspaceView } from "./project-management";
-import { clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, tokenPrice, tokenUsageTotals, type CodeChange, type MentionTrigger, type ReviewFinding, type RunEvent, type RunQuestion } from "./task-run";
+import { PROJECT_NAME_MAX_LENGTH, activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, initialWorkspaceView, isStaleWorkspaceHash, projectIdAfterArchive, projectNameError, projectRunLabels, workspaceContentState, type ManagedProject, type WorkspaceView } from "./project-management";
+import { clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, tokenPrice, tokenUsageTotals, upsertComment, type CodeChange, type MentionTrigger, type ReviewFinding, type RunEvent, type RunQuestion } from "./task-run";
 import {
   TASK_STATUSES,
   canDropTask,
@@ -111,12 +111,15 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
   const projectManagementDialog = useRef<HTMLDialogElement>(null);
   const projectIdRef = useRef(projectId);
   const projectDataRequestGate = useRef(createProjectDataRequestGate()).current;
+  const projectLoadingRequestGate = useRef(createProjectDataRequestGate()).current;
   const projectSnapshotSingleFlight = useRef(createKeyedSingleFlight()).current;
   projectIdRef.current = projectId;
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { delay: 180, tolerance: 8 } }), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
 
   useEffect(() => {
-    setView(initialWorkspaceView(localStorage.getItem(SELECTED_VIEW_KEY), location.hash));
+    const storedView = localStorage.getItem(SELECTED_VIEW_KEY);
+    setView(initialWorkspaceView(storedView, location.hash));
+    if (isStaleWorkspaceHash(storedView, location.hash)) history.replaceState(null, "", `${location.pathname}${location.search}`);
     setViewLoaded(true);
     void api<Project[]>("/api/projects").then((items) => {
       const active = activeProjects(items);
@@ -167,6 +170,14 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
   }, [view, projectId, taskDialogTask?.id]);
 
   useEffect(() => {
+    if (view !== "projects") return;
+    const refresh = () => void api<Project[]>("/api/projects").then((items) => setProjects(activeProjects(items))).catch(() => undefined);
+    refresh();
+    const timer = window.setInterval(refresh, 3000);
+    return () => window.clearInterval(timer);
+  }, [view]);
+
+  useEffect(() => {
     if (!projectId) { setTasks([]); setProjectCommissions([]); setLoading(false); return; }
     void loadProjectSnapshot(projectId, true);
   }, [projectId]);
@@ -189,7 +200,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
   }, [loading, notificationTarget, projectId, tasks, view]);
 
   function navigateNotificationTarget(target: { entityType: "task" | "approval"; entityId: string; projectId: string | null }) {
-    if (target.projectId) setProjectId(target.projectId);
+    if (target.projectId && target.projectId !== projectIdRef.current) selectProject(target.projectId);
     setView(target.entityType === "task" ? "board" : "notifications");
     setNotificationTarget(target.entityType === "task" ? target : null);
   }
@@ -292,6 +303,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     if (nextProjectId === projectIdRef.current) return;
     projectIdRef.current = nextProjectId;
     projectDataRequestGate.invalidate();
+    projectLoadingRequestGate.invalidate();
     setTasks([]);
     setProjectCommissions([]);
     setSelected(new Set());
@@ -395,25 +407,28 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
   }
 
   async function loadProjectSnapshot(requestedProjectId: string, showLoading: boolean) {
-    if (showLoading && requestedProjectId === projectIdRef.current) setLoading(true);
-    await projectSnapshotSingleFlight.run(requestedProjectId, async () => {
-      const request = projectDataRequestGate.begin(requestedProjectId);
-      const isCurrent = () => projectDataRequestGate.accepts(request, projectIdRef.current);
-      try {
-        const [nextTasks, nextCommissions] = await Promise.all([
-          api<Task[]>(`/api/projects/${requestedProjectId}/tasks?includeArchived=true`),
-          api<Commission[]>(`/api/projects/${requestedProjectId}/commissions`)
-        ]);
-        if (isCurrent()) {
-          setTasks(nextTasks);
-          setProjectCommissions(nextCommissions);
+    const loadingRequest = showLoading ? projectLoadingRequestGate.begin(requestedProjectId) : null;
+    if (loadingRequest && requestedProjectId === projectIdRef.current) setLoading(true);
+    try {
+      await projectSnapshotSingleFlight.run(requestedProjectId, async () => {
+        const request = projectDataRequestGate.begin(requestedProjectId);
+        const isCurrent = () => projectDataRequestGate.accepts(request, projectIdRef.current);
+        try {
+          const [nextTasks, nextCommissions] = await Promise.all([
+            api<Task[]>(`/api/projects/${requestedProjectId}/tasks?includeArchived=true`),
+            api<Commission[]>(`/api/projects/${requestedProjectId}/commissions`)
+          ]);
+          if (isCurrent()) {
+            setTasks(nextTasks);
+            setProjectCommissions(nextCommissions);
+          }
+        } catch (error) {
+          if (isCurrent()) setMessage((error as Error).message);
         }
-      } catch (error) {
-        if (isCurrent()) setMessage((error as Error).message);
-      } finally {
-        if (isCurrent()) setLoading(false);
-      }
-    });
+      });
+    } finally {
+      if (loadingRequest && projectLoadingRequestGate.accepts(loadingRequest, projectIdRef.current)) setLoading(false);
+    }
   }
 
   async function loadCurrentProjectTasks() {
@@ -597,10 +612,12 @@ function ProjectManagementPage({ projects, projectId, associate, onSelect, onMan
     <header className="project-management-header"><div><p className="eyebrow">Projects</p><h2>项目管理</h2><p>切换当前工作项目，或管理本地目录关联。</p></div>{associate}</header>
     {projects.length ? <div className="commission-list">{projects.map((project) => {
       const active = project.id === projectId;
+      const runLabels = projectRunLabels(project);
+      const completion = project.task_total ? Math.round(project.task_completed / project.task_total * 100) : 0;
       return <article className="commission-card project-card" key={project.id}>
         <button className="commission-card-main" onClick={() => onSelect(project.id)} aria-current={active ? "true" : undefined}>
-          <span className="commission-card-title"><strong>{project.name}</strong>{active && <small>当前项目</small>}</span>
-          <span className="commission-summary">{project.path}</span>
+          <span className="project-card-identity"><strong>{project.name}</strong><span className="commission-summary">{project.path}</span></span>
+          <span className="project-card-overview"><span className="project-card-statuses">{active && <small className="project-current-status">当前项目</small>}{runLabels.length ? runLabels.map((label) => <small key={label} className="project-run-status">{label}</small>) : <small>空闲</small>}</span><span className="project-task-progress-label">任务进度 · {project.task_completed}/{project.task_total} · {completion}%</span><span className="project-task-progress" role="progressbar" aria-label={`${project.name} 任务进度 ${project.task_completed}/${project.task_total}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={completion}><span className="project-task-progress-fill" style={{ width: `${completion}%` }} /></span></span>
         </button>
         <button className="secondary" onClick={() => onManage(project)}>管理</button>
       </article>;
@@ -709,12 +726,16 @@ function SwimlaneColumn({ rootId, status, tasks, manual, onOpen }: { rootId: str
   </section>;
 }
 
+function TaskTitle({ task }: { task: Task }) {
+  return <>{!task.parent_id && <span className="main-task-crown" role="img" aria-label="主任务" title="主任务"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 6 4.5 5L12 4l4.5 7L21 6l-2 12H5L3 6Z" /><path d="M5.5 15h13" /></svg></span>}{task.number_path} {task.title}</>;
+}
+
 function TaskCard({ task, manual, onOpen }: { task: Task; manual: boolean; onOpen(task: Task): void }) {
   const sortable = useSortable({ id: task.id, disabled: task.status === "archived", data: { task } });
   const style = { transform: CSS.Transform.toString(sortable.transform), transition: sortable.transition };
   return <article ref={sortable.setNodeRef} style={style} className={`task-card ${sortable.isDragging ? "dragging" : ""}`} id={`task-${task.id}`} {...sortable.attributes} {...sortable.listeners} onClick={(event) => { const target = event.target as HTMLElement; if (target.closest(".task-card") === event.currentTarget && !target.closest("button, input, select, textarea, a")) onOpen(task); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === "Enter") { event.preventDefault(); onOpen(task); } }} title={manual ? "单击查看详情，按住后拖动任务" : "单击查看详情，按住后跨列移动"}>
     <div className="task-card-heading">
-      <div><strong>{task.number_path} {task.title}</strong><p>{task.description || "无描述"}</p></div>
+      <div><strong><TaskTitle task={task} /></strong><p>{task.description || "无描述"}</p></div>
     </div>
     <TaskMeta task={task} />
   </article>;
@@ -722,7 +743,7 @@ function TaskCard({ task, manual, onOpen }: { task: Task; manual: boolean; onOpe
 
 function TaskPropertyDialog({ dialog, task, busy, error, onClose, onSubmit }: { dialog: React.RefObject<HTMLDialogElement | null>; task: Task | null; busy: boolean; error: string; onClose(): void; onSubmit(event: FormEvent<HTMLFormElement>): Promise<void> }) {
   return <dialog ref={dialog} className="commission-dialog task-property-dialog" onClose={onClose}>
-    <header className="commission-dialog-header"><div><p className="eyebrow">Task Properties</p><h2>任务属性</h2>{task && <p>{task.number_path} {task.title}</p>}</div><button type="button" className="secondary dialog-close" onClick={onClose}>关闭</button></header>
+    <header className="commission-dialog-header"><div><p className="eyebrow">Task Properties</p><h2>任务属性</h2>{task && <p><TaskTitle task={task} /></p>}</div><button type="button" className="secondary dialog-close" onClick={onClose}>关闭</button></header>
     {task && <form key={task.id} className="commission-dialog-body commission-form" onSubmit={(event) => void onSubmit(event)}>
       <label>负责人<select name="ownerType" defaultValue={task.owner_type}><option value="ai">AI</option><option value="human">人工</option></select></label>
       <label>优先级<select name="priority" defaultValue={task.priority}><option value="none">无</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="urgent">紧急</option></select></label>
@@ -746,7 +767,7 @@ function TaskRow({ task, tasks, depth, collapsed, selected, onToggle, onSelect, 
   const children = taskChildren(tasks, task.id);
   return <>
     <div className="task-row" role="row" style={{ "--depth": depth } as React.CSSProperties}>
-      <span className="task-name"><input type="checkbox" checked={selected.has(task.id)} disabled={task.status !== "done"} onChange={(event) => { const next = new Set(selected); if (event.target.checked) next.add(task.id); else next.delete(task.id); onSelect(next); }} aria-label={`选择 ${task.title}`} />{children.length ? <button className="icon-button" onClick={() => onToggle(task.id)}>{collapsed.has(task.id) ? "▸" : "▾"}</button> : <span className="indent-spacer" />}<strong>{task.number_path} {task.title}</strong></span>
+      <span className="task-name"><input type="checkbox" checked={selected.has(task.id)} disabled={task.status !== "done"} onChange={(event) => { const next = new Set(selected); if (event.target.checked) next.add(task.id); else next.delete(task.id); onSelect(next); }} aria-label={`选择 ${task.title}`} />{children.length ? <button className="icon-button" onClick={() => onToggle(task.id)}>{collapsed.has(task.id) ? "▸" : "▾"}</button> : <span className="indent-spacer" />}<strong><TaskTitle task={task} /></strong></span>
       <span><i className={`status-dot status-${task.status}`} />{STATUS_LABELS[task.status]}</span><span>{task.owner_type === "human" ? "人工" : "AI"}</span><span>{task.priority}</span><span className="task-row-actions"><button className="secondary compact" onClick={() => onOpen(task)}>查看与推进</button>{task.status === "done" && <button className="secondary compact" onClick={() => onArchive([task.id])}>归档</button>}{task.status === "archived" && <button className="secondary compact" onClick={() => onUnarchive(task)}>解除归档</button>}</span>
     </div>
     {!collapsed.has(task.id) && children.map((child) => <TaskRow key={child.id} task={child} tasks={tasks} depth={depth + 1} collapsed={collapsed} selected={selected} onToggle={onToggle} onSelect={onSelect} onArchive={onArchive} onUnarchive={onUnarchive} onOpen={onOpen} />)}
@@ -797,7 +818,7 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, eventsByRun, busy
     try {
       uploaded = await uploadTaskAttachments(task.id, files, setCommentUploadProgress);
       const comment = await api<CommentPostResponse>(`/api/tasks/${task.id}/comments`, { method: "POST", body: JSON.stringify({ content, parentId: data.get("parentId") || null, attachmentIds: uploaded.map((item) => item.id) }) });
-      setComments((current) => [...current, comment]);
+      setComments((current) => upsertComment(current, comment));
       form.reset();
       if (comment.agentMention?.action === "unavailable") setCommentError(`评论已保存，但 Agent 未响应：${comment.agentMention.message ?? "当前不可用"}`);
       return true;
@@ -813,7 +834,7 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, eventsByRun, busy
     } catch (error) { setCommentError((error as Error).message); }
   }
   return <dialog ref={dialog} className="commission-dialog task-run-dialog" onClose={onClose}>
-    <header className="commission-dialog-header"><div><p className="eyebrow">Task Execution</p><h2>任务运行</h2>{task && <p>{task.number_path} {task.title}</p>}</div><div className="task-run-header-actions">{task && task.status !== "archived" && <button className="secondary" onClick={() => onProperties(task)}>任务属性</button>}<button className="secondary dialog-close" onClick={onClose}>关闭</button></div></header>
+    <header className="commission-dialog-header"><div><p className="eyebrow">Task Execution</p><h2>任务运行</h2>{task && <p><TaskTitle task={task} /></p>}</div><div className="task-run-header-actions">{task && task.status !== "archived" && <button className="secondary" onClick={() => onProperties(task)}>任务属性</button>}<button className="secondary dialog-close" onClick={onClose}>关闭</button></div></header>
     {task && <div className="task-run-layout commission-dialog-body">
     <main className="task-run-content">
       <div className="task-run-summary"><span className={`status-pill status-${task.status}`}>{STATUS_LABELS[task.status]}</span><span>{task.owner_type === "human" ? "人工任务" : "AI 任务"}</span><span>{latest ? `Run #${latest.attempt_no} · ${latest.role} · ${latest.status}` : "尚未运行"}</span>{latest && active && <RunElapsedTimer run={latest} />}</div>

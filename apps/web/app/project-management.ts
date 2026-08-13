@@ -4,6 +4,11 @@ export type ManagedProject = {
   path: string;
   real_path: string;
   archived_at: string | null;
+  task_total: number;
+  task_completed: number;
+  run_queued: number;
+  run_active: number;
+  run_waiting: number;
 };
 
 export const PROJECT_NAME_MAX_LENGTH = 100;
@@ -27,6 +32,10 @@ export function initialWorkspaceView(storedValue: string | null, hash: string): 
   return "commissions";
 }
 
+export function isStaleWorkspaceHash(storedValue: string | null, hash: string): boolean {
+  return WORKSPACE_VIEW_IDS.includes(storedValue as WorkspaceView) && (hash.startsWith("#task-") || hash.startsWith("#approval-"));
+}
+
 export type WorkspaceContentState = "settings" | "loading" | "ready";
 
 export function workspaceContentState(view: WorkspaceView, loading: boolean): WorkspaceContentState {
@@ -36,6 +45,10 @@ export function workspaceContentState(view: WorkspaceView, loading: boolean): Wo
 
 export function activeProjects(projects: ManagedProject[]): ManagedProject[] {
   return projects.filter((project) => !project.archived_at);
+}
+
+export function projectRunLabels(project: ManagedProject): string[] {
+  return [project.run_active && `运行 ${project.run_active}`, project.run_queued && `排队 ${project.run_queued}`, project.run_waiting && `等待 ${project.run_waiting}`].filter((label): label is string => Boolean(label));
 }
 
 export function projectIdAfterArchive(projects: ManagedProject[], currentProjectId: string, archivedProjectId: string): string {

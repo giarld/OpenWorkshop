@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PROJECT_NAME_MAX_LENGTH, activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, initialWorkspaceView, projectIdAfterArchive, projectNameError, storedWorkspaceView, workspaceContentState, type ManagedProject } from "./project-management.ts";
+import { PROJECT_NAME_MAX_LENGTH, activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, initialWorkspaceView, isStaleWorkspaceHash, projectIdAfterArchive, projectNameError, projectRunLabels, storedWorkspaceView, workspaceContentState, type ManagedProject } from "./project-management.ts";
 
-const project = (id: string, archivedAt: string | null = null): ManagedProject => ({ id, name: id, path: `C:/${id}`, real_path: `C:/${id}`, archived_at: archivedAt });
+const project = (id: string, archivedAt: string | null = null): ManagedProject => ({ id, name: id, path: `C:/${id}`, real_path: `C:/${id}`, archived_at: archivedAt, task_total: 0, task_completed: 0, run_queued: 0, run_active: 0, run_waiting: 0 });
 
 test("project management only lists active associations", () => {
   assert.deepEqual(activeProjects([project("active"), project("archived", "2026-08-10T00:00:00.000Z")]).map((item) => item.id), ["active"]);
+});
+
+test("lists every active project run state", () => {
+  assert.deepEqual(projectRunLabels({ ...project("active"), run_active: 2, run_queued: 1, run_waiting: 3 }), ["运行 2", "排队 1", "等待 3"]);
+  assert.deepEqual(projectRunLabels(project("idle")), []);
 });
 
 test("validates project name length consistently", () => {
@@ -40,6 +45,14 @@ test("keeps the saved workspace page on refresh instead of letting a stale hash 
   assert.equal(initialWorkspaceView(null, ""), "commissions");
 });
 
+test("clears a stale notification hash only when restoring a saved workspace page", () => {
+  assert.equal(isStaleWorkspaceHash("delivery", "#task-old"), true);
+  assert.equal(isStaleWorkspaceHash("settings", "#approval-old"), true);
+  assert.equal(isStaleWorkspaceHash(null, "#task-current"), false);
+  assert.equal(isStaleWorkspaceHash("removed-page", "#approval-current"), false);
+  assert.equal(isStaleWorkspaceHash("delivery", "#section"), false);
+});
+
 test("keeps settings available while project data is loading", () => {
   assert.equal(workspaceContentState("settings", true), "settings");
   assert.equal(workspaceContentState("commissions", true), "loading");
@@ -55,6 +68,18 @@ test("only accepts the latest project data request", () => {
   assert.equal(gate.accepts(older, "project-a"), false);
   assert.equal(gate.accepts(newer, "project-a"), true);
   assert.equal(gate.accepts(newer, "project-b"), false);
+});
+
+test("keeps project loading ownership separate from data refresh requests", () => {
+  const dataGate = createProjectDataRequestGate();
+  const loadingGate = createProjectDataRequestGate();
+  const loadingRequest = loadingGate.begin("project-b");
+  const snapshotRequest = dataGate.begin("project-b");
+  const taskRefreshRequest = dataGate.begin("project-b");
+
+  assert.equal(dataGate.accepts(snapshotRequest, "project-b"), false);
+  assert.equal(dataGate.accepts(taskRefreshRequest, "project-b"), true);
+  assert.equal(loadingGate.accepts(loadingRequest, "project-b"), true);
 });
 
 test("invalidating project data requests rejects in-flight responses", () => {

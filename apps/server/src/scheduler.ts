@@ -65,6 +65,24 @@ export class Scheduler {
     return { grant, runIds };
   }
 
+  async coordinate(taskId: string, beforeStart?: (runIds: readonly string[]) => void) {
+    const { grant, runId } = transaction(this.database, () => {
+      const task = this.database.prepare("SELECT task.commission_id, commission.status FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id WHERE task.id = ? AND task.archived_at IS NULL AND task.id = commission.main_task_id").get(taskId) as { commission_id: string; status: string } | undefined;
+      if (!task) throw conflict("Coordination is only available for the main task");
+      const grant = (task.status === "active" ? this.database.prepare("SELECT * FROM execution_grants WHERE commission_id = ? AND root_task_id = ? AND scope = 'commission_tree' AND status = 'active' ORDER BY created_at DESC LIMIT 1").get(task.commission_id, taskId) as GrantRow | undefined : undefined) ?? createExecutionGrantUnsafe(this.database, taskId);
+      if (grant.scope !== "commission_tree") throw conflict("Coordination is only available for the main task");
+      const now = new Date().toISOString();
+      this.database.prepare("UPDATE tasks SET status = 'in_progress', blocked_reason = NULL, updated_at = ? WHERE id = ? AND status <> 'done'").run(now, taskId);
+      const covered = coveredTaskIds(this.database, grant.id);
+      if (covered.length) this.database.prepare(`UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id IN (${covered.map(() => "?").join(", ")}) AND status = 'backlog'`).run(now, ...covered);
+      const runId = reserveRun(this.database, grant.id, taskId, "coordinate", grant.id, null, undefined, "{}", "supervisor");
+      beforeStart?.([runId]);
+      return { grant, runId };
+    });
+    await this.startQueued();
+    return { grant, runIds: [runId] };
+  }
+
   async resume(taskId: string, previousRunId: string): Promise<string> {
     const previous = runById(this.database, previousRunId);
     const task = this.database.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string } | undefined;
@@ -85,9 +103,10 @@ export class Scheduler {
   }
 
   async recover(): Promise<string[]> {
-    const retries = recoverInterruptedRuns(this.database);
+    const blocked: string[] = [];
+    const retries = recoverInterruptedRuns(this.database, blocked);
     const commissions = this.database.prepare("SELECT id FROM commissions WHERE status IN ('active', 'blocked') AND archived_at IS NULL").all() as Array<{ id: string }>;
-    for (const { id } of commissions) updateCommissionAcceptance(this.database, id);
+    for (const { id } of commissions) if (!blocked.includes(id)) updateCommissionAcceptance(this.database, id);
     await this.startQueued();
     return retries;
   }
@@ -108,6 +127,22 @@ export class Scheduler {
 
   async terminal(runId: string): Promise<void> {
     const run = runById(this.database, runId);
+    if (["interrupted", "cancelled"].includes(run.status)) {
+      await this.cleanup(run.id, run.status === "cancelled");
+      return;
+    }
+    if (run.status === "failed" && run.trigger_type === "coordinate" && run.execution_grant_id) {
+      await this.cleanup(run.id);
+      transaction(this.database, () => {
+        const now = new Date().toISOString();
+        this.database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(now, run.task_id);
+        this.database.prepare("UPDATE commissions SET status = 'blocked', updated_at = ? WHERE id = ?").run(now, run.commission_id);
+        this.database.prepare("UPDATE execution_grants SET status = 'exhausted' WHERE id = ?").run(run.execution_grant_id);
+        addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "system", kind: "blocker", content: "调度 Run 失败，已停止自动推进，请人工检查运行详情后重新触发调度。" });
+        notify(this.database, "blocked", "调度需要人工处理", "调度 Run 执行失败。", "task", run.task_id);
+      });
+      return;
+    }
     if (run.status === "failed") {
       await this.cleanup(runId);
       this.database.prepare("UPDATE tasks SET status = 'blocked', blocked_reason = 'Run failed', updated_at = ? WHERE id = ?").run(new Date().toISOString(), run.task_id);
@@ -115,6 +150,20 @@ export class Scheduler {
       addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "system", kind: "blocker", content: `任务执行失败：${run.trigger_type} Run 未成功完成。` });
       addMainTaskComment(this.database, { sourceTaskId: run.task_id, runId: run.id, kind: "blocker", content: "子任务执行失败并进入阻塞。" });
       notify(this.database, "blocked", `任务阻塞：${task.title}`, "Run 执行失败。", "task", run.task_id);
+    }
+    if (run.status === "succeeded" && run.role === "supervisor" && run.trigger_type === "coordinate" && run.execution_grant_id) {
+      let decision: CoordinatorDecision;
+      try { decision = parseCoordinatorDecision(runAgentOutput(this.database, run.id)); }
+      catch (error) { decision = { action: "wait_human", summary: error instanceof Error ? error.message : "调度 Agent 返回了无效结果" }; }
+      let outcome: "queued" | "blocked";
+      try { outcome = transaction(this.database, () => applyCoordinatorDecision(this.database, run, decision)); }
+      catch (error) {
+        decision = { action: "wait_human", summary: error instanceof Error ? error.message : "调度决策无法执行" };
+        outcome = transaction(this.database, () => applyCoordinatorDecision(this.database, run, decision));
+      }
+      await this.cleanup(run.id, false);
+      if (outcome === "queued") await this.startQueued();
+      return;
     }
     if (run.status === "succeeded" && run.role === "supervisor" && run.execution_grant_id) {
       const existing = this.database.prepare("SELECT id FROM runs WHERE trigger_ref_id = ? ORDER BY rowid LIMIT 1").get(run.id) as { id: string } | undefined;
@@ -419,17 +468,26 @@ export function workspacePlan(projectRoot: string, vcs: VcsInfo["type"], readOnl
   return { cwd: projectRoot, lock: "exclusive", worktree: false };
 }
 
-export function recoverInterruptedRuns(database: DatabaseSync): string[] {
+export function recoverInterruptedRuns(database: DatabaseSync, blockedCommissions: string[] = []): string[] {
   return transaction(database, () => {
     const interrupted = database.prepare(`SELECT * FROM runs WHERE status IN (${ACTIVE_RUN_STATUSES.map(() => "?").join(", ")})`).all(...ACTIVE_RUN_STATUSES) as RunRow[];
     const now = new Date().toISOString(); const retries: string[] = [];
     for (const run of interrupted) {
       database.prepare("UPDATE runs SET status = 'interrupted', finished_at = ?, failure_code = 'server_restart' WHERE id = ?").run(now, run.id);
       const root = run.retry_root_run_id ?? run.id;
-      if (run.trigger_type === "auto_retry" || database.prepare("SELECT 1 FROM runs WHERE trigger_type = 'auto_retry' AND retry_root_run_id = ?").get(root)) continue;
+      if (run.trigger_type === "coordinate" && run.retry_root_run_id) {
+        database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(now, run.task_id);
+        database.prepare("UPDATE commissions SET status = 'blocked', updated_at = ? WHERE id = ?").run(now, run.commission_id);
+        if (run.execution_grant_id) database.prepare("UPDATE execution_grants SET status = 'exhausted' WHERE id = ? AND status = 'active'").run(run.execution_grant_id);
+        addRunCommentOnce(database, { taskId: run.task_id, runId: run.id, authorType: "system", kind: "blocker", content: "调度 Run 连续两次因服务重启中断，已停止自动恢复，请人工检查后重新触发调度。" });
+        notify(database, "blocked", "调度需要人工处理", "调度 Run 连续两次因服务重启中断。", "task", run.task_id);
+        blockedCommissions.push(run.commission_id);
+        continue;
+      }
+      if (run.retry_root_run_id || database.prepare("SELECT 1 FROM runs WHERE retry_root_run_id = ?").get(root)) continue;
       if (!run.execution_grant_id || grantById(database, run.execution_grant_id).status !== "active") continue;
-      database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(now, run.task_id);
-      retries.push(reserveRun(database, run.execution_grant_id, run.task_id, "auto_retry", run.id, root, run.config_snapshot_json, run.context_snapshot_json, run.role));
+      database.prepare("UPDATE tasks SET status = ?, blocked_reason = NULL, updated_at = ? WHERE id = ?").run(run.trigger_type === "coordinate" ? "in_progress" : "todo", now, run.task_id);
+      retries.push(reserveRun(database, run.execution_grant_id, run.task_id, run.trigger_type === "coordinate" ? "coordinate" : "auto_retry", run.id, root, run.config_snapshot_json, run.trigger_type === "coordinate" ? "{}" : run.context_snapshot_json, run.role));
     }
     return retries;
   });
@@ -467,6 +525,63 @@ export function parseSupervisorDecision(output: string): SupervisorDecision {
   const decision = value as Record<string, unknown>;
   if (!SUPERVISOR_ACTIONS.includes(decision.action as SupervisorAction) || typeof decision.summary !== "string" || !decision.summary.trim()) throw new Error("Supervisor returned invalid decision");
   return { action: decision.action as SupervisorAction, summary: decision.summary.trim() };
+}
+
+const COORDINATOR_ACTIONS = ["proceed", "replan", "wait_human"] as const;
+const COORDINATOR_TASK_ACTIONS = ["start", "retry", "resume"] as const;
+type CoordinatorTaskAction = { taskId: string; action: typeof COORDINATOR_TASK_ACTIONS[number] };
+type CoordinatorDecision = { action: typeof COORDINATOR_ACTIONS[number]; summary: string; tasks?: CoordinatorTaskAction[] };
+
+function parseCoordinatorDecision(output: string): CoordinatorDecision {
+  const json = /```(?:json)?\s*([\s\S]*?)```/i.exec(output)?.[1] ?? output.slice(output.indexOf("{"), output.lastIndexOf("}") + 1);
+  let value: unknown;
+  try { value = JSON.parse(json); } catch { throw new Error("Coordinator returned invalid JSON"); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Coordinator returned invalid decision");
+  const decision = value as Record<string, unknown>;
+  if (!COORDINATOR_ACTIONS.includes(decision.action as CoordinatorDecision["action"]) || typeof decision.summary !== "string" || !decision.summary.trim()) throw new Error("Coordinator returned invalid decision");
+  const tasks = decision.tasks === undefined ? [] : Array.isArray(decision.tasks) ? decision.tasks.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("Coordinator returned invalid task action");
+    const action = item as Record<string, unknown>;
+    if (typeof action.taskId !== "string" || !action.taskId || !COORDINATOR_TASK_ACTIONS.includes(action.action as CoordinatorTaskAction["action"])) throw new Error("Coordinator returned invalid task action");
+    return { taskId: action.taskId, action: action.action as CoordinatorTaskAction["action"] };
+  }) : (() => { throw new Error("Coordinator returned invalid tasks"); })();
+  if (decision.action === "proceed" && !tasks.length) throw new Error("Coordinator proceed decision requires task actions");
+  if (decision.action !== "proceed" && tasks.length) throw new Error("Coordinator task actions require proceed");
+  if (new Set(tasks.map(({ taskId }) => taskId)).size !== tasks.length) throw new Error("Coordinator task actions must be unique");
+  return { action: decision.action as CoordinatorDecision["action"], summary: decision.summary.trim(), ...(tasks.length ? { tasks } : {}) };
+}
+
+function applyCoordinatorDecision(database: DatabaseSync, run: RunRow, decision: CoordinatorDecision): "queued" | "blocked" {
+  const now = new Date().toISOString();
+  addRunCommentOnce(database, { taskId: run.task_id, runId: run.id, authorType: "agent", agentRole: "supervisor", content: `## 调度决策：${decision.action}\n\n${decision.action === "wait_human" ? "@负责人 " : ""}${decision.summary}` });
+  if (decision.action === "proceed") {
+    const actions = decision.tasks ?? [];
+    const rows = actions.map(({ taskId, action }) => {
+      const task = database.prepare(`SELECT task.id, task.status, task.owner_type, task.archived_at, commission.main_task_id
+        FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id
+        WHERE task.id = ? AND task.commission_id = ?`).get(taskId, run.commission_id) as { id: string; status: string; owner_type: string; archived_at: string | null; main_task_id: string | null } | undefined;
+      if (!task || task.archived_at || task.id === task.main_task_id || task.owner_type !== "ai") throw conflict(`调度目标不可执行：${taskId}`);
+      if (database.prepare("SELECT 1 FROM task_dependencies AS dependency JOIN tasks AS required ON required.id = dependency.depends_on_task_id WHERE dependency.task_id = ? AND required.status <> 'done' LIMIT 1").get(task.id)) throw conflict(`调度目标依赖未完成：${taskId}`);
+      if (database.prepare(`SELECT 1 FROM runs WHERE task_id = ? AND status IN (${RESERVED_RUN_STATUSES.map(() => "?").join(", ")})`).get(task.id, ...RESERVED_RUN_STATUSES)) throw conflict(`调度目标已有 Run：${taskId}`);
+      const previous = database.prepare("SELECT * FROM runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1").get(task.id) as RunRow | undefined;
+      if (action === "start" && task.status !== "todo") throw conflict(`调度目标不是 Todo：${taskId}`);
+      if (action === "retry" && task.status !== "blocked") throw conflict(`调度目标不是 Blocked：${taskId}`);
+      if (action === "resume" && (task.status !== "in_progress" || previous?.status !== "interrupted")) throw conflict(`调度目标没有可恢复的 Interrupted Run：${taskId}`);
+      return { task, action, previous };
+    });
+    for (const { task, action, previous } of rows) {
+      if (action !== "start") database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(now, task.id);
+      if (action === "resume") reserveRun(database, run.execution_grant_id!, task.id, "resume", previous!.id, null, previous!.config_snapshot_json, previous!.context_snapshot_json, previous!.role);
+      else reserveRoutedRun(database, run.execution_grant_id!, task.id);
+    }
+    return "queued";
+  }
+  const reason = decision.action === "replan" ? `调度 Agent 建议重新规划：${decision.summary}` : `等待人工处理：${decision.summary}`;
+  database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(now, run.task_id);
+  database.prepare("UPDATE commissions SET status = 'blocked', updated_at = ? WHERE id = ?").run(now, run.commission_id);
+  database.prepare("UPDATE execution_grants SET status = 'exhausted' WHERE id = ?").run(run.execution_grant_id);
+  notify(database, "blocked", "调度需要人工处理", reason, "task", run.task_id);
+  return "blocked";
 }
 
 function applySupervisorDecision(database: DatabaseSync, run: RunRow, decision: SupervisorDecision): "queued" | "blocked" {
@@ -531,11 +646,21 @@ function consecutiveFailedReviewCount(database: DatabaseSync, taskId: string): n
 function runAgentOutput(database: DatabaseSync, runId: string): string {
   const rows = database.prepare("SELECT payload_json FROM run_events WHERE run_id = ? AND event_type IN ('agent.message.delta', 'item.completed') ORDER BY id").all(runId) as Array<{ payload_json: string }>;
   let output = "";
+  let itemId: string | undefined;
   for (const row of rows) {
     const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
-    if (typeof payload.delta === "string") output += payload.delta;
+    if (typeof payload.delta === "string") {
+      if (typeof payload.itemId === "string" && payload.itemId !== itemId) {
+        itemId = payload.itemId;
+        output = "";
+      }
+      output += payload.delta;
+    }
     const item = payload.item as Record<string, unknown> | undefined;
-    if (!output && item?.type === "agentMessage" && typeof item.content === "string") output = item.content;
+    if (item?.type === "agentMessage" && typeof item.content === "string") {
+      itemId = typeof item.id === "string" ? item.id : itemId;
+      output = item.content;
+    }
   }
   return output;
 }
@@ -551,7 +676,7 @@ function canStartRun(database: DatabaseSync, run: RunRow): boolean {
     JOIN projects AS project ON project.id = commission.project_id
     JOIN root_paths AS root ON root.id = project.root_path_id
     WHERE commission.id = ? AND commission.status = 'active' AND commission.archived_at IS NULL AND project.archived_at IS NULL AND root.enabled = 1`).get(run.commission_id)) return false;
-  const taskStatus = run.trigger_type === "review" || run.trigger_type === "rework" ? "in_progress" : "todo";
+  const taskStatus = run.trigger_type === "review" || run.trigger_type === "rework" || run.trigger_type === "coordinate" ? "in_progress" : "todo";
   if (!database.prepare("SELECT 1 FROM tasks WHERE id = ? AND status = ? AND archived_at IS NULL").get(run.task_id, taskStatus)) return false;
   if (database.prepare("SELECT 1 FROM task_dependencies AS dependency JOIN tasks AS required ON required.id = dependency.depends_on_task_id WHERE dependency.task_id = ? AND required.status <> 'done' LIMIT 1").get(run.task_id)) return false;
   if (database.prepare("SELECT 1 FROM approvals JOIN runs ON runs.id = approvals.run_id WHERE runs.project_id = ? AND approvals.kind = 'high_risk' AND approvals.status = 'pending' LIMIT 1").get(run.project_id)) return false;

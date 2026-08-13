@@ -7,7 +7,7 @@ import { watchSystemColorTheme } from "./theme-settings";
 
 type Screen = "loading" | "initialize" | "login" | "settings";
 type AgentHealth = { ok: boolean; version?: string; error?: string };
-type RunStatus = { queued: number; active: number; waiting: number };
+type RunStatus = { queued: number; active: number; waiting: number; tasks: Array<{ taskId: string; status: string; numberPath: string; title: string; description: string; projectName: string }> };
 
 export default function Home() {
   const [screen, setScreen] = useState<Screen>("loading");
@@ -105,6 +105,6 @@ function AgentIndicators() {
   const healthLabel = health === null ? "健康：检查中" : health.ok ? "健康：正常" : "健康：异常";
   return <div className="agent-indicators" role="status" aria-live="polite" aria-label={`Agent ${healthLabel}，${run.label}`}>
     <span className={`agent-indicator ${healthState}`} title={health?.version ?? health?.error}><i />{healthLabel}</span>
-    <span className={`agent-indicator ${run.state}`}><i />{run.label}</span>
+    <div className="agent-run-indicator" tabIndex={0} aria-describedby="agent-run-summary"><span className={`agent-indicator ${run.state}`}><i />{run.label}</span><div className="agent-run-popover" id="agent-run-summary" role="tooltip"><strong>Agent 任务</strong>{runs?.tasks.length ? <ul>{runs.tasks.map((task) => <li key={task.taskId}><span><b>{task.projectName} · {task.numberPath} {task.title}</b><small>{task.status === "queued" ? "排队" : task.status === "preparing" ? "准备中" : task.status === "running" ? "运行中" : task.status === "waiting_approval" ? "等待审批" : "等待输入"}</small></span><p>{task.description || "暂无任务简介"}</p></li>)}</ul> : <p>当前没有运行、排队或等待处理的任务。</p>}</div></div>
   </div>;
 }

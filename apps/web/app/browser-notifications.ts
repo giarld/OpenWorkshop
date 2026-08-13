@@ -7,6 +7,7 @@ export type AppNotification = {
   entity_id: string;
   project_id: string | null;
   read_at: string | null;
+  system_notified_at: string | null;
 };
 
 type BrowserNotificationHandle = {
@@ -42,7 +43,7 @@ export function notificationNavigation(item: Pick<AppNotification, "entity_type"
 }
 
 export async function pushBrowserNotifications(items: AppNotification[], runtime: BrowserNotificationRuntime): Promise<void> {
-  const unread = items.filter((item) => !item.read_at);
+  const unread = items.filter((item) => !item.read_at && !item.system_notified_at);
   if (!unread.length || !runtime.supported) return;
   let permission = runtime.permission();
   if (permission === "default") permission = await runtime.requestPermission();

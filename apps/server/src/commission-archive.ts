@@ -276,7 +276,7 @@ function restoreCommissionRows(database: DatabaseSync, snapshot: ArchiveSnapshot
   insertRows(database, "documents", tables.documents.map((row) => ({ ...row, current_version_id: null })));
   insertRows(database, "document_versions", tables.documentVersions);
   for (const row of tables.documents) if (row.current_version_id) database.prepare("UPDATE documents SET current_version_id = ? WHERE id = ?").run(sqlValue(row, "current_version_id"), sqlValue(row, "id"));
-  insertRows(database, "notifications", tables.notifications);
+  insertRows(database, "notifications", tables.notifications.map((row) => Object.hasOwn(row, "system_notified_at") ? row : { ...row, system_notified_at: requiredSnapshotString(row.created_at, "notification.created_at") }));
 }
 
 function insertRows(database: DatabaseSync, table: string, values: Row[]): void {

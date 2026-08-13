@@ -256,6 +256,28 @@ test("exclusive workspaces serialize queued Runs and expire obsolete approvals",
   } finally { await fixture.close(); }
 });
 
+test("interrupted exclusive Run releases its lock for the next scheduler wake", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    fixture.database.prepare("UPDATE projects SET vcs_type = 'none' WHERE id = ?").run(fixture.project);
+    fixture.done(fixture.main);
+    fixture.task("first-write", fixture.main, "backlog");
+    fixture.task("second-write", fixture.main, "backlog");
+    const starts: string[] = [];
+    const scheduler = new Scheduler(fixture.database, { start: async (runId) => {
+      starts.push(runId);
+      fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId);
+    } });
+    await scheduler.trigger(fixture.main);
+    assert.equal(starts.length, 1);
+    fixture.database.prepare("UPDATE runs SET status = 'interrupted' WHERE id = ?").run(starts[0]!);
+    await scheduler.terminal(starts[0]!);
+    assert.equal(starts.length, 1);
+    await scheduler.wake();
+    assert.equal(starts.length, 2);
+  } finally { await fixture.close(); }
+});
+
 test("concurrent wake drains do not leak the first Run lock", async () => {
   const fixture = await schedulerFixture();
   try {
@@ -294,6 +316,48 @@ test("restart consumes one persisted automatic retry without extending its linea
     assert.deepEqual(await new Scheduler(fixture.database, starter, async () => "dirty").recover(), []);
     assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE trigger_type = 'auto_retry' AND trigger_ref_id = ?").get(run) as { count: number }).count, 1);
     assert.equal((fixture.database.prepare("SELECT MAX(attempt_no) AS attempt FROM runs WHERE task_id = ?").get(task) as { attempt: number }).attempt, 2);
+  } finally { await fixture.close(); }
+});
+
+test("restart preserves an interrupted coordination Run", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    const starter = { start: async (runId: string) => { fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } };
+    const firstScheduler = new Scheduler(fixture.database, starter, async () => "dirty");
+    const result = await firstScheduler.coordinate(fixture.main);
+    const run = result.runIds[0]!;
+    const [recovered] = await new Scheduler(fixture.database, starter, async () => "dirty").recover();
+    const retry = fixture.database.prepare("SELECT role, trigger_type, trigger_ref_id, status FROM runs WHERE id = ?").get(recovered) as { role: string; trigger_type: string; trigger_ref_id: string; status: string };
+    assert.deepEqual([retry.role, retry.trigger_type, retry.trigger_ref_id, retry.status], ["supervisor", "coordinate", run, "queued"]);
+    assert.equal((fixture.database.prepare("SELECT status FROM tasks WHERE id = ?").get(fixture.main) as { status: string }).status, "in_progress");
+    assert.deepEqual(await new Scheduler(fixture.database, { start: async () => undefined }, async () => "dirty").recover(), []);
+  } finally { await fixture.close(); }
+});
+
+test("a second coordination restart stops automatic recovery", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    const starter = { start: async (runId: string) => { fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } };
+    const first = await new Scheduler(fixture.database, starter, async () => "dirty").coordinate(fixture.main);
+    const [recovered] = await new Scheduler(fixture.database, starter, async () => "dirty").recover();
+    fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(recovered);
+    assert.deepEqual(await new Scheduler(fixture.database, starter, async () => "dirty").recover(), []);
+    assert.equal((fixture.database.prepare("SELECT status FROM execution_grants WHERE id = ?").get(first.grant.id) as { status: string }).status, "exhausted");
+    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE main_task_id = ?").get(fixture.main) as { status: string }).status, "blocked");
+    assert.equal((fixture.database.prepare("SELECT status FROM tasks WHERE id = ?").get(fixture.main) as { status: string }).status, "todo");
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE retry_root_run_id = ?").get(first.runIds[0]) as { count: number }).count, 1);
+    assert.match((fixture.database.prepare("SELECT content FROM comments WHERE run_id = ? AND kind = 'blocker'").get(recovered) as { content: string }).content, /连续两次/);
+  } finally { await fixture.close(); }
+});
+
+test("coordination rejects an active grant after the commission leaves active state", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    createExecutionGrant(fixture.database, fixture.main);
+    fixture.database.prepare("UPDATE commissions SET status = 'awaiting_acceptance' WHERE main_task_id = ?").run(fixture.main);
+    const scheduler = new Scheduler(fixture.database, { start: async () => assert.fail("awaiting acceptance must not start coordination") });
+    await assert.rejects(() => scheduler.coordinate(fixture.main), /cannot be executed/);
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE task_id = ? AND trigger_type = 'coordinate'").get(fixture.main) as { count: number }).count, 0);
   } finally { await fixture.close(); }
 });
 
@@ -338,6 +402,95 @@ test("re-execution reconciles with a read-only supervisor before choosing the ne
     const reviewerRun = fixture.database.prepare("SELECT trigger_type, trigger_ref_id FROM runs WHERE id = ?").get(reviewer) as { trigger_type: string; trigger_ref_id: string };
     assert.deepEqual([reviewerRun.trigger_type, reviewerRun.trigger_ref_id], ["resume", supervisor]);
     assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE task_id = ? AND role = 'developer'").get(task) as { count: number }).count, 0);
+  } finally { await fixture.close(); }
+});
+
+test("main-task coordination proceeds through the task tree or asks the human in comments", async () => {
+  const proceed = await schedulerFixture();
+  try {
+    const child = proceed.task("coordinated-child", proceed.main, "todo");
+    const starts: string[] = [];
+    const scheduler = new Scheduler(proceed.database, { start: async (runId) => { starts.push(runId); proceed.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } }, async () => "dirty");
+    const coordinator = (await scheduler.coordinate(proceed.main)).runIds[0]!;
+    proceed.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'decision', ?, 0, ?)")
+      .run(coordinator, JSON.stringify({ delta: JSON.stringify({ action: "proceed", summary: "The current task tree can advance.", tasks: [{ taskId: child, action: "start" }] }) }), new Date().toISOString());
+    proceed.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(coordinator);
+    await scheduler.terminal(coordinator);
+    assert.deepEqual(starts.map((id) => { const run = proceed.database.prepare("SELECT task_id, role FROM runs WHERE id = ?").get(id) as { task_id: string; role: string }; return [run.task_id, run.role]; }), [[proceed.main, "supervisor"], [child, "developer"]]);
+  } finally { await proceed.close(); }
+
+  const waiting = await schedulerFixture();
+  try {
+    waiting.task("waiting-child", waiting.main, "todo");
+    const scheduler = new Scheduler(waiting.database, { start: async (runId) => { waiting.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } }, async () => "dirty");
+    const coordinator = (await scheduler.coordinate(waiting.main)).runIds[0]!;
+    waiting.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'decision', ?, 0, ?)")
+      .run(coordinator, JSON.stringify({ delta: '{"action":"wait_human","summary":"请确认是否允许执行外部部署。"}' }), new Date().toISOString());
+    waiting.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(coordinator);
+    await scheduler.terminal(coordinator);
+    const comment = waiting.database.prepare("SELECT content FROM comments WHERE task_id = ? AND run_id = ? AND author_type = 'agent'").get(waiting.main, coordinator) as { content: string };
+    assert.match(comment.content, /@负责人 请确认是否允许执行外部部署/);
+    assert.equal((waiting.database.prepare("SELECT status FROM commissions WHERE main_task_id = ?").get(waiting.main) as { status: string }).status, "blocked");
+    assert.equal((waiting.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE task_id <> ?").get(waiting.main) as { count: number }).count, 0);
+  } finally { await waiting.close(); }
+});
+
+test("failed main-task coordination exhausts its grant without starting children", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    fixture.task("must-not-start", fixture.main, "todo");
+    const starts: string[] = [];
+    const scheduler = new Scheduler(fixture.database, { start: async (runId) => { starts.push(runId); fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } }, async () => "dirty");
+    const result = await scheduler.coordinate(fixture.main);
+    const coordinator = result.runIds[0]!;
+    fixture.database.prepare("UPDATE runs SET status = 'failed' WHERE id = ?").run(coordinator);
+    await scheduler.terminal(coordinator);
+    assert.deepEqual(starts, [coordinator]);
+    assert.equal((fixture.database.prepare("SELECT status FROM execution_grants WHERE id = ?").get(result.grant.id) as { status: string }).status, "exhausted");
+    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE main_task_id = ?").get(fixture.main) as { status: string }).status, "blocked");
+    assert.match((fixture.database.prepare("SELECT content FROM comments WHERE run_id = ? AND kind = 'blocker'").get(coordinator) as { content: string }).content, /已停止自动推进/);
+  } finally { await fixture.close(); }
+});
+
+test("main-task coordination executes explicit retry and resume actions", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    const retryTask = fixture.task("retry-blocked", fixture.main, "blocked");
+    fixture.database.prepare("UPDATE tasks SET blocked_reason = 'Review exhausted' WHERE id = ?").run(retryTask);
+    fixture.run(retryTask, "succeeded", null, "reviewer");
+    const resumeTask = fixture.task("resume-interrupted", fixture.main, "in_progress");
+    const interrupted = fixture.run(resumeTask, "interrupted", null, "developer");
+    const starts: string[] = [];
+    const scheduler = new Scheduler(fixture.database, { start: async (runId) => { starts.push(runId); fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } }, async () => "dirty");
+    const coordinator = (await scheduler.coordinate(fixture.main)).runIds[0]!;
+    fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'decision', ?, 0, ?)")
+      .run(coordinator, JSON.stringify({ delta: JSON.stringify({ action: "proceed", summary: "Retry blocked work and resume the interrupted task.", tasks: [{ taskId: retryTask, action: "retry" }, { taskId: resumeTask, action: "resume" }] }) }), new Date().toISOString());
+    fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(coordinator);
+    await scheduler.terminal(coordinator);
+
+    const retried = fixture.database.prepare("SELECT role, trigger_type FROM runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1").get(retryTask) as { role: string; trigger_type: string };
+    const resumed = fixture.database.prepare("SELECT role, trigger_type, trigger_ref_id FROM runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1").get(resumeTask) as { role: string; trigger_type: string; trigger_ref_id: string };
+    assert.deepEqual([retried.role, retried.trigger_type], ["supervisor", "reconcile"]);
+    assert.deepEqual([resumed.role, resumed.trigger_type, resumed.trigger_ref_id], ["developer", "resume", interrupted]);
+    assert.equal((fixture.database.prepare("SELECT blocked_reason FROM tasks WHERE id = ?").get(retryTask) as { blocked_reason: string | null }).blocked_reason, null);
+    assert.equal(starts.length, 2);
+    assert.deepEqual((fixture.database.prepare("SELECT status FROM runs WHERE task_id IN (?, ?) ORDER BY rowid").all(retryTask, resumeTask) as Array<{ status: string }>).map(({ status }) => status), ["succeeded", "interrupted", "running", "queued"]);
+  } finally { await fixture.close(); }
+});
+
+test("invalid or empty coordination actions ask the human instead of silently proceeding", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    fixture.task("still-blocked", fixture.main, "blocked");
+    const scheduler = new Scheduler(fixture.database, { start: async (runId) => { fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } }, async () => "dirty");
+    const coordinator = (await scheduler.coordinate(fixture.main)).runIds[0]!;
+    fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'decision', ?, 0, ?)")
+      .run(coordinator, JSON.stringify({ delta: '{"action":"proceed","summary":"Continue.","tasks":[]}' }), new Date().toISOString());
+    fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(coordinator);
+    await scheduler.terminal(coordinator);
+    const comment = fixture.database.prepare("SELECT content FROM comments WHERE task_id = ? AND run_id = ? AND author_type = 'agent'").get(fixture.main, coordinator) as { content: string };
+    assert.match(comment.content, /@负责人 Coordinator proceed decision requires task actions/);
+    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE main_task_id = ?").get(fixture.main) as { status: string }).status, "blocked");
   } finally { await fixture.close(); }
 });
 
@@ -388,7 +541,9 @@ test("failed reviews trigger rework without consuming required successful rounds
       const reviewer = starts.at(-1)!;
       assert.equal((fixture.database.prepare("SELECT role FROM runs WHERE id = ?").get(reviewer) as { role: string }).role, "reviewer");
       const review = JSON.stringify({ passed: false, summary: `round ${round + 1} failed`, checks: [], findings: [{ severity: "blocking", file: "src.ts", line: null, message: "fix" }] });
-      fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'review', ?, 0, ?)").run(reviewer, JSON.stringify({ delta: review }), new Date().toISOString());
+      const insertReview = fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'review', ?, 0, ?)");
+      insertReview.run(reviewer, JSON.stringify({ itemId: "progress", delta: '{"status":"checking"}' }), new Date().toISOString());
+      insertReview.run(reviewer, JSON.stringify({ itemId: "result", delta: review }), new Date().toISOString());
       fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(reviewer);
       await scheduler.terminal(reviewer);
     }

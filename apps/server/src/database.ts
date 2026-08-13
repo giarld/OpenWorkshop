@@ -505,6 +505,10 @@ const MIGRATIONS = [
   CREATE INDEX attachments_task_created ON attachments(task_id, created_at);
   CREATE INDEX attachments_comment_created ON attachments(comment_id, created_at);
   CREATE INDEX attachments_run_created ON attachments(run_id, created_at);
+  `,
+  `
+  ALTER TABLE notifications ADD COLUMN system_notified_at TEXT;
+  UPDATE notifications SET system_notified_at = created_at;
   `
 ];
 

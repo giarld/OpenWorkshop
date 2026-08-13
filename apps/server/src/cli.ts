@@ -12,6 +12,7 @@ import { setPin } from "./auth.js";
 import { checkCodexHealth } from "./codex.js";
 import { backupDatabase, openWorkshopDatabase, restoreDatabase, SettingsStore } from "./database.js";
 import { pruneRawRunEvents } from "./runs.js";
+import { startSystemNotificationWorker } from "./notifications.js";
 import { acquireInstanceLock, clearRuntimeState, consumeRuntimeStop, prepareWorkshopHome, pruneLogFiles, readLatestLog, readRuntimeState, requestRuntimeStop, writeRuntimeState, type RuntimeState } from "./platform.js";
 import { browserCommand, startBackgroundService, waitForServiceStop } from "./service-control.js";
 import { installWorkshopSkill } from "./skill-installer.js";
@@ -168,11 +169,13 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     await clearRuntimeState(home);
     let closing: Promise<void> | undefined;
     let stopWatcher: NodeJS.Timeout | undefined;
+    let stopNotificationWorker: (() => Promise<void>) | undefined;
     const retentionWatcher = setInterval(() => void Promise.all([pruneLogFiles(join(home, "logs"), retentionDays), Promise.resolve(pruneRawRunEvents(database!, retentionDays))]), 86_400_000);
     retentionWatcher.unref();
     const shutdown = async () => {
       closing ??= (async () => {
         if (stopWatcher) clearInterval(stopWatcher);
+        await stopNotificationWorker?.();
         clearInterval(retentionWatcher);
         await server.close();
         database?.close();
@@ -189,6 +192,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     await server.listen({ host: values.host, port });
     try {
       await writeRuntimeState(home, state);
+      stopNotificationWorker = startSystemNotificationWorker(database, serviceUrl(state));
     } catch (error) {
       await server.close();
       throw error;
@@ -334,7 +338,7 @@ async function doctor(home: string, host: string, port: number): Promise<DoctorR
   } finally {
     database?.close();
   }
-  for (const command of ["git", "svn"]) results.push(await check(command, async () => void await runFile(command, ["--version"], { windowsHide: true })));
+  results.push(await check("git", async () => void await runFile("git", ["--version"], { windowsHide: true })));
   const codex = await checkCodexHealth();
   results.push({ name: "codex app-server", ok: codex.ok, ...(codex.version ?? codex.error ? { detail: codex.version ?? codex.error } : {}) });
   results.push(await check(`port ${host}:${port}`, () => checkPort(host, port)));

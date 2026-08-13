@@ -310,6 +310,32 @@ test("human waiver advances the commission to main-task acceptance", async () =>
   } finally { await fixture.close(); }
 });
 
+test("manually completing the final child advances the commission to main-task acceptance", async () => {
+  const fixture = await taskFixture();
+  try {
+    const response = await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: {
+      mainTask: { title: "Main", acceptanceCriteria: ["Human approval"] },
+      tasks: [
+        { clientId: "T1", parentClientId: null, title: "Completed child", acceptanceCriteria: ["Reviewed"], dependsOn: [] },
+        { clientId: "T2", parentClientId: null, title: "Manual child", acceptanceCriteria: ["Checked"], dependsOn: ["T1"] }
+      ]
+    } });
+    const plan = response.json() as { mainTask: { id: string }; tasks: Array<{ id: string }> };
+    fixture.database.prepare("UPDATE commissions SET status = 'active' WHERE id = ?").run(fixture.commissionA);
+    fixture.database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(plan.mainTask.id);
+    fixture.database.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(plan.tasks[0]!.id);
+
+    const moved = await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[1]!.id}/move`, payload: { status: "done" } });
+
+    assert.equal(moved.statusCode, 200);
+    assert.equal(moved.json().status, "done");
+    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE id = ?").get(fixture.commissionA) as { status: string }).status, "awaiting_acceptance");
+    assert.equal((fixture.database.prepare("SELECT status FROM tasks WHERE id = ?").get(plan.mainTask.id) as { status: string }).status, "in_progress");
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE entity_type = 'task' AND entity_id = ? AND kind = 'acceptance'").get(plan.mainTask.id) as { count: number }).count, 1);
+    assert.ok(currentDelivery(fixture.database, fixture.commissionA));
+  } finally { await fixture.close(); }
+});
+
 async function taskFixture(mentionAgent?: AgentMentionHandler) {
   const home = await mkdtemp(join(tmpdir(), "project-workshop-tasks-"));
   const database = await openWorkshopDatabase(home);

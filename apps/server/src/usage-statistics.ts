@@ -26,6 +26,8 @@ type UsageBucket = {
 };
 
 const TOKEN_PRICES: Record<string, { input: number; cached: number; output: number }> = {
+  "deepseek-v4-flash": { input: 0.14, cached: 0.0028, output: 0.28 },
+  "deepseek-v4-pro": { input: 0.435, cached: 0.003625, output: 0.87 },
   "gpt-5.6-sol": { input: 5, cached: 0.5, output: 30 },
   "gpt-5.6-terra": { input: 2, cached: 0.2, output: 12 },
   "gpt-5.6-luna": { input: 0.2, cached: 0.02, output: 1.2 },
@@ -125,7 +127,7 @@ function estimatedCost(rows: RunUsageRow[]): number | null {
     const output = row.token_output ?? 0;
     if (input === 0 && output === 0) continue;
     const model = configModel(row.config_snapshot_json);
-    const price = model ? TOKEN_PRICES[model] : undefined;
+    const price = model ? TOKEN_PRICES[model.split("/").at(-1)!] : undefined;
     if (!price) return null;
     dollars += ((input - cached) * price.input + cached * price.cached + output * price.output) / 1_000_000;
   }

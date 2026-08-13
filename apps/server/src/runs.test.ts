@@ -201,6 +201,109 @@ test("passes image attachments as initial visual input when an @Agent mention cr
   }
 });
 
+test("starts a scheduling Agent when the main task is mentioned", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-main-task-coordinate-"));
+  const database = await openWorkshopDatabase(home);
+  const server = Fastify();
+  const prompts: string[] = [];
+  try {
+    const { commissionId, taskId: mainTaskId } = seedTask(database, home);
+    database.prepare("UPDATE commissions SET main_task_id = ? WHERE id = ?").run(mainTaskId, commissionId);
+    const childTaskId = randomUUID();
+    const previousRunId = randomUUID();
+    const interruptedRunId = randomUUID();
+    const now = new Date().toISOString();
+    database.prepare(`INSERT INTO tasks (id, commission_id, parent_id, number_path, position, title, description, status, priority, owner_type, acceptance_json, review_round_limit, review_round_used, created_at, updated_at)
+      VALUES (?, ?, ?, '1.1', 0, 'Child', 'Child work', 'todo', 'high', 'ai', '[]', 1, 0, ?, ?)`).run(childTaskId, commissionId, mainTaskId, now, now);
+    database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json) SELECT ?, project_id, id, ?, 'reviewer', 'review', 'succeeded', 1, '{}', '{}' FROM commissions WHERE id = ?").run(previousRunId, childTaskId, commissionId);
+    database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json) SELECT ?, project_id, id, ?, 'developer', 'resume', 'interrupted', 2, '{}', '{}' FROM commissions WHERE id = ?").run(interruptedRunId, childTaskId, commissionId);
+    const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
+      initialize: async () => undefined,
+      startRun: async (options) => { prompts.push(options.prompt); return { threadId: "thread-coordinate", turnId: "turn-coordinate", completed: new Promise<NormalizedCodexEvent>(() => undefined) }; },
+      steer: async () => undefined,
+      interrupt: async () => undefined,
+      close: async () => undefined
+    }), join(home, "attachments"));
+
+    const result = await mentionAgent(mainTaskId, "@Agent 请分析后推进");
+    assert.equal(result.action, "triggered");
+    const run = database.prepare("SELECT task_id, role, trigger_type FROM runs WHERE id = ?").get(result.runId!) as { task_id: string; role: string; trigger_type: string };
+    assert.equal(run.task_id, mainTaskId);
+    assert.equal(run.role, "supervisor");
+    assert.equal(run.trigger_type, "coordinate");
+    assert.match(prompts[0]!, /project scheduling Agent/);
+    const taskTree = await readFile(join(home, ".openworkshop", "runs", result.runId!, "task-tree.md"), "utf8");
+    assert.match(taskTree, /1\.1 Child/);
+    assert.match(taskTree, new RegExp(childTaskId));
+    assert.match(taskTree, new RegExp(`Latest Run: ${interruptedRunId} · developer · interrupted`));
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM runs WHERE task_id = ?").get(childTaskId) as { count: number }).count, 2);
+  } finally {
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("recovered scheduling Agent rebuilds task Run context after restart", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-coordinate-recovery-context-"));
+  const database = await openWorkshopDatabase(home);
+  const server = Fastify();
+  try {
+    const { commissionId, taskId: mainTaskId } = seedTask(database, home);
+    const projectId = (database.prepare("SELECT project_id FROM commissions WHERE id = ?").get(commissionId) as { project_id: string }).project_id;
+    const childTaskId = randomUUID();
+    const childRunId = randomUUID();
+    const coordinateRunId = randomUUID();
+    const grantId = randomUUID();
+    const now = new Date().toISOString();
+    database.prepare("UPDATE commissions SET main_task_id = ?, status = 'active' WHERE id = ?").run(mainTaskId, commissionId);
+    database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(mainTaskId);
+    database.prepare(`INSERT INTO tasks (id, commission_id, parent_id, number_path, position, title, description, status, priority, owner_type, acceptance_json, review_round_limit, review_round_used, created_at, updated_at)
+      VALUES (?, ?, ?, '1.1', 0, 'Interrupted child', '', 'in_progress', 'high', 'ai', '[]', 1, 0, ?, ?)`).run(childTaskId, commissionId, mainTaskId, now, now);
+    database.prepare("INSERT INTO execution_grants (id, commission_id, root_task_id, scope, status, created_at) VALUES (?, ?, ?, 'commission_tree', 'active', ?)").run(grantId, commissionId, mainTaskId, now);
+    database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, execution_grant_id, status, attempt_no, config_snapshot_json, context_snapshot_json) VALUES (?, ?, ?, ?, 'supervisor', 'coordinate', ?, 'running', 1, '{}', ?)")
+      .run(coordinateRunId, projectId, commissionId, mainTaskId, grantId, JSON.stringify({ version: 1, files: { "task-tree.md": "STALE CHILD STATUS: running" } }));
+    database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json) VALUES (?, ?, ?, ?, 'developer', 'scheduler', 'running', 1, '{}', '{}')")
+      .run(childRunId, projectId, commissionId, childTaskId);
+    await registerProductionRunRoutes(server, database, () => ({
+      initialize: async () => undefined,
+      startRun: async () => ({ threadId: "thread-recovered-coordinate", turnId: "turn-recovered-coordinate", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
+      steer: async () => undefined, interrupt: async () => undefined, close: async () => undefined
+    }), join(home, "attachments"));
+
+    const recovered = database.prepare("SELECT id FROM runs WHERE retry_root_run_id = ? AND trigger_type = 'coordinate'").get(coordinateRunId) as { id: string };
+    const taskTree = await readFile(join(home, ".openworkshop", "runs", recovered.id, "task-tree.md"), "utf8");
+    assert.doesNotMatch(taskTree, /STALE CHILD STATUS/);
+    assert.match(taskTree, new RegExp(`Latest Run: ${childRunId} · developer · interrupted`));
+  } finally {
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("main-task mention during acceptance does not queue a coordinator or change task status", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-coordinate-awaiting-acceptance-"));
+  const database = await openWorkshopDatabase(home);
+  const server = Fastify();
+  try {
+    const { commissionId, taskId } = seedTask(database, home);
+    const now = new Date().toISOString();
+    database.prepare("UPDATE commissions SET main_task_id = ?, status = 'awaiting_acceptance' WHERE id = ?").run(taskId, commissionId);
+    database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(taskId);
+    database.prepare("INSERT INTO execution_grants (id, commission_id, root_task_id, scope, status, created_at) VALUES (?, ?, ?, 'commission_tree', 'active', ?)").run(randomUUID(), commissionId, taskId, now);
+    const mentionAgent = await registerProductionRunRoutes(server, database, () => { throw new Error("acceptance coordinator must not launch"); }, join(home, "attachments"));
+    const result = await mentionAgent(taskId, "@Agent 继续");
+    assert.equal(result.action, "unavailable");
+    assert.equal((database.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string }).status, "in_progress");
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM runs WHERE task_id = ? AND trigger_type = 'coordinate'").get(taskId) as { count: number }).count, 0);
+  } finally {
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("associates a queued @Agent image with the reserved Run before its initial input is built", async () => {
   const home = await mkdtemp(join(tmpdir(), "project-workshop-queued-run-image-"));
   const database = await openWorkshopDatabase(home);
@@ -329,7 +432,7 @@ test("serves run details and executes steer, approval, pause, resume, interrupt,
     fixture.database.prepare("UPDATE runs SET status = 'waiting_approval' WHERE id = ?").run(fixture.runId);
 
     const runStatus = (await fixture.server.inject({ method: "GET", url: "/api/runtime/run-status" })).json();
-    assert.deepEqual(runStatus, { queued: 0, active: 0, waiting: 1 });
+    assert.deepEqual(runStatus, { queued: 0, active: 0, waiting: 1, tasks: [{ taskId: fixture.taskId, status: "waiting_approval", numberPath: "1", title: "Task", description: "Task", projectName: "Project" }] });
 
     const details = (await fixture.server.inject({ method: "GET", url: `/api/runs/${fixture.runId}` })).json();
     assert.equal(details.summaryTimeline.length, 2);

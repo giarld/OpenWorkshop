@@ -119,6 +119,9 @@ test("associates and archives a project without deleting its record", async () =
     database.prepare("UPDATE commissions SET main_task_id = ? WHERE id = ?").run(task, commission);
     database.prepare("INSERT INTO execution_grants (id, commission_id, root_task_id, scope, status, created_at) VALUES (?, ?, ?, 'commission_tree', 'active', ?)").run(grant, commission, task, now);
     database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, execution_grant_id, status, attempt_no, config_snapshot_json, context_snapshot_json) VALUES (?, ?, ?, ?, 'developer', 'manual', ?, 'queued', 1, '{}', '{}')").run(run, associated.id, commission, task, grant);
+    const listed = (await server.inject({ method: "GET", url: "/api/projects" })).json() as Array<{ id: string; task_total: number; task_completed: number; run_queued: number; run_active: number; run_waiting: number }>;
+    const summary = listed.find((item) => item.id === associated.id)!;
+    assert.deepEqual({ task_total: summary.task_total, task_completed: summary.task_completed, run_queued: summary.run_queued, run_active: summary.run_active, run_waiting: summary.run_waiting }, { task_total: 1, task_completed: 0, run_queued: 1, run_active: 0, run_waiting: 0 });
     assert.equal((await server.inject({ method: "PUT", url: `/api/roots/${root.id}`, payload: { enabled: false } })).statusCode, 409);
     assert.equal((await server.inject({ method: "POST", url: `/api/projects/${associated.id}/archive` })).statusCode, 409);
     database.prepare("UPDATE runs SET status = 'cancelled' WHERE id = ?").run(run);

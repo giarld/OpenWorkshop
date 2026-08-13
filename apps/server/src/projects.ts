@@ -218,7 +218,7 @@ export function registerProjectRoutes(server: FastifyInstance, database: Databas
     return browseDirectory(root.real_path, request.query.path);
   });
 
-  server.get("/api/projects", async () => database.prepare("SELECT * FROM projects ORDER BY archived_at IS NOT NULL, name").all());
+  server.get("/api/projects", async () => projectList(database));
 
   server.post<{ Body: { name?: unknown; path?: unknown; rootPathId?: unknown } }>("/api/projects", async (request, reply) => {
     const name = limitedString(request.body?.name, "name", PROJECT_NAME_MAX_LENGTH);
@@ -322,9 +322,21 @@ function enabledRootById(database: DatabaseSync, id: string): RootRow {
 }
 
 function projectById(database: DatabaseSync, id: string): ProjectRow {
-  const project = database.prepare("SELECT * FROM projects WHERE id = ?").get(id) as ProjectRow | undefined;
+  const project = database.prepare(`${PROJECT_LIST_SQL} WHERE project.id = ?`).get(id) as ProjectRow | undefined;
   if (!project) throw notFound("Project not found");
   return project;
+}
+
+const PROJECT_LIST_SQL = `SELECT project.*,
+  (SELECT COUNT(*) FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id WHERE commission.project_id = project.id AND task.archived_at IS NULL) AS task_total,
+  (SELECT COUNT(*) FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id WHERE commission.project_id = project.id AND task.archived_at IS NULL AND task.status = 'done') AS task_completed,
+  (SELECT COUNT(*) FROM runs AS run WHERE run.project_id = project.id AND run.status = 'queued') AS run_queued,
+  (SELECT COUNT(*) FROM runs AS run WHERE run.project_id = project.id AND run.status IN ('preparing', 'running')) AS run_active,
+  (SELECT COUNT(*) FROM runs AS run WHERE run.project_id = project.id AND run.status IN ('waiting_approval', 'waiting_input')) AS run_waiting
+  FROM projects AS project`;
+
+function projectList(database: DatabaseSync): ProjectRow[] {
+  return database.prepare(`${PROJECT_LIST_SQL} ORDER BY project.archived_at IS NOT NULL, project.name`).all() as ProjectRow[];
 }
 
 function activeProjectById(database: DatabaseSync, id: string): ProjectRow {
