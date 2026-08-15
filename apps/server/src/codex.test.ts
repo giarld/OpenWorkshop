@@ -248,8 +248,9 @@ test("validates role overrides and cleans current or stale Run context", async (
     assert.throws(() => validateCustomArgs(["-c", "approval_policy=\"never\""]), /conflicts/);
     assert.throws(() => validateCustomArgs(["-c", "sandbox_workspace_write.network_access=true"]), /conflicts/);
 
-    const context = await createRunContext(root, "run-1", { "task.md": "Task", "messages.md": "Message" });
+    const context = await createRunContext(root, "run-1", { "task.md": "Task", "plan-revision.md": "Proposal", "messages.md": "Message" });
     assert.equal(await readFile(join(context.directory, "task.md"), "utf8"), "Task");
+    assert.equal(await readFile(join(context.directory, "plan-revision.md"), "utf8"), "Proposal");
     await context.cleanup();
     await createRunContext(root, "stale-run", { "task.md": "Stale" });
     assert.equal(await recoverRunContexts(root), 1);

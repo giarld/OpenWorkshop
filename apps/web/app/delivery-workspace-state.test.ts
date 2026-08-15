@@ -18,6 +18,9 @@ const task = (overrides: Partial<Task>): Task => ({
   created_at: "2026-08-10T00:00:00.000Z",
   updated_at: "2026-08-10T00:00:00.000Z",
   archived_at: null,
+  read_only: 0,
+  acceptanceCriteria: [],
+  dependencyIds: [],
   auto_approve_permissions: 0,
   labels: [],
   ...overrides

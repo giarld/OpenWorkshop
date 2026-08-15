@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, taskMentionParts, tokenPrice, tokenUsageTotals, upsertComment } from "./task-run.ts";
+import { canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, taskLifecycleAction, taskMentionParts, tokenPrice, tokenUsageTotals, upsertComment } from "./task-run.ts";
 
 test("recognizes supported clipboard images and generates readable screenshot names", () => {
   assert.equal(clipboardImageExtension("image/png"), "png");
@@ -17,6 +17,20 @@ test("recognizes Ctrl or Command plus Enter as the comment submit shortcut", () 
   assert.equal(isCommentSubmitShortcut({ key: "Enter", ctrlKey: false, metaKey: false }), false);
   assert.equal(isCommentSubmitShortcut({ key: "Enter", ctrlKey: true, metaKey: false, isComposing: true }), false);
   assert.equal(isCommentSubmitShortcut({ key: "NumpadEnter", ctrlKey: true, metaKey: false }), false);
+});
+
+test("only offers generic resume for active ordinary interrupted tasks", () => {
+  assert.equal(canResumeTaskRun("in_progress", { status: "interrupted", trigger_type: "manual" }), true);
+  assert.equal(canResumeTaskRun("archived", { status: "interrupted", trigger_type: "manual" }), false);
+  assert.equal(canResumeTaskRun("in_progress", { status: "interrupted", trigger_type: "plan_revision" }), false);
+  assert.equal(canResumeTaskRun("in_progress", { status: "interrupted", trigger_type: "coordinate" }), false);
+});
+
+test("offers task lifecycle actions only for Done and Archived tasks", () => {
+  assert.equal(taskLifecycleAction("done"), "archive");
+  assert.equal(taskLifecycleAction("archived"), "unarchive");
+  assert.equal(taskLifecycleAction("archived", true), null);
+  assert.equal(taskLifecycleAction("in_progress"), null);
 });
 
 test("formats Agent Run elapsed time", () => {

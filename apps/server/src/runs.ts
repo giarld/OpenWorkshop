@@ -71,7 +71,7 @@ type UserInputAnswers = Record<string, { answers: string[] }>;
 
 type TaskContext = {
   title: string; description: string; acceptance_json: string; read_only: number;
-  commission_title: string; requirement: string; requirement_acceptance: string;
+  commission_title: string; main_task_id: string | null; requirement: string; requirement_acceptance: string;
   project_name: string; project_root: string; vcs_type: string; vcs_root: string | null; profile_json: string | null;
 };
 type RunContextFiles = Parameters<typeof createRunContext>[2];
@@ -128,8 +128,10 @@ export class CodexRunController {
   }
 
   async interrupt(runId: string, mode: "pause" | "cancel"): Promise<void> {
-    const run = this.activeRun(runId);
+    const run = this.active.get(runId);
+    if (!run) throw conflict("Run is not active in this server process");
     this.interruptModes.set(runId, mode);
+    if (!run.handle) return;
     try {
       await run.client.interrupt(run.handle!.threadId, run.handle!.turnId);
     } catch (error) {
@@ -142,7 +144,7 @@ export class CodexRunController {
     const run = runById(this.database, runId);
     const task = this.database.prepare(`
       SELECT tasks.title, tasks.description, tasks.acceptance_json, tasks.read_only,
-        commissions.title AS commission_title, requirement.content_markdown AS requirement,
+        commissions.title AS commission_title, commissions.main_task_id, requirement.content_markdown AS requirement,
         requirement.acceptance_json AS requirement_acceptance, projects.name AS project_name,
         projects.real_path AS project_root, projects.vcs_type, projects.vcs_root, projects.profile_json
       FROM tasks
@@ -192,10 +194,15 @@ export class CodexRunController {
     this.active.set(runId, { client, contextDirectory: context.directory, cleanupContext: context.cleanup });
     try {
       await client.initialize();
+      if (this.interruptModes.has(runId)) { await this.release(runId); await this.onTerminal(runId); return; }
       const prompt = run.role === "supervisor"
         ? run.trigger_type === "coordinate"
-          ? `You are the project scheduling Agent. Analyze the approved requirement, the complete task tree, dependencies, statuses, Runs, and main-task comments before any work proceeds. Do not modify project files or perform implementation. Decide exactly which tasks the service should start, retry, or resume now.\n\nCurrent objective: ${task.title}\nExecution boundary: read-only scheduling and coordination.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"action":"proceed|replan|wait_human","summary":"string","tasks":[{"taskId":"uuid","action":"start|retry|resume"}]}. proceed requires at least one immediately executable task: start for a Todo task, retry for a Blocked task, resume for a task whose latest Run is interrupted. Include only task IDs from task-tree.md whose dependencies are already Done. Use replan when the approved work cannot be completed with the current plan. Use wait_human when a concrete human decision or missing answer is required; summary must state the exact question that should be asked in the main-task comments. Omit tasks for replan and wait_human.`
-          : `You are the project supervisor Agent. Reconcile the current task before it is executed again so completed work is not repeated. Read every context file, inspect the current workspace without modifying it, distinguish infrastructure interruption from implementation or review failure, and choose exactly one next action.\n\nCurrent objective: ${task.title}\nExecution boundary: read-only coordination; do not modify project files, run destructive commands, or perform the task itself.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"action":"resume_reviewer|resume_developer|rework_developer|restart_developer|replan|wait_human","summary":"string"}. Use resume_reviewer when review was interrupted or failed for infrastructure reasons; resume_developer when an interrupted developer should continue; rework_developer when review findings require code changes; restart_developer only when prior development cannot be reused; replan when the task definition or dependencies must change; wait_human when a human decision or operation is required.`
+          ? `You are the project scheduling Agent. Analyze the approved requirement, the complete task tree, dependencies, statuses, Runs, review evidence, and main-task comments before any work proceeds. A child task may have just been moved manually to In Progress; verify that state and correct it through an explicit task action when needed. Do not modify project files or perform implementation. Decide exactly which tasks the service should start, retry, or resume now. Before final acceptance, scan every Done child and verify from its Runs and evidence that it is actually complete.\n\nCurrent objective: ${task.title}\nExecution boundary: read-only scheduling and coordination.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"action":"proceed|complete|block|replan|wait_human","summary":"string","tasks":[{"taskId":"uuid","action":"start|retry|resume|block","reason":"required for block"}]}. proceed requires at least one immediately executable task: start for a Todo task or a manually moved In Progress task that needs work, retry for a Blocked task, resume for a task whose latest Run is interrupted. Include only task IDs from task-tree.md whose dependencies are already Done. Use complete only after every Done child has sufficient completion evidence and the commission should enter final human acceptance. If any Done child is not actually complete, use block with one block task action per invalid Done child and explain the evidence gap in reason; the service will notify the human and block those children. Use replan when the approved work cannot be completed with the current plan. Use wait_human when a concrete human decision or missing answer is required; summary must state the exact question that should be asked in the main-task comments. Omit tasks for complete, replan, and wait_human.`
+          : run.trigger_type === "plan_revision"
+            ? `You are the project supervisor Agent collecting enough information to revise the task plan. Read the approved requirement, active task tree, Runs, evidence, and main-task comments. Do not modify files or tasks and do not call task-management CLI commands yet. Either ask exactly one useful question or produce a concrete proposal.\n\nCurrent objective: ${task.title}\nContext files:\n${contextIndex}\n\nReturn JSON only. Ask: {"action":"ask","question":{"type":"boolean|single_choice|multiple_choice|text","prompt":"正文","options":["选项"]}}. Use no options for text, exactly two for boolean, two or more for single_choice, and one or more for multiple_choice. When information is sufficient return {"action":"review","proposal":{"summary":"完整修订摘要","changes":[{"action":"create","clientId":"new-key","title":"title","description":"scope","ownerType":"ai|human","priority":"none|low|medium|high|urgent","dueDate":"YYYY-MM-DD or null","readOnly":false,"acceptanceCriteria":[],"parentTaskId":"uuid","position":0,"dependsOnTaskIds":["uuid or new-key"]},{"action":"update","taskId":"uuid","description":"new direction","dueDate":"YYYY-MM-DD or null","readOnly":false,"position":0,"dependsOnTaskIds":[],"reopen":false},{"action":"delete","taskId":"uuid","reason":"reason"}]}}. Include only required changes; IDs must come from task-tree.md.`
+            : run.trigger_type === "plan_revision_review"
+              ? `You are the independent supervisor reviewing a proposed task-plan revision before human confirmation. Read the approved requirement, active task tree, Runs, evidence, main-task comments, and the proposal in the Run context. Verify scope, task IDs, dependencies, deletion effects, Done-task reopen requirements, and whether the proposal can complete the approved requirement. Do not modify files or tasks and do not call task-management CLI commands.\n\nCurrent objective: ${task.title}\nContext files:\n${contextIndex}\n\nReturn JSON only: {"approved":boolean,"summary":"human-readable complete task diff and review conclusion","question":{"type":"text","prompt":"needed correction","options":[]}}. Omit question when approved; when rejected, include one actionable question if human input is required. A text question has no options; boolean requires exactly two options; single_choice requires at least two options; multiple_choice requires at least one option.`
+          : `You are the project supervisor Agent. Reconcile the current task before it is executed again so completed work is not repeated. Read every context file, inspect the current workspace without modifying it, distinguish Run execution status from the structured review result, and choose exactly one next action.\n\nCurrent objective: ${task.title}\nExecution boundary: read-only coordination; do not modify project files, run destructive commands, or perform the task itself.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"action":"resume_reviewer|resume_developer|rework_developer|restart_developer|replan|wait_human","summary":"string"}. Use resume_reviewer when review was interrupted or failed for infrastructure reasons, or when a human or external process changed or validated the current workspace after the latest review and a fresh independent review is required. A successful build or test does not replace required review. Use resume_developer when an interrupted developer should continue; rework_developer when unresolved review findings require code changes; restart_developer only when prior development cannot be reused; replan when the task definition or dependencies must change; wait_human only when a concrete unanswered human decision or operation is required. Never use wait_human for final acceptance or task closure of a child task; final human acceptance belongs to the main task.`
         : run.role === "reviewer"
           ? `You are the independent test/review Agent. Verify the current task against its acceptance criteria and project instructions. Read every context file before acting.\n\nCurrent objective: ${task.title}\nExecution boundary: inspect the current workspace; do not implement fixes.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"passed":boolean,"summary":"string","checks":[],"findings":[{"severity":"blocking|warning","file":"path","line":null,"message":"string"}]}. Only blocking findings make passed false.`
           : `You are the developer Agent. Read every context file before acting.\n\nCurrent objective: ${task.title}\nExecution boundary: ${task.read_only ? "read-only analysis; do not modify project files" : "work only inside the provided workspace and complete the task acceptance criteria"}.\nContext files:\n${contextIndex}\n\nComplete the task and report the key result, checks, constraints, and remaining risks in the final message. The final message is saved to the task discussion; mention @负责人 when human attention or a decision is required.`;
@@ -213,13 +220,18 @@ export class CodexRunController {
         this.database.prepare("UPDATE runs SET config_snapshot_json = ? WHERE id = ?").run(JSON.stringify(config), runId);
       }
       this.active.set(runId, { client, handle, contextDirectory: context.directory, cleanupContext: context.cleanup });
-      this.database.prepare("UPDATE runs SET status = 'running' WHERE id = ? AND status = 'preparing'").run(runId);
-      appendRunEvent(this.database, this.hub, runId, "run.status", "Run running", { status: "running" });
-      await this.flushPendingSteers(runId, client, handle);
       void handle.completed.then(
         (event) => this.trackCompletion(this.complete(runId, event)),
         (error) => this.trackCompletion(this.fail(runId, error))
       );
+      if (this.interruptModes.has(runId)) {
+        try { await client.interrupt(handle.threadId, handle.turnId); }
+        catch { await this.release(runId); await this.onTerminal(runId); }
+        return;
+      }
+      this.database.prepare("UPDATE runs SET status = 'running' WHERE id = ? AND status = 'preparing'").run(runId);
+      appendRunEvent(this.database, this.hub, runId, "run.status", "Run running", { status: "running" });
+      await this.flushPendingSteers(runId, client, handle);
     } catch (error) {
       this.releasePendingSteers(runId);
       releaseRunAttachments(this.database, runId, initialSourceAttachments);
@@ -352,7 +364,7 @@ export class CodexRunController {
 
   private async complete(runId: string, event: NormalizedCodexEvent): Promise<void> {
     const status = event.type === "turn.interrupted" ? "interrupted" : event.type === "turn.failed" ? "failed" : "succeeded";
-    if (!(event.type === "turn.interrupted" && this.interruptModes.has(runId))) {
+    if (!this.interruptModes.has(runId)) {
       this.database.prepare("UPDATE runs SET status = ?, finished_at = ? WHERE id = ? AND status NOT IN ('cancelled', 'interrupted')").run(status, new Date().toISOString(), runId);
       appendRunEvent(this.database, this.hub, runId, "run.status", `Run ${status}`, { status });
     }
@@ -366,8 +378,9 @@ export class CodexRunController {
       return;
     }
     const summary = error instanceof Error ? error.message : String(error);
-    this.database.prepare("UPDATE runs SET status = 'failed', finished_at = ?, failure_summary = ? WHERE id = ?").run(new Date().toISOString(), summary, runId);
-    appendRunEvent(this.database, this.hub, runId, "run.status", "Run failed", { status: "failed", summary });
+    const failed = this.database.prepare("UPDATE runs SET status = 'failed', finished_at = ?, failure_summary = ? WHERE id = ? AND status IN ('preparing', 'running', 'waiting_approval', 'waiting_input')")
+      .run(new Date().toISOString(), summary, runId);
+    if (failed.changes) appendRunEvent(this.database, this.hub, runId, "run.status", "Run failed", { status: "failed", summary });
     await this.release(runId);
     await this.onTerminal(runId);
   }
@@ -423,29 +436,53 @@ function runContextFiles(database: DatabaseSync, run: RunRow, task: TaskContext,
     WHERE dependency.task_id = ? ORDER BY task.number_path
   `).all(run.task_id) as Array<{ number_path: string; title: string; description: string; status: string; acceptance_json: string }>;
   const previousRuns = database.prepare(`
-    SELECT attempt_no, role, trigger_type, status, started_at, finished_at, failure_summary
-    FROM runs WHERE task_id = ? AND id <> ? ORDER BY rowid DESC LIMIT 20
+    SELECT run.attempt_no, run.role, run.trigger_type, run.status, run.started_at, run.finished_at, run.failure_summary,
+      review.status AS review_status, review.summary AS review_summary
+    FROM runs AS run
+    LEFT JOIN evidence AS review ON review.rowid = (
+      SELECT MAX(candidate.rowid) FROM evidence AS candidate WHERE candidate.run_id = run.id AND candidate.type = 'review'
+    )
+    WHERE run.task_id = ? AND run.id <> ? ORDER BY run.rowid DESC LIMIT 20
   `).all(run.task_id, run.id) as Array<Record<string, unknown>>;
   const evidence = run.trigger_ref_id ? database.prepare(`
     SELECT event_type, summary, payload_json, created_at FROM run_events
-    WHERE run_id = ? AND event_type IN ('agent.message.delta', 'item.completed', 'file.changed', 'command.completed')
+    WHERE run_id = ? AND event_type IN ('agent.message.delta', 'agent_message.completed', 'file.changed', 'command.completed')
     ORDER BY id DESC LIMIT 50
   `).all(run.trigger_ref_id) as Array<Record<string, unknown>> : [];
   const requirementMessages = database.prepare("SELECT role, content, created_at FROM requirement_messages WHERE commission_id = ? ORDER BY created_at, rowid").all(run.commission_id) as Array<{ role: string; content: string; created_at: string }>;
+  const mainTaskInstructions = task.main_task_id && task.main_task_id !== run.task_id
+    ? database.prepare("SELECT content, created_at FROM comments WHERE task_id = ? AND author_type = 'human' AND deleted_at IS NULL ORDER BY created_at, rowid").all(task.main_task_id) as Array<{ content: string; created_at: string }>
+    : [];
   const comments = database.prepare("SELECT id, parent_id, run_id, author_type, agent_role, kind, content, created_at FROM comments WHERE task_id = ? AND deleted_at IS NULL ORDER BY created_at, rowid").all(run.task_id) as Array<{ id: string; parent_id: string | null; run_id: string | null; author_type: string; agent_role: string | null; kind: string; content: string; created_at: string }>;
-  const taskTree = run.trigger_type === "coordinate" ? database.prepare(`SELECT task.id, task.number_path, task.title, task.description, task.status, task.owner_type, task.blocked_reason, task.acceptance_json, latest.id AS latest_run_id, latest.role AS latest_run_role, latest.status AS latest_run_status
+  const treeContext = ["coordinate", "plan_revision", "plan_revision_review"].includes(run.trigger_type);
+  const revisionContext = run.trigger_type.startsWith("plan_revision") && run.trigger_ref_id
+    ? database.prepare("SELECT status, proposal_json FROM plan_revisions WHERE id = ?").get(run.trigger_ref_id) as { status: string; proposal_json: string | null } | undefined
+    : undefined;
+  const taskTree = treeContext ? database.prepare(`SELECT task.id, task.number_path, task.title, task.description, task.status, task.owner_type, task.blocked_reason, task.acceptance_json, latest.id AS latest_run_id, latest.role AS latest_run_role, latest.status AS latest_run_status
     FROM tasks AS task
     LEFT JOIN runs AS latest ON latest.rowid = (SELECT MAX(candidate.rowid) FROM runs AS candidate WHERE candidate.task_id = task.id AND candidate.id <> ?)
     WHERE task.commission_id = ? AND task.archived_at IS NULL ORDER BY task.number_path`).all(run.id, run.commission_id) as Array<{ id: string; number_path: string; title: string; description: string; status: string; owner_type: string; blocked_reason: string | null; acceptance_json: string; latest_run_id: string | null; latest_run_role: string | null; latest_run_status: string | null }> : [];
-  const taskTreeDependencies = run.trigger_type === "coordinate" ? database.prepare("SELECT task.number_path AS task_path, required.number_path AS dependency_path FROM task_dependencies AS dependency JOIN tasks AS task ON task.id = dependency.task_id JOIN tasks AS required ON required.id = dependency.depends_on_task_id WHERE task.commission_id = ? ORDER BY task.number_path, required.number_path").all(run.commission_id) as Array<{ task_path: string; dependency_path: string }> : [];
+  const taskTreeDependencies = treeContext ? database.prepare("SELECT task.number_path AS task_path, required.number_path AS dependency_path FROM task_dependencies AS dependency JOIN tasks AS task ON task.id = dependency.task_id JOIN tasks AS required ON required.id = dependency.depends_on_task_id WHERE task.commission_id = ? AND task.archived_at IS NULL AND required.archived_at IS NULL ORDER BY task.number_path, required.number_path").all(run.commission_id) as Array<{ task_path: string; dependency_path: string }> : [];
+  const taskTreeRuns = treeContext ? database.prepare(`SELECT run.task_id, run.id, run.attempt_no, run.role, run.trigger_type, run.status, run.failure_summary
+    FROM runs AS run JOIN tasks AS task ON task.id = run.task_id
+    WHERE run.commission_id = ? AND run.id <> ? AND task.status = 'done' ORDER BY run.task_id, run.rowid`).all(run.commission_id, run.id) as Array<{ task_id: string; id: string; attempt_no: number; role: string; trigger_type: string; status: string; failure_summary: string | null }> : [];
+  const taskTreeEvidence = treeContext ? database.prepare(`SELECT evidence.task_id, evidence.run_id, evidence.type, evidence.status, evidence.summary, evidence.payload_json
+    FROM evidence JOIN tasks ON tasks.id = evidence.task_id
+    WHERE tasks.commission_id = ? AND tasks.status = 'done' ORDER BY evidence.task_id, evidence.rowid`).all(run.commission_id) as Array<{ task_id: string; run_id: string | null; type: string; status: string; summary: string; payload_json: string }> : [];
   const attachmentsByComment = new Map<string, typeof commentAttachments>();
   for (const attachment of commentAttachments) if (attachment.comment_id) attachmentsByComment.set(attachment.comment_id, [...attachmentsByComment.get(attachment.comment_id) ?? [], attachment]);
   const files: RunContextFiles = {
+    "execution-policy.md": `# Execution and Validation Policy\n\n- When the current Run sandbox and approval policy permit, execute relevant build, test, and validation commands autonomously. Do not invent a human confirmation gate.\n- Explicit project instructions, the approved requirement, and human instructions on the main task apply to the whole commission and override the default.\n- Human instructions on the current child task apply only to that task. Never carry them to sibling tasks.\n- Real approval requests emitted by the sandbox or tools still follow the configured approval workflow.\n\n## Main Task Human Instructions\n\n${mainTaskInstructions.length ? mainTaskInstructions.map((item) => `- ${item.created_at}: ${item.content}`).join("\n") : "No additional main-task human instructions."}\n`,
     "requirement.md": `# Requirement: ${task.commission_title}\n\n${task.requirement}\n\n## Acceptance\n\n\`\`\`json\n${prettyJson(task.requirement_acceptance)}\n\`\`\`\n`,
     "task.md": `# Task: ${task.title}\n\n${task.description || "No description."}\n\n- Run role: ${run.role}\n- Trigger: ${run.trigger_type}\n- Read only: ${Boolean(task.read_only)}\n\n## Acceptance\n\n\`\`\`json\n${prettyJson(task.acceptance_json)}\n\`\`\`\n`,
     "dependencies.md": `# Dependencies\n\n${dependencies.length ? dependencies.map((item) => `## ${item.number_path} ${item.title}\n\n- Status: ${item.status}\n- Description: ${item.description || "No description."}\n- Acceptance: ${prettyJson(item.acceptance_json)}`).join("\n\n") : "No task dependencies."}\n`,
-    ...(taskTree.length ? { "task-tree.md": `# Task Tree\n\n${taskTree.map((item) => `## ${item.number_path} ${item.title}\n\n- ID: ${item.id}\n- Status: ${item.status}\n- Owner: ${item.owner_type}\n- Latest Run: ${item.latest_run_id ? `${item.latest_run_id} · ${item.latest_run_role} · ${item.latest_run_status}` : "none"}\n- Depends on: ${taskTreeDependencies.filter((dependency) => dependency.task_path === item.number_path).map((dependency) => dependency.dependency_path).join(", ") || "none"}\n- Blocked: ${item.blocked_reason ?? "no"}\n- Description: ${item.description || "No description."}\n- Acceptance: ${prettyJson(item.acceptance_json)}`).join("\n\n")}\n` } : {}),
-    "previous-runs.md": `# Previous Runs\n\n${previousRuns.length ? previousRuns.map((item) => `- Attempt ${item.attempt_no} · ${item.role} · ${item.status} · ${item.trigger_type}${item.failure_summary ? ` · ${item.failure_summary}` : ""}`).join("\n") : "No previous Runs."}${evidence.length ? `\n\n## Trigger Run Evidence\n\n${evidence.map((item) => `- ${item.created_at} · ${item.event_type} · ${item.summary}\n  ${item.payload_json}`).join("\n")}` : ""}\n`,
+    ...(taskTree.length ? { "task-tree.md": `# Task Tree\n\nRecorded human_waiver/waived evidence is authorized completion.\n\n${taskTree.map((item) => {
+      const runs = taskTreeRuns.filter((taskRun) => taskRun.task_id === item.id);
+      const taskEvidence = taskTreeEvidence.filter((entry) => entry.task_id === item.id);
+      return `## ${item.number_path} ${item.title}\n\n- ID: ${item.id}\n- Status: ${item.status}\n- Owner: ${item.owner_type}\n- Latest Run: ${item.latest_run_id ? `${item.latest_run_id} · ${item.latest_run_role} · ${item.latest_run_status}` : "none"}\n- Depends on: ${taskTreeDependencies.filter((dependency) => dependency.task_path === item.number_path).map((dependency) => dependency.dependency_path).join(", ") || "none"}\n- Blocked: ${item.blocked_reason ?? "no"}\n- Description: ${item.description || "No description."}\n- Acceptance: ${prettyJson(item.acceptance_json)}\n- Run history: ${runs.length ? runs.map((taskRun) => `Attempt ${taskRun.attempt_no} · ${taskRun.id} · ${taskRun.role} · ${taskRun.trigger_type} · ${taskRun.status}${taskRun.failure_summary ? ` · ${taskRun.failure_summary}` : ""}`).join("; ") : "none"}\n- Evidence: ${taskEvidence.length ? taskEvidence.map((entry) => `${entry.type}/${entry.status} · run:${entry.run_id ?? "none"} · ${entry.summary} · ${entry.payload_json}`).join("; ") : "none"}`;
+    }).join("\n\n")}\n` } : {}),
+    ...(revisionContext ? { "plan-revision.md": `# Plan Revision\n\n- Status: ${revisionContext.status}\n\n## Proposed Changes\n\n\`\`\`json\n${revisionContext.proposal_json ? prettyJson(revisionContext.proposal_json) : "null"}\n\`\`\`\n` } : {}),
+    "previous-runs.md": `# Previous Runs\n\n${previousRuns.length ? previousRuns.map((item) => `- Attempt ${item.attempt_no} · ${item.role} · Run ${item.status} · ${item.trigger_type}${item.review_status ? ` · Review ${item.review_status}${item.review_summary ? ` · ${item.review_summary}` : ""}` : ""}${item.failure_summary ? ` · ${item.failure_summary}` : ""}`).join("\n") : "No previous Runs."}${evidence.length ? `\n\n## Trigger Run Evidence\n\n${evidence.toReversed().map((item) => `- ${item.created_at} · ${item.event_type} · ${item.summary}\n  ${item.payload_json}`).join("\n")}` : ""}\n`,
     "project-profile.md": `# Project: ${task.project_name}\n\n- Root: ${task.project_root}\n- VCS: ${task.vcs_type}\n- VCS root: ${task.vcs_root ?? "none"}\n\n## Profile\n\n\`\`\`json\n${prettyJson(task.profile_json ?? "{}")}\n\`\`\`\n`,
     "messages.md": `# Messages\n\n${requirementMessages.length ? requirementMessages.map((item) => `## ${item.role} · ${item.created_at}\n\n${item.content}`).join("\n\n") : "No requirement messages."}${comments.length ? `\n\n# Task Comments\n\n${comments.map((item) => `## ${item.id} · ${item.author_type}${item.agent_role ? `/${item.agent_role}` : ""} · ${item.kind} · ${item.created_at}${item.parent_id ? ` · reply-to:${item.parent_id}` : ""}${item.run_id ? ` · run:${item.run_id}` : ""}\n\n${attachmentMessage(item.content, attachmentsByComment.get(item.id) ?? [])}`).join("\n\n")}` : ""}\n`
   };
@@ -490,7 +527,7 @@ export async function registerProductionRunRoutes(server: FastifyInstance, datab
   registerSchedulerRoutes(server, scheduler);
   await scheduler.recover();
   server.addHook("onClose", () => controller.close());
-  return async (taskId, message, attachmentIds = []) => {
+  const mentionAgent: AgentMentionHandler = async (taskId, message, attachmentIds = []) => {
     const reserved = database.prepare("SELECT id, status FROM runs WHERE task_id = ? AND status IN ('queued', 'preparing', 'running', 'waiting_approval', 'waiting_input') ORDER BY rowid DESC LIMIT 1").get(taskId) as { id: string; status: RunStatus } | undefined;
     if (reserved && ["running", "waiting_approval", "waiting_input"].includes(reserved.status)) {
       try {
@@ -527,8 +564,15 @@ export async function registerProductionRunRoutes(server: FastifyInstance, datab
     if (task.owner_type !== "ai") return { action: "unavailable", message: "人工任务没有可唤起的执行 Agent" };
     if (["done", "archived"].includes(task.status)) return { action: "unavailable", message: "已完成或归档任务不能启动 Agent" };
     try {
+      const mainTask = database.prepare("SELECT id FROM commissions WHERE main_task_id = ?").get(taskId) as { id: string } | undefined;
+      const revision = mainTask ? database.prepare(`SELECT revision.id, revision.status,
+        EXISTS (SELECT 1 FROM plan_revision_cards AS card WHERE card.plan_revision_id = revision.id AND card.status = 'pending') AS pending_card
+        FROM plan_revisions AS revision WHERE revision.commission_id = ? AND revision.status IN ('collecting', 'reviewing', 'awaiting_confirmation')`).get(mainTask.id) as { id: string; status: string; pending_card: number } | undefined : undefined;
+      if (revision) {
+        if (!revision.pending_card && ["collecting", "reviewing"].includes(revision.status)) return { action: "triggered", runId: await scheduler.revise(revision.id) };
+        return { action: "unavailable", message: "请先回答待确认的计划修订卡" };
+      }
       const attachments = selectedTaskAttachments(database, taskId, attachmentIds, "not-run");
-      const mainTask = database.prepare("SELECT 1 FROM commissions WHERE main_task_id = ?").get(taskId);
       if (!mainTask && ["in_progress", "blocked"].includes(task.status)) database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(new Date().toISOString(), taskId);
       const result = await (mainTask ? scheduler.coordinate(taskId, (runIds) => {
         const runId = runIds[0];
@@ -542,6 +586,11 @@ export async function registerProductionRunRoutes(server: FastifyInstance, datab
       return { action: "triggered", ...(result.runIds[0] ? { runId: result.runIds[0] } : {}) };
     } catch (error) { return { action: "unavailable", message: error instanceof Error ? error.message : String(error) }; }
   };
+  mentionAgent.cancelTaskRun = (taskId) => cancelActiveRunForTask(database, hub, controls, taskId);
+  mentionAgent.coordinateTask = (taskId) => scheduler.coordinate(taskId);
+  mentionAgent.coordinateFinal = (commissionId) => scheduler.coordinateFinal(commissionId);
+  mentionAgent.reviseTaskPlan = (revisionId) => scheduler.revise(revisionId);
+  return mentionAgent;
 }
 
 function databaseRunAttachments(database: DatabaseSync, runId: string): AttachmentRow[] {
@@ -605,8 +654,9 @@ export function registerRunRoutes(server: FastifyInstance, database: DatabaseSyn
   });
 
   server.post<{ Params: { id: string } }>("/api/runs/:id/interrupt", async (request) => {
-    const run = activeRun(database, request.params.id);
-    await interruptRun(database, hub, controller, run, "cancel");
+    const run = runById(database, request.params.id);
+    if (!["queued", "preparing", "running", "waiting_approval", "waiting_input"].includes(run.status)) throw conflict("Run is not active");
+    await cancelRun(database, hub, controller, run);
     return runDetails(database, run.id);
   });
 
@@ -617,8 +667,8 @@ export function registerRunRoutes(server: FastifyInstance, database: DatabaseSyn
   });
 
   server.post<{ Params: { id: string } }>("/api/tasks/:id/cancel", async (request) => {
-    const run = activeRunForTask(database, request.params.id);
-    await interruptRun(database, hub, controller, run, "cancel");
+    if (!await cancelActiveRunForTask(database, hub, controller, request.params.id)) throw conflict("Task has no active run");
+    const run = latestRunForTask(database, request.params.id);
     return runDetails(database, run.id);
   });
 
@@ -690,9 +740,27 @@ function encodeSse(event: RunEvent): string {
 }
 
 async function interruptRun(database: DatabaseSync, hub: EventHub, controller: RunController, run: RunRow, mode: "pause" | "cancel"): Promise<void> {
-  await controller.interrupt(run.id, mode);
   const status = mode === "pause" ? "interrupted" : "cancelled";
+  const pendingApprovals = database.prepare("SELECT id FROM approvals WHERE run_id = ? AND status = 'pending'").all(run.id) as Array<{ id: string }>;
+  const unreadNotifications = pendingApprovals.length ? database.prepare(`SELECT id FROM notifications WHERE entity_type = 'approval' AND entity_id IN (${pendingApprovals.map(() => "?").join(", ")}) AND read_at IS NULL`)
+    .all(...pendingApprovals.map(({ id }) => id)) as Array<{ id: string }> : [];
   database.prepare("UPDATE runs SET status = ?, finished_at = ? WHERE id = ?").run(status, new Date().toISOString(), run.id);
+  try { await controller.interrupt(run.id, mode); }
+  catch (error) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.prepare("UPDATE runs SET status = ?, finished_at = ? WHERE id = ? AND status = ?").run(run.status, run.finished_at, run.id, status);
+      if (pendingApprovals.length) database.prepare(`UPDATE approvals SET status = 'pending', decided_at = NULL WHERE id IN (${pendingApprovals.map(() => "?").join(", ")}) AND status = 'expired'`)
+        .run(...pendingApprovals.map(({ id }) => id));
+      if (unreadNotifications.length) database.prepare(`UPDATE notifications SET read_at = NULL WHERE id IN (${unreadNotifications.map(() => "?").join(", ")})`)
+        .run(...unreadNotifications.map(({ id }) => id));
+      database.exec("COMMIT");
+    } catch (rollbackError) {
+      database.exec("ROLLBACK");
+      throw rollbackError;
+    }
+    throw error;
+  }
   appendRunEvent(database, hub, run.id, "run.status", `Run ${status}`, { status, reason: mode });
 }
 
@@ -759,9 +827,33 @@ function activeRun(database: DatabaseSync, id: string): RunRow {
 }
 
 function activeRunForTask(database: DatabaseSync, taskId: string): RunRow {
-  const run = database.prepare("SELECT * FROM runs WHERE task_id = ? AND status IN ('preparing', 'running', 'waiting_approval', 'waiting_input') ORDER BY attempt_no DESC, rowid DESC LIMIT 1").get(taskId) as RunRow | undefined;
+  const run = database.prepare("SELECT * FROM runs WHERE task_id = ? AND status IN ('queued', 'preparing', 'running', 'waiting_approval', 'waiting_input') ORDER BY attempt_no DESC, rowid DESC LIMIT 1").get(taskId) as RunRow | undefined;
   if (!run) throw conflict("Task has no active run");
   return run;
+}
+
+async function cancelActiveRunForTask(database: DatabaseSync, hub: EventHub, controller: RunController, taskId: string): Promise<boolean> {
+  const run = database.prepare("SELECT * FROM runs WHERE task_id = ? AND status IN ('queued', 'preparing', 'running', 'waiting_approval', 'waiting_input') ORDER BY attempt_no DESC, rowid DESC LIMIT 1").get(taskId) as RunRow | undefined;
+  if (!run) return false;
+  await cancelRun(database, hub, controller, run);
+  return true;
+}
+
+async function cancelRun(database: DatabaseSync, hub: EventHub, controller: RunController, run: RunRow): Promise<void> {
+  const coordinationPending = run.trigger_type === "coordinate"
+    ? (database.prepare("SELECT coordination_pending FROM commissions WHERE id = ?").get(run.commission_id) as { coordination_pending: number }).coordination_pending
+    : undefined;
+  if (coordinationPending !== undefined) database.prepare("UPDATE commissions SET coordination_pending = 0 WHERE id = ?").run(run.commission_id);
+  try {
+    if (run.status === "queued") {
+      releaseRunAttachments(database, run.id, databaseRunAttachments(database, run.id));
+      database.prepare("UPDATE runs SET status = 'cancelled', finished_at = ? WHERE id = ?").run(new Date().toISOString(), run.id);
+      appendRunEvent(database, hub, run.id, "run.status", "Run cancelled", { status: "cancelled", reason: "cancel" });
+    } else await interruptRun(database, hub, controller, run, "cancel");
+  } catch (error) {
+    if (coordinationPending !== undefined) database.prepare("UPDATE commissions SET coordination_pending = ? WHERE id = ?").run(coordinationPending, run.commission_id);
+    throw error;
+  }
 }
 
 function latestRunForTask(database: DatabaseSync, taskId: string): RunRow {

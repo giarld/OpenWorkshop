@@ -22,10 +22,12 @@ export const WORKSPACE_VIEW_IDS = ["projects", "commissions", "requirements", "b
 export type WorkspaceView = typeof WORKSPACE_VIEW_IDS[number];
 
 export function storedWorkspaceView(value: string | null): WorkspaceView {
+  if (value === "history") return "board";
   return WORKSPACE_VIEW_IDS.includes(value as WorkspaceView) ? value as WorkspaceView : "commissions";
 }
 
 export function initialWorkspaceView(storedValue: string | null, hash: string): WorkspaceView {
+  if (storedValue === "history") return "board";
   if (WORKSPACE_VIEW_IDS.includes(storedValue as WorkspaceView)) return storedValue as WorkspaceView;
   if (hash.startsWith("#task-")) return "board";
   if (hash.startsWith("#approval-")) return "notifications";

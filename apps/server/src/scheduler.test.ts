@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 import Fastify from "fastify";
 import { openWorkshopDatabase } from "./database.ts";
+import { answerRevisionCard, beginPlanRevision, saveRevisionProposal } from "./plan-revisions.ts";
 import { coveredTaskIds, createExecutionGrant, parseReviewResult, parseSupervisorDecision, ProjectLockManager, registerSchedulerRoutes, runnableTasks, Scheduler, workspacePlan } from "./scheduler.ts";
 import { registerTaskRoutes } from "./tasks.ts";
 
@@ -69,6 +70,78 @@ test("main task trigger schedules runnable children and marks the main task in p
     assert.equal(starts.length, 1);
     assert.equal((fixture.database.prepare("SELECT status FROM tasks WHERE id = ?").get(fixture.main) as { status: string }).status, "in_progress");
     assert.deepEqual(statuses(fixture.database, [first, second]), ["in_progress", "todo"]);
+  } finally { await fixture.close(); }
+});
+
+test("main-task coordination promotes an active child grant instead of rejecting its Run", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    const child = fixture.task("active-child", fixture.main, "todo");
+    const scheduler = new Scheduler(fixture.database, { start: async (runId) => {
+      fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId);
+    } }, async () => "dirty");
+    const childExecution = await scheduler.trigger(child);
+
+    const coordination = await scheduler.coordinate(fixture.main);
+
+    assert.equal(coordination.grant.id, childExecution.grant.id);
+    assert.deepEqual({ ...fixture.database.prepare("SELECT root_task_id, scope, status FROM execution_grants WHERE id = ?").get(coordination.grant.id) as Record<string, unknown> }, {
+      root_task_id: fixture.main,
+      scope: "commission_tree",
+      status: "active"
+    });
+    assert.equal((fixture.database.prepare("SELECT status FROM runs WHERE id = ?").get(coordination.runIds[0]!) as { status: string }).status, "queued");
+  } finally { await fixture.close(); }
+});
+
+test("task status revisions discard a stale Coordinator and run a fresh snapshot when requested", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    const child = fixture.task("revised-child", fixture.main, "todo");
+    const starts: string[] = [];
+    const scheduler = new Scheduler(fixture.database, { start: async (runId) => {
+      starts.push(runId);
+      fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId);
+    } }, async () => "dirty");
+    const first = (await scheduler.coordinate(fixture.main)).runIds[0]!;
+    fixture.database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(child);
+
+    assert.equal((await scheduler.coordinate(fixture.main)).runIds[0], first);
+    fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'stale decision', ?, 0, ?)")
+      .run(first, JSON.stringify({ delta: '{"action":"wait_human","summary":"stale"}' }), new Date().toISOString());
+    fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(first);
+    await scheduler.terminal(first);
+
+    assert.equal(starts.length, 2);
+    const latest = fixture.database.prepare("SELECT id, status, coordination_revision FROM runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1").get(fixture.main) as { id: string; status: string; coordination_revision: number };
+    const commission = fixture.database.prepare("SELECT status, coordination_revision, coordination_pending FROM commissions WHERE main_task_id = ?").get(fixture.main) as { status: string; coordination_revision: number; coordination_pending: number };
+    assert.notEqual(latest.id, first);
+    assert.equal(latest.status, "running");
+    assert.equal(latest.coordination_revision, commission.coordination_revision);
+    assert.equal(commission.status, "active");
+    assert.equal(commission.coordination_pending, 1);
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM comments WHERE run_id = ?").get(first) as { count: number }).count, 0);
+  } finally { await fixture.close(); }
+});
+
+test("task status revisions restart a stale Coordinator with the latest state", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    const child = fixture.task("invalidated-child", fixture.main, "todo");
+    const starts: string[] = [];
+    const scheduler = new Scheduler(fixture.database, { start: async (runId) => {
+      starts.push(runId);
+      fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId);
+    } }, async () => "dirty");
+    const coordinator = (await scheduler.coordinate(fixture.main)).runIds[0]!;
+    fixture.database.prepare("UPDATE tasks SET status = 'blocked' WHERE id = ?").run(child);
+    fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(coordinator);
+
+    await scheduler.terminal(coordinator);
+
+    assert.equal(starts.length, 2);
+    assert.notEqual(starts[1], coordinator);
+    assert.equal((fixture.database.prepare("SELECT coordination_pending FROM commissions WHERE main_task_id = ?").get(fixture.main) as { coordination_pending: number }).coordination_pending, 1);
   } finally { await fixture.close(); }
 });
 
@@ -156,15 +229,16 @@ test("authorization stays inside its commission and target closure", async () =>
   } finally { await fixture.close(); }
 });
 
-test("startup restores acceptance when every child task is done", async () => {
+test("startup schedules final coordination when every child task is done", async () => {
   const fixture = await schedulerFixture();
   try {
     const child = fixture.task("completed", fixture.main, "done");
     fixture.database.prepare("UPDATE commissions SET status = 'active' WHERE main_task_id = ?").run(fixture.main);
-    await new Scheduler(fixture.database, { start: async () => undefined }).recover();
-    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE main_task_id = ?").get(fixture.main) as { status: string }).status, "awaiting_acceptance");
+    await new Scheduler(fixture.database, { start: async (runId) => { fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } }).recover();
+    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE main_task_id = ?").get(fixture.main) as { status: string }).status, "active");
     assert.equal((fixture.database.prepare("SELECT status FROM tasks WHERE id = ?").get(fixture.main) as { status: string }).status, "in_progress");
     assert.equal((fixture.database.prepare("SELECT status FROM tasks WHERE id = ?").get(child) as { status: string }).status, "done");
+    assert.deepEqual({ ...fixture.database.prepare("SELECT role, trigger_type, status FROM runs WHERE task_id = ?").get(fixture.main) as Record<string, unknown> }, { role: "supervisor", trigger_type: "coordinate", status: "running" });
   } finally { await fixture.close(); }
 });
 
@@ -256,25 +330,28 @@ test("exclusive workspaces serialize queued Runs and expire obsolete approvals",
   } finally { await fixture.close(); }
 });
 
-test("interrupted exclusive Run releases its lock for the next scheduler wake", async () => {
+test("cancelled exclusive Run releases its lock and starts queued final coordination", async () => {
   const fixture = await schedulerFixture();
   try {
     fixture.database.prepare("UPDATE projects SET vcs_type = 'none' WHERE id = ?").run(fixture.project);
-    fixture.done(fixture.main);
-    fixture.task("first-write", fixture.main, "backlog");
-    fixture.task("second-write", fixture.main, "backlog");
+    const child = fixture.task("active-write", fixture.main, "backlog");
     const starts: string[] = [];
     const scheduler = new Scheduler(fixture.database, { start: async (runId) => {
       starts.push(runId);
       fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId);
     } });
-    await scheduler.trigger(fixture.main);
+    await scheduler.trigger(child);
     assert.equal(starts.length, 1);
-    fixture.database.prepare("UPDATE runs SET status = 'interrupted' WHERE id = ?").run(starts[0]!);
+    fixture.database.prepare("UPDATE runs SET status = 'cancelled' WHERE id = ?").run(starts[0]!);
+    fixture.done(child);
+    const commissionId = (fixture.database.prepare("SELECT commission_id FROM tasks WHERE id = ?").get(fixture.main) as { commission_id: string }).commission_id;
+    assert.equal(await scheduler.coordinateFinal(commissionId), true);
+    const coordinator = fixture.database.prepare("SELECT id, status FROM runs WHERE role = 'supervisor' AND trigger_type = 'coordinate'").get() as { id: string; status: string };
+    assert.equal(coordinator.status, "queued");
     await scheduler.terminal(starts[0]!);
-    assert.equal(starts.length, 1);
-    await scheduler.wake();
     assert.equal(starts.length, 2);
+    assert.equal(starts[1], coordinator.id);
+    assert.equal((fixture.database.prepare("SELECT status FROM runs WHERE id = ?").get(coordinator.id) as { status: string }).status, "running");
   } finally { await fixture.close(); }
 });
 
@@ -328,7 +405,7 @@ test("restart preserves an interrupted coordination Run", async () => {
     const run = result.runIds[0]!;
     const [recovered] = await new Scheduler(fixture.database, starter, async () => "dirty").recover();
     const retry = fixture.database.prepare("SELECT role, trigger_type, trigger_ref_id, status FROM runs WHERE id = ?").get(recovered) as { role: string; trigger_type: string; trigger_ref_id: string; status: string };
-    assert.deepEqual([retry.role, retry.trigger_type, retry.trigger_ref_id, retry.status], ["supervisor", "coordinate", run, "queued"]);
+    assert.deepEqual([retry.role, retry.trigger_type, retry.trigger_ref_id, retry.status], ["supervisor", "coordinate", run, "running"]);
     assert.equal((fixture.database.prepare("SELECT status FROM tasks WHERE id = ?").get(fixture.main) as { status: string }).status, "in_progress");
     assert.deepEqual(await new Scheduler(fixture.database, { start: async () => undefined }, async () => "dirty").recover(), []);
   } finally { await fixture.close(); }
@@ -435,6 +512,76 @@ test("main-task coordination proceeds through the task tree or asks the human in
   } finally { await waiting.close(); }
 });
 
+test("replan coordination opens a main-task card and continues with a dedicated supervisor Run", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    fixture.task("blocked-child", fixture.main, "blocked");
+    const starts: string[] = [];
+    const scheduler = new Scheduler(fixture.database, { start: async (runId) => { starts.push(runId); fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } }, async () => "dirty");
+    const coordinator = (await scheduler.coordinate(fixture.main)).runIds[0]!;
+    fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'decision', ?, 0, ?)")
+      .run(coordinator, JSON.stringify({ delta: '{"action":"replan","summary":"当前任务方向无法继续。"}' }), new Date().toISOString());
+    fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(coordinator);
+    await scheduler.terminal(coordinator);
+
+    const card = fixture.database.prepare(`SELECT card.comment_id, card.plan_revision_id FROM plan_revision_cards AS card
+      JOIN comments AS comment ON comment.id = card.comment_id WHERE comment.task_id = ? AND card.status = 'pending'`).get(fixture.main) as { comment_id: string; plan_revision_id: string };
+    answerRevisionCard(fixture.database, fixture.main, card.comment_id, "改为新的实现路径");
+    const revisionRun = await scheduler.revise(card.plan_revision_id);
+    const row = fixture.database.prepare("SELECT role, trigger_type FROM runs WHERE id = ?").get(revisionRun) as { role: string; trigger_type: string };
+    assert.equal(row.role, "supervisor");
+    assert.equal(row.trigger_type, "plan_revision");
+    assert.deepEqual(starts, [coordinator, revisionRun]);
+  } finally { await fixture.close(); }
+});
+
+test("plan revision promotes a child execution grant before running on the main task", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    const child = fixture.task("child", fixture.main, "todo");
+    const grant = createExecutionGrant(fixture.database, child);
+    const commissionId = (fixture.database.prepare("SELECT commission_id FROM tasks WHERE id = ?").get(fixture.main) as { commission_id: string }).commission_id;
+    const revisionId = beginPlanRevision(fixture.database, commissionId, "调整方向");
+    const card = fixture.database.prepare("SELECT comment_id FROM plan_revision_cards WHERE plan_revision_id = ? AND status = 'pending'").get(revisionId) as { comment_id: string };
+    answerRevisionCard(fixture.database, fixture.main, card.comment_id, "更换实现路径");
+    const scheduler = new Scheduler(fixture.database, { start: async (runId) => { fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } }, async () => "dirty");
+
+    const runId = await scheduler.revise(revisionId);
+
+    assert.deepEqual({ ...fixture.database.prepare("SELECT root_task_id, scope FROM execution_grants WHERE id = ?").get(grant.id) }, { root_task_id: fixture.main, scope: "commission_tree" });
+    assert.equal((fixture.database.prepare("SELECT execution_grant_id FROM runs WHERE id = ?").get(runId) as { execution_grant_id: string }).execution_grant_id, grant.id);
+  } finally { await fixture.close(); }
+});
+
+test("rejected plan revision with invalid choices posts the review reason as a text card", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    const starts: string[] = [];
+    const scheduler = new Scheduler(fixture.database, { start: async (runId) => {
+      starts.push(runId);
+      fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId);
+    } }, async () => "dirty");
+    const commissionId = (fixture.database.prepare("SELECT commission_id FROM tasks WHERE id = ?").get(fixture.main) as { commission_id: string }).commission_id;
+    const revisionId = beginPlanRevision(fixture.database, commissionId, "调整方向");
+    saveRevisionProposal(fixture.database, revisionId, { summary: "修订", changes: [] });
+    const reviewRun = await scheduler.revise(revisionId);
+    fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'decision', ?, 0, ?)")
+      .run(reviewRun, JSON.stringify({ delta: '{"approved":false,"summary":"缺少精确任务差异，不能批准。","question":{"type":"boolean","prompt":"是否重新提交？","options":[]}}' }), new Date().toISOString());
+    fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(reviewRun);
+
+    await scheduler.terminal(reviewRun);
+
+    const revision = fixture.database.prepare("SELECT status FROM plan_revisions WHERE id = ?").get(revisionId) as { status: string };
+    const card = fixture.database.prepare(`SELECT card.interaction_type, comment.content FROM plan_revision_cards AS card
+      JOIN comments AS comment ON comment.id = card.comment_id
+      WHERE card.plan_revision_id = ? AND card.status = 'pending' ORDER BY comment.rowid DESC LIMIT 1`).get(revisionId) as { interaction_type: string; content: string };
+    assert.equal(revision.status, "collecting");
+    assert.equal(card.interaction_type, "text");
+    assert.match(card.content, /缺少精确任务差异，不能批准/);
+    assert.deepEqual(starts, [reviewRun]);
+  } finally { await fixture.close(); }
+});
+
 test("failed main-task coordination exhausts its grant without starting children", async () => {
   const fixture = await schedulerFixture();
   try {
@@ -475,6 +622,42 @@ test("main-task coordination executes explicit retry and resume actions", async 
     assert.equal((fixture.database.prepare("SELECT blocked_reason FROM tasks WHERE id = ?").get(retryTask) as { blocked_reason: string | null }).blocked_reason, null);
     assert.equal(starts.length, 2);
     assert.deepEqual((fixture.database.prepare("SELECT status FROM runs WHERE task_id IN (?, ?) ORDER BY rowid").all(retryTask, resumeTask) as Array<{ status: string }>).map(({ status }) => status), ["succeeded", "interrupted", "running", "queued"]);
+  } finally { await fixture.close(); }
+});
+
+test("main-task coordination starts manually active work and blocks false Done tasks before completion", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    const child = fixture.task("manually-moved", fixture.main, "in_progress");
+    const starts: string[] = [];
+    const scheduler = new Scheduler(fixture.database, { start: async (runId) => { starts.push(runId); fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } }, async () => "dirty");
+    const first = (await scheduler.coordinate(fixture.main)).runIds[0]!;
+    fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'decision', ?, 0, ?)")
+      .run(first, JSON.stringify({ delta: JSON.stringify({ action: "proceed", summary: "The manually activated task needs execution.", tasks: [{ taskId: child, action: "start" }] }) }), new Date().toISOString());
+    fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(first);
+    await scheduler.terminal(first);
+    assert.equal((fixture.database.prepare("SELECT status FROM tasks WHERE id = ?").get(child) as { status: string }).status, "in_progress");
+    assert.equal((fixture.database.prepare("SELECT role FROM runs WHERE id = ?").get(starts.at(-1)!) as { role: string }).role, "developer");
+
+    fixture.database.prepare("UPDATE runs SET status = 'cancelled' WHERE id = ?").run(starts.at(-1)!);
+    fixture.database.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(child);
+    const blocked = (await scheduler.coordinate(fixture.main)).runIds[0]!;
+    fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'decision', ?, 0, ?)")
+      .run(blocked, JSON.stringify({ delta: JSON.stringify({ action: "block", summary: "A Done task lacks completion evidence.", tasks: [{ taskId: child, action: "block", reason: "No successful execution or review evidence exists." }] }) }), new Date().toISOString());
+    fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(blocked);
+    await scheduler.terminal(blocked);
+    const blockedState = fixture.database.prepare("SELECT status, blocked_reason FROM tasks WHERE id = ?").get(child) as { status: string; blocked_reason: string };
+    assert.equal(blockedState.status, "blocked");
+    assert.match(blockedState.blocked_reason, /No successful execution/);
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE entity_type = 'task' AND entity_id = ? AND kind = 'blocked'").get(child) as { count: number }).count, 1);
+
+    fixture.database.prepare("UPDATE tasks SET status = 'done', blocked_reason = NULL WHERE id = ?").run(child);
+    const complete = (await scheduler.coordinate(fixture.main)).runIds[0]!;
+    fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'decision', ?, 0, ?)")
+      .run(complete, JSON.stringify({ delta: '{"action":"complete","summary":"All child work is genuinely complete."}' }), new Date().toISOString());
+    fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(complete);
+    await scheduler.terminal(complete);
+    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE main_task_id = ?").get(fixture.main) as { status: string }).status, "awaiting_acceptance");
   } finally { await fixture.close(); }
 });
 
@@ -603,13 +786,14 @@ test("Git development changes reach reviewer and project root before worktree cl
     await git(fixture.projectPath, "config", "user.name", "Test");
     await git(fixture.projectPath, "add", ".");
     await git(fixture.projectPath, "commit", "-m", "base");
-    fixture.done(fixture.main);
+    fixture.database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(fixture.main);
     const task = fixture.task("git-chain", fixture.main, "backlog");
-    const starts: Array<{ id: string; role: string; cwd: string }> = [];
+    const starts: Array<{ id: string; role: string; trigger: string; cwd: string }> = [];
     let reviewerSawChange = false;
     const scheduler = new Scheduler(fixture.database, { start: async (runId, cwd) => {
-      const role = (fixture.database.prepare("SELECT role FROM runs WHERE id = ?").get(runId) as { role: string }).role;
-      starts.push({ id: runId, role, cwd });
+      const run = fixture.database.prepare("SELECT role, trigger_type FROM runs WHERE id = ?").get(runId) as { role: string; trigger_type: string };
+      const role = run.role;
+      starts.push({ id: runId, role, trigger: run.trigger_type, cwd });
       if (role === "developer") await writeFile(join(cwd, "feature.txt"), "reviewed change\n");
       else {
         reviewerSawChange = await readFile(join(cwd, "feature.txt"), "utf8").then((text) => text === "reviewed change\n", () => false);
@@ -626,6 +810,7 @@ test("Git development changes reach reviewer and project root before worktree cl
     assert.equal(await access(starts[0]!.cwd).then(() => true, () => false), true);
     assert.equal(starts[2]!.role, "reviewer");
     await scheduler.terminal(starts[2]!.id);
+    assert.deepEqual([starts[3]!.role, starts[3]!.trigger], ["supervisor", "coordinate"]);
     assert.equal((await readFile(join(fixture.projectPath, "feature.txt"), "utf8")).trim(), "reviewed change");
     assert.equal(await access(starts[0]!.cwd).then(() => true, () => false), false);
     assert.match((fixture.database.prepare("SELECT content FROM comments WHERE task_id = ? ORDER BY rowid DESC LIMIT 1").get(fixture.main) as { content: string }).content, /@任务1[\s\S]*已完成/);

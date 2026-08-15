@@ -509,6 +509,106 @@ const MIGRATIONS = [
   `
   ALTER TABLE notifications ADD COLUMN system_notified_at TEXT;
   UPDATE notifications SET system_notified_at = created_at;
+  `,
+  `
+  ALTER TABLE commissions ADD COLUMN coordination_revision INTEGER NOT NULL DEFAULT 0 CHECK (coordination_revision >= 0);
+  ALTER TABLE commissions ADD COLUMN coordination_pending INTEGER NOT NULL DEFAULT 0 CHECK (coordination_pending IN (0, 1));
+  ALTER TABLE runs ADD COLUMN coordination_revision INTEGER CHECK (coordination_revision IS NULL OR coordination_revision >= 0);
+  UPDATE runs SET coordination_revision = 0 WHERE trigger_type = 'coordinate';
+
+  CREATE TRIGGER tasks_revision_coordination
+  AFTER UPDATE OF status ON tasks
+  WHEN OLD.status <> NEW.status
+  BEGIN
+    UPDATE commissions
+    SET coordination_revision = coordination_revision + 1
+    WHERE id = NEW.commission_id;
+    UPDATE runs
+    SET coordination_revision = (SELECT coordination_revision FROM commissions WHERE id = NEW.commission_id),
+        context_snapshot_json = '{}'
+    WHERE commission_id = NEW.commission_id AND trigger_type = 'coordinate' AND status = 'queued';
+  END;
+  `,
+  `
+  CREATE TABLE plan_revisions (
+    id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL REFERENCES commissions(id),
+    base_coordination_revision INTEGER NOT NULL CHECK (base_coordination_revision >= 0),
+    status TEXT NOT NULL CHECK (status IN ('collecting', 'reviewing', 'awaiting_confirmation', 'applied', 'cancelled', 'stale')),
+    proposal_json TEXT CHECK (proposal_json IS NULL OR json_valid(proposal_json)),
+    review_run_id TEXT REFERENCES runs(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    applied_at TEXT
+  ) STRICT;
+  CREATE UNIQUE INDEX plan_revisions_one_active
+  ON plan_revisions(commission_id)
+  WHERE status IN ('collecting', 'reviewing', 'awaiting_confirmation');
+
+  CREATE TABLE plan_revision_cards (
+    comment_id TEXT PRIMARY KEY REFERENCES comments(id),
+    plan_revision_id TEXT NOT NULL REFERENCES plan_revisions(id),
+    interaction_type TEXT NOT NULL CHECK (interaction_type IN ('boolean', 'single_choice', 'multiple_choice', 'text')),
+    purpose TEXT NOT NULL CHECK (purpose IN ('question', 'final_confirmation')),
+    options_json TEXT NOT NULL CHECK (json_valid(options_json) AND json_type(options_json) = 'array'),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'superseded')),
+    answer_json TEXT CHECK (answer_json IS NULL OR json_valid(answer_json)),
+    answered_at TEXT
+  ) STRICT;
+  CREATE UNIQUE INDEX plan_revision_cards_one_pending
+  ON plan_revision_cards(plan_revision_id)
+  WHERE status = 'pending';
+
+  ALTER TABLE tasks ADD COLUMN deleted_at TEXT;
+  ALTER TABLE tasks ADD COLUMN deleted_reason TEXT;
+  ALTER TABLE tasks ADD COLUMN deleted_revision_id TEXT REFERENCES plan_revisions(id);
+
+  ${mutationGuardTriggers("plan_revisions", (row) => `SELECT 1 FROM commissions WHERE id = ${row}.commission_id AND lifecycle_operation IS NOT NULL`).join("\n")}
+  ${mutationGuardTriggers("plan_revision_cards", (row) => `SELECT 1 FROM commissions WHERE id = (SELECT commission_id FROM plan_revisions WHERE id = ${row}.plan_revision_id) AND lifecycle_operation IS NOT NULL`).join("\n")}
+  `,
+  `
+  CREATE TRIGGER tasks_structure_revision_insert
+  AFTER INSERT ON tasks
+  WHEN NOT EXISTS (SELECT 1 FROM commissions WHERE id = NEW.commission_id AND lifecycle_operation IS NOT NULL)
+  BEGIN
+    UPDATE commissions SET coordination_revision = coordination_revision + 1 WHERE id = NEW.commission_id;
+    UPDATE runs SET coordination_revision = (SELECT coordination_revision FROM commissions WHERE id = NEW.commission_id), context_snapshot_json = '{}'
+      WHERE commission_id = NEW.commission_id AND trigger_type = 'coordinate' AND status = 'queued';
+  END;
+
+  CREATE TRIGGER tasks_structure_revision_update
+  AFTER UPDATE OF parent_id, position, title, description, priority, due_date, owner_type, acceptance_json, read_only, archived_at, deleted_at ON tasks
+  WHEN NOT EXISTS (SELECT 1 FROM commissions WHERE id = NEW.commission_id AND lifecycle_operation IS NOT NULL)
+  BEGIN
+    UPDATE commissions SET coordination_revision = coordination_revision + 1 WHERE id = NEW.commission_id;
+    UPDATE runs SET coordination_revision = (SELECT coordination_revision FROM commissions WHERE id = NEW.commission_id), context_snapshot_json = '{}'
+      WHERE commission_id = NEW.commission_id AND trigger_type = 'coordinate' AND status = 'queued';
+  END;
+
+  CREATE TRIGGER task_dependencies_revision_insert
+  AFTER INSERT ON task_dependencies
+  WHEN NOT EXISTS (SELECT 1 FROM commissions JOIN tasks ON tasks.commission_id = commissions.id WHERE tasks.id = NEW.task_id AND commissions.lifecycle_operation IS NOT NULL)
+  BEGIN
+    UPDATE commissions SET coordination_revision = coordination_revision + 1 WHERE id = (SELECT commission_id FROM tasks WHERE id = NEW.task_id);
+    UPDATE runs SET coordination_revision = (SELECT coordination_revision FROM commissions WHERE id = runs.commission_id), context_snapshot_json = '{}'
+      WHERE commission_id = (SELECT commission_id FROM tasks WHERE id = NEW.task_id) AND trigger_type = 'coordinate' AND status = 'queued';
+  END;
+
+  CREATE TRIGGER task_dependencies_revision_delete
+  AFTER DELETE ON task_dependencies
+  WHEN NOT EXISTS (SELECT 1 FROM commissions JOIN tasks ON tasks.commission_id = commissions.id WHERE tasks.id = OLD.task_id AND commissions.lifecycle_operation IS NOT NULL)
+  BEGIN
+    UPDATE commissions SET coordination_revision = coordination_revision + 1 WHERE id = (SELECT commission_id FROM tasks WHERE id = OLD.task_id);
+    UPDATE runs SET coordination_revision = (SELECT coordination_revision FROM commissions WHERE id = runs.commission_id), context_snapshot_json = '{}'
+      WHERE commission_id = (SELECT commission_id FROM tasks WHERE id = OLD.task_id) AND trigger_type = 'coordinate' AND status = 'queued';
+  END;
+  `,
+  `
+  ALTER TABLE tasks ADD COLUMN deleted_dependency_ids_json TEXT
+  CHECK (
+    deleted_dependency_ids_json IS NULL
+    OR (json_valid(deleted_dependency_ids_json) AND json_type(deleted_dependency_ids_json) = 'array')
+  );
   `
 ];
 

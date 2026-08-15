@@ -23,6 +23,8 @@ type ArchiveSnapshot = {
     taskDependencies: Row[];
     taskLabels: Row[];
     comments: Row[];
+    planRevisions?: Row[];
+    planRevisionCards?: Row[];
     executionGrants: Row[];
     runs: Row[];
     runEvents: Row[];
@@ -132,9 +134,9 @@ export async function reactivateCommission(database: DatabaseSync, attachmentsRo
         WHERE id = ? AND lifecycle_operation = 'reactivating' AND lifecycle_token = ?`).run(commissionId, lifecycleToken);
       if (!claimed.changes) throw conflict("Commission reactivation operation was not claimed");
       restoreCommissionRows(database, snapshot, attachmentsRoot, commissionId);
-      database.prepare(`UPDATE commissions SET status = ?, active_requirement_version_id = ?, main_task_id = ?, archived_at = NULL,
+      database.prepare(`UPDATE commissions SET status = ?, active_requirement_version_id = ?, main_task_id = ?, coordination_revision = ?, archived_at = NULL,
         updated_at = ?, archive_path = NULL, archive_sha256 = NULL, archive_size_bytes = NULL WHERE id = ?`)
-        .run(originalStatus, snapshot.commission.active_requirement_version_id ?? null, snapshot.commission.main_task_id ?? null, new Date().toISOString(), commissionId);
+        .run(originalStatus, snapshot.commission.active_requirement_version_id ?? null, snapshot.commission.main_task_id ?? null, snapshot.commission.coordination_revision ?? commission.coordination_revision ?? 0, new Date().toISOString(), commissionId);
       database.exec("COMMIT");
     } catch (error) {
       database.exec("ROLLBACK");
@@ -190,6 +192,8 @@ function snapshotCommission(database: DatabaseSync, commission: Row): ArchiveSna
       taskDependencies: taskIds.length ? rows(database, `SELECT * FROM task_dependencies WHERE task_id IN (${taskIds.map(() => "?").join(", ")}) OR depends_on_task_id IN (${taskIds.map(() => "?").join(", ")}) ORDER BY rowid`, ...taskIds, ...taskIds) : [],
       taskLabels: selectBy(database, "task_labels", "task_id", taskIds),
       comments: selectBy(database, "comments", "task_id", taskIds),
+      planRevisions: rows(database, "SELECT * FROM plan_revisions WHERE commission_id = ? ORDER BY rowid", commissionId),
+      planRevisionCards: rows(database, "SELECT card.* FROM plan_revision_cards AS card JOIN plan_revisions AS revision ON revision.id = card.plan_revision_id WHERE revision.commission_id = ? ORDER BY card.rowid", commissionId),
       executionGrants: rows(database, "SELECT * FROM execution_grants WHERE commission_id = ? ORDER BY rowid", commissionId),
       runs,
       runEvents: selectBy(database, "run_events", "run_id", runIds),
@@ -237,6 +241,9 @@ function clearCommissionRows(database: DatabaseSync, commissionId: string, notif
   database.prepare("DELETE FROM approvals WHERE run_id IN (SELECT id FROM runs WHERE commission_id = ?)").run(commissionId);
   database.prepare("DELETE FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE commission_id = ?)").run(commissionId);
   database.prepare("DELETE FROM evidence WHERE task_id IN (SELECT id FROM tasks WHERE commission_id = ?)").run(commissionId);
+  database.prepare("DELETE FROM plan_revision_cards WHERE plan_revision_id IN (SELECT id FROM plan_revisions WHERE commission_id = ?)").run(commissionId);
+  database.prepare("UPDATE tasks SET deleted_revision_id = NULL WHERE commission_id = ?").run(commissionId);
+  database.prepare("DELETE FROM plan_revisions WHERE commission_id = ?").run(commissionId);
   database.prepare("DELETE FROM comments WHERE task_id IN (SELECT id FROM tasks WHERE commission_id = ?)").run(commissionId);
   database.prepare("DELETE FROM task_labels WHERE task_id IN (SELECT id FROM tasks WHERE commission_id = ?)").run(commissionId);
   database.prepare("DELETE FROM task_dependencies WHERE task_id IN (SELECT id FROM tasks WHERE commission_id = ?) OR depends_on_task_id IN (SELECT id FROM tasks WHERE commission_id = ?)").run(commissionId, commissionId);
@@ -259,6 +266,7 @@ function restoreCommissionRows(database: DatabaseSync, snapshot: ArchiveSnapshot
     database.prepare("UPDATE commissions SET status = 'planned', active_requirement_version_id = ? WHERE id = ?")
       .run(snapshot.commission.active_requirement_version_id ?? null, commissionId);
   }
+  insertRows(database, "plan_revisions", (tables.planRevisions ?? []).map((row) => ({ ...row, review_run_id: null })));
   insertRows(database, "tasks", tables.tasks.map((row) => ({ ...row, parent_id: null })));
   for (const row of tables.tasks) if (row.parent_id) database.prepare("UPDATE tasks SET parent_id = ? WHERE id = ?").run(sqlValue(row, "parent_id"), sqlValue(row, "id"));
   insertRows(database, "attachments", tables.attachments.map((row) => ({ ...row, storage_path: join(attachmentsRoot, commissionId, String(row.id)), comment_id: null, run_id: null })));
@@ -268,7 +276,9 @@ function restoreCommissionRows(database: DatabaseSync, snapshot: ArchiveSnapshot
   insertRows(database, "runs", tables.runs.map((row) => ({ ...row, retry_root_run_id: null })));
   for (const row of tables.runs) if (row.retry_root_run_id) database.prepare("UPDATE runs SET retry_root_run_id = ? WHERE id = ?").run(sqlValue(row, "retry_root_run_id"), sqlValue(row, "id"));
   insertRows(database, "comments", tables.comments.map((row) => ({ ...row, parent_id: null })));
+  insertRows(database, "plan_revision_cards", tables.planRevisionCards ?? []);
   for (const row of tables.comments) if (row.parent_id) database.prepare("UPDATE comments SET parent_id = ? WHERE id = ?").run(sqlValue(row, "parent_id"), sqlValue(row, "id"));
+  for (const row of tables.planRevisions ?? []) if (row.review_run_id) database.prepare("UPDATE plan_revisions SET review_run_id = ? WHERE id = ?").run(sqlValue(row, "review_run_id"), sqlValue(row, "id"));
   for (const row of tables.attachments) database.prepare("UPDATE attachments SET comment_id = ?, run_id = ? WHERE id = ?").run(row.comment_id ?? null, row.run_id ?? null, sqlValue(row, "id"));
   insertRows(database, "run_events", tables.runEvents);
   insertRows(database, "approvals", tables.approvals);

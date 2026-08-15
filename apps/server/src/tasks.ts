@@ -5,6 +5,7 @@ import { attachmentData, registerAttachmentParsers, removePendingAttachment, sel
 import { addMainTaskComment, addTaskComment, mentionsAgent, type AgentMentionHandler } from "./comments.ts";
 import { generateAcceptanceDocuments } from "./documents.ts";
 import { notify } from "./notifications.ts";
+import { answerRevisionCard, pendingTextRevisionCard, respondRevisionCard } from "./plan-revisions.ts";
 
 const STATUSES = ["backlog", "todo", "in_progress", "done", "blocked", "archived"] as const;
 const PRIORITIES = ["none", "low", "medium", "high", "urgent"] as const;
@@ -34,6 +35,10 @@ type TaskRow = {
   archived_at: string | null;
   read_only: number;
   auto_approve_permissions: number;
+  deleted_at: string | null;
+  deleted_reason: string | null;
+  deleted_revision_id: string | null;
+  deleted_dependency_ids_json: string | null;
 };
 
 type CommissionRow = { id: string; project_id: string; main_task_id: string | null; status: string; archived_at: string | null; lifecycle_operation?: string | null };
@@ -82,17 +87,41 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
   });
 
   server.post<{ Params: { id: string }; Body: Record<string, unknown> }>("/api/tasks/:id/move", async (request) => {
-    transaction(database, () => {
+    const preview = taskMovePlan(database, request.params.id, request.body ?? {});
+    if (preview.status !== undefined && preview.status !== preview.task.status) await stopTaskRun(database, preview.task.id, mentionAgent);
+    const coordination = transaction(database, () => {
       const before = activeTask(database, request.params.id);
       moveTask(database, request.params.id, request.body ?? {});
       const after = activeTask(database, request.params.id);
       if (before.status !== after.status && after.status === "done") {
         addMainTaskComment(database, { sourceTaskId: after.id, content: "子任务已由人工标记为完成。" });
-        updateCommissionAcceptance(database, after.commission_id);
       }
       if (before.status !== after.status && after.status === "blocked") addMainTaskComment(database, { sourceTaskId: after.id, kind: "blocker", content: "子任务已由人工标记为阻塞。" });
+      if (before.status === after.status) return undefined;
+      if (after.status === "done") {
+        markFinalCoordinationPending(database, after.commission_id);
+        return { kind: "final" as const, id: after.commission_id };
+      }
+      if (after.status !== "in_progress") return undefined;
+      const mainTask = database.prepare("SELECT main_task_id FROM commissions WHERE id = ?").get(after.commission_id) as { main_task_id: string | null } | undefined;
+      if (!mainTask?.main_task_id || (after.id !== mainTask.main_task_id && after.owner_type !== "ai")) return undefined;
+      database.prepare("UPDATE commissions SET coordination_pending = 1 WHERE id = ?").run(after.commission_id);
+      return { kind: "task" as const, id: mainTask.main_task_id };
     });
+    if (coordination?.kind === "final") await mentionAgent?.coordinateFinal?.(coordination.id);
+    if (coordination?.kind === "task") await mentionAgent?.coordinateTask?.(coordination.id);
     return taskView(database, request.params.id, true);
+  });
+
+  server.get<{ Params: { id: string }; Querystring: Record<string, string | undefined> }>("/api/projects/:id/task-history", async (request) => {
+    projectExists(database, request.params.id);
+    const search = optionalString(request.query.search, "search");
+    const commissionId = optionalString(request.query.commissionId, "commissionId");
+    const conditions = ["commission.project_id = ?", "task.deleted_at IS NOT NULL"];
+    const values: SQLInputValue[] = [request.params.id];
+    if (search) { conditions.push("(task.title LIKE ? OR task.description LIKE ? OR task.deleted_reason LIKE ?)"); values.push(`%${search}%`, `%${search}%`, `%${search}%`); }
+    if (commissionId) { conditions.push("task.commission_id = ?"); values.push(commissionId); }
+    return (database.prepare(`SELECT task.* FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id WHERE ${conditions.join(" AND ")} ORDER BY task.deleted_at DESC, task.rowid DESC`).all(...values) as TaskRow[]).map((task) => decorateTask(database, task));
   });
 
   server.post<{ Params: { id: string }; Body: Record<string, unknown> }>("/api/tasks/:id/reorder", async (request) => {
@@ -103,6 +132,7 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
   server.post<{ Params: { id: string } }>("/api/tasks/:id/archive", async (request) => {
     transaction(database, () => {
       const task = activeTask(database, request.params.id);
+      assertNoConcurrentTaskPlanMutation(database, task.commission_id);
       const commission = database.prepare("SELECT main_task_id FROM commissions WHERE id = ?").get(task.commission_id) as { main_task_id: string | null } | undefined;
       const archiveTree = commission?.main_task_id === task.id;
       if (archiveTree) {
@@ -150,6 +180,8 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
   server.post<{ Params: { id: string } }>("/api/tasks/:id/unarchive", async (request) => {
     transaction(database, () => {
       const task = taskById(database, request.params.id);
+      assertNoConcurrentTaskPlanMutation(database, task.commission_id);
+      if (task.deleted_at) throw conflict("Deleted tasks can only be restored through a new plan revision");
       if (!task.archived_at) throw conflict("Task is not archived");
       const commission = database.prepare("SELECT main_task_id FROM commissions WHERE id = ?").get(task.commission_id) as { main_task_id: string | null } | undefined;
       const unarchiveTree = commission?.main_task_id === task.id;
@@ -158,8 +190,8 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
         database.prepare(`WITH RECURSIVE descendants(id) AS (
           SELECT id FROM tasks WHERE id = ?
           UNION ALL
-          SELECT child.id FROM tasks AS child JOIN descendants AS parent ON child.parent_id = parent.id
-        ) UPDATE tasks SET status = 'done', archived_at = NULL, updated_at = ? WHERE id IN (SELECT id FROM descendants)`).run(task.id, now);
+          SELECT child.id FROM tasks AS child JOIN descendants AS parent ON child.parent_id = parent.id WHERE child.deleted_at IS NULL
+        ) UPDATE tasks SET status = 'done', archived_at = NULL, updated_at = ? WHERE id IN (SELECT id FROM descendants) AND deleted_at IS NULL`).run(task.id, now);
       } else {
         const archivedAncestor = database.prepare(`WITH RECURSIVE ancestors(id, parent_id, archived_at) AS (
           SELECT id, parent_id, archived_at FROM tasks WHERE id = ?
@@ -185,7 +217,8 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
   });
 
   server.delete<{ Params: { id: string; dependencyId: string } }>("/api/tasks/:id/dependencies/:dependencyId", async (request, reply) => {
-    activeTask(database, request.params.id);
+    const task = activeTask(database, request.params.id);
+    assertTaskPlanMutable(database, task.commission_id);
     const result = database.prepare("DELETE FROM task_dependencies WHERE task_id = ? AND depends_on_task_id = ?").run(request.params.id, request.params.dependencyId);
     if (!result.changes) throw notFound("Dependency not found");
     return reply.code(204).send();
@@ -196,6 +229,11 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
     return commentsWithAttachments(database, request.params.id);
   });
 
+  server.get<{ Params: { id: string } }>("/api/tasks/:id/evidence", async (request) => {
+    taskById(database, request.params.id);
+    return database.prepare("SELECT * FROM evidence WHERE task_id = ? ORDER BY created_at, rowid").all(request.params.id);
+  });
+
   server.post<{ Params: { id: string }; Body: Record<string, unknown> }>("/api/tasks/:id/comments", async (request, reply) => {
     const task = activeTask(database, request.params.id);
     const content = optionalString(request.body?.content, "content") ?? "";
@@ -203,6 +241,7 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
     const attachmentIds = request.body?.attachmentIds === undefined && request.body?.attachment_ids === undefined ? [] : stringArray(request.body?.attachmentIds ?? request.body?.attachment_ids, "attachmentIds");
     const attachments = selectedTaskAttachments(database, task.id, attachmentIds, "unlinked");
     if (!content && !attachments.length) throw badRequest("content or attachmentIds is required");
+    let revisionAnswer: { revisionId: string; finalAccepted: boolean } | undefined;
     const comment = transaction(database, () => {
       const created = addTaskComment(database, { taskId: task.id, authorType: "human", content, parentId });
       if (attachments.length) {
@@ -210,10 +249,15 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
           .run(String(created.id), task.id, ...attachments.map((attachment) => attachment.id));
         if (Number(claimed.changes) !== attachments.length) throw conflict("Attachment was already used by another request");
       }
+      const pendingCard = pendingTextRevisionCard(database, task.id);
+      if (pendingCard) revisionAnswer = answerRevisionCard(database, task.id, pendingCard.comment_id, content);
       return created;
     });
     let agentMention;
-    if (mentionsAgent(content)) {
+    if (revisionAnswer) {
+      try { await mentionAgent?.reviseTaskPlan?.(revisionAnswer.revisionId); }
+      catch { agentMention = { action: "unavailable" as const, message: "Plan revision routing failed after the answer was saved" }; }
+    } else if (mentionsAgent(content)) {
       try {
         agentMention = mentionAgent
           ? await mentionAgent(task.id, content, attachments.map((attachment) => attachment.id))
@@ -223,6 +267,18 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
       }
     }
     return reply.code(201).send({ ...comment, attachments, ...(agentMention ? { agentMention } : {}) });
+  });
+
+  server.post<{ Params: { id: string; commentId: string }; Body: Record<string, unknown> }>("/api/tasks/:id/comments/:commentId/respond", async (request, reply) => {
+    const task = activeTask(database, request.params.id);
+    const answer = request.body?.answer;
+    const result = respondRevisionCard(database, task.id, request.params.commentId, answer);
+    let agentMention;
+    try {
+      if (result.mainTaskId) await mentionAgent?.coordinateTask?.(result.mainTaskId);
+      else await mentionAgent?.reviseTaskPlan?.(result.answered.revisionId);
+    } catch { agentMention = { action: "unavailable" as const, message: "回答已保存，后续调度暂未启动，可在主任务中重新触发 @Agent" }; }
+    return reply.code(201).send({ ...result.comment, ...(agentMention ? { agentMention } : {}) });
   });
 
   server.post<{ Params: { id: string }; Body: Buffer | string }>("/api/tasks/:id/attachments", async (request, reply) => {
@@ -252,6 +308,7 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
 
   server.delete<{ Params: { id: string; commentId: string } }>("/api/tasks/:id/comments/:commentId", async (request, reply) => {
     activeTask(database, request.params.id);
+    if (database.prepare("SELECT 1 FROM plan_revision_cards WHERE comment_id = ?").get(request.params.commentId)) throw conflict("Plan revision cards cannot be deleted");
     const result = database.prepare("UPDATE comments SET content = '', deleted_at = COALESCE(deleted_at, ?) WHERE id = ? AND task_id = ?")
       .run(new Date().toISOString(), request.params.commentId, request.params.id);
     if (!result.changes) throw notFound("Comment not found");
@@ -260,19 +317,19 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
 
   server.post<{ Params: { id: string }; Body: Record<string, unknown> }>("/api/tasks/:id/waive", async (request) => {
     const reason = requiredString(request.body?.reason, "reason");
+    const candidate = waivableTask(database, request.params.id);
+    await stopTaskRun(database, candidate.id, mentionAgent);
     transaction(database, () => {
-      const task = activeTask(database, request.params.id);
-      const commission = activeCommission(database, task.commission_id);
-      if (commission.main_task_id === task.id) throw conflict("Main task cannot be waived");
-      if (task.status === "done") throw conflict("Task is already done");
+      const task = waivableTask(database, request.params.id);
       const now = new Date().toISOString();
       database.prepare("UPDATE tasks SET status = 'done', blocked_reason = NULL, human_waiver_reason = ?, updated_at = ? WHERE id = ?").run(reason, now, task.id);
       database.prepare("INSERT INTO evidence (id, task_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, '*', 'human_waiver', 'waived', ?, ?, ?)")
         .run(randomUUID(), task.id, reason, JSON.stringify({ reason }), now);
       database.prepare("INSERT INTO comments (id, task_id, author_type, kind, content, created_at) VALUES (?, ?, 'human', 'waiver', ?, ?)").run(randomUUID(), task.id, reason, now);
       addMainTaskComment(database, { sourceTaskId: task.id, content: `子任务已由人工豁免并完成。\n\n${reason}` });
-      updateCommissionAcceptance(database, task.commission_id);
+      markFinalCoordinationPending(database, task.commission_id);
     });
+    await mentionAgent?.coordinateFinal?.(candidate.commission_id);
     return taskView(database, request.params.id);
   });
 
@@ -313,6 +370,7 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
 
 function createSingleTask(database: DatabaseSync, commissionId: string, body: Record<string, unknown>): string {
   const commission = activeCommission(database, commissionId);
+  assertTaskPlanMutable(database, commission.id);
   const parentWasProvided = Object.hasOwn(body, "parentId") || Object.hasOwn(body, "parent_id");
   const parentId = nullableString(body.parentId ?? body.parent_id, "parentId", parentWasProvided ? null : commission.main_task_id);
   if (parentId) assertParent(database, parentId, commission.id);
@@ -410,6 +468,29 @@ export function updateCommissionAcceptance(database: DatabaseSync, commissionId:
   return true;
 }
 
+function waivableTask(database: DatabaseSync, taskId: string): TaskRow {
+  const task = activeTask(database, taskId);
+  const commission = activeCommission(database, task.commission_id);
+  if (commission.main_task_id === task.id) throw conflict("Main task cannot be waived");
+  if (task.status === "done") throw conflict("Task is already done");
+  return task;
+}
+
+function markFinalCoordinationPending(database: DatabaseSync, commissionId: string): void {
+  database.prepare(`UPDATE commissions SET coordination_pending = 1 WHERE id = ? AND main_task_id IS NOT NULL
+    AND EXISTS (SELECT 1 FROM tasks WHERE commission_id = ? AND id <> commissions.main_task_id AND archived_at IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM tasks WHERE commission_id = ? AND id <> commissions.main_task_id AND archived_at IS NULL AND status <> 'done')`)
+    .run(commissionId, commissionId, commissionId);
+}
+
+async function stopTaskRun(database: DatabaseSync, taskId: string, handler?: AgentMentionHandler): Promise<void> {
+  const reserved = database.prepare("SELECT 1 FROM runs WHERE task_id = ? AND status IN ('queued', 'preparing', 'running', 'waiting_approval', 'waiting_input') LIMIT 1").get(taskId);
+  if (!reserved) return;
+  if (!handler?.cancelTaskRun) throw conflict("Task has an active Run that must be cancelled before changing status");
+  await handler.cancelTaskRun(taskId);
+  if (database.prepare("SELECT 1 FROM runs WHERE task_id = ? AND status IN ('queued', 'preparing', 'running', 'waiting_approval', 'waiting_input') LIMIT 1").get(taskId)) throw conflict("Task Run could not be cancelled");
+}
+
 function insertTask(database: DatabaseSync, commission: CommissionRow, parentId: string | null, body: Record<string, unknown>): string {
   const id = randomUUID();
   const now = new Date().toISOString();
@@ -427,6 +508,7 @@ function insertTask(database: DatabaseSync, commission: CommissionRow, parentId:
 
 function updateTask(database: DatabaseSync, id: string, body: Record<string, unknown>): void {
   const task = activeTask(database, id);
+  assertTaskPlanMutable(database, task.commission_id);
   const title = body.title === undefined ? task.title : requiredString(body.title, "title");
   const description = body.description === undefined ? task.description : optionalString(body.description, "description") ?? "";
   const priority = body.priority === undefined ? task.priority : enumValue(body.priority, PRIORITIES, "priority");
@@ -440,32 +522,56 @@ function updateTask(database: DatabaseSync, id: string, body: Record<string, unk
   if (body.labels !== undefined) setTaskLabels(database, task.id, projectIdForTask(database, task.id), body.labels);
 }
 
-function moveTask(database: DatabaseSync, id: string, body: Record<string, unknown>): void {
+type TaskMovePlan = { task: TaskRow; status?: typeof ACTIVE_STATUSES[number]; blockedReason?: string | null; parent?: TaskRow };
+
+function taskMovePlan(database: DatabaseSync, id: string, body: Record<string, unknown>): TaskMovePlan {
   const task = activeTask(database, id);
+  const plan: TaskMovePlan = { task };
   if (body.status !== undefined) {
     const status = enumValue(body.status, ACTIVE_STATUSES, "status");
-    if (status !== task.status && task.status === "done") throw conflict(`Invalid task transition: ${task.status} -> ${status}`);
-    if (status === "done" && database.prepare("SELECT main_task_id FROM commissions WHERE id = ?").get(task.commission_id) && (database.prepare("SELECT main_task_id FROM commissions WHERE id = ?").get(task.commission_id) as { main_task_id: string | null }).main_task_id === task.id) throw conflict("Main task requires human acceptance before completion");
-    const blockedReason = status === "blocked" ? optionalString(body.blockedReason, "blockedReason") ?? null : null;
-    database.prepare("UPDATE tasks SET status = ?, blocked_reason = ?, updated_at = ? WHERE id = ?").run(status, blockedReason, new Date().toISOString(), task.id);
-    if (status === "blocked") notify(database, "blocked", `任务阻塞：${task.title}`, blockedReason ?? "任务已阻塞。", "task", task.id);
-    if (status === "done") notify(database, "completed", `任务完成：${task.title}`, "任务已完成。", "task", task.id);
+    const main = database.prepare("SELECT task.id, task.status FROM commissions JOIN tasks AS task ON task.id = commissions.main_task_id WHERE commissions.id = ?").get(task.commission_id) as { id: string; status: string } | undefined;
+    if (status !== task.status && task.id !== main?.id && !["backlog", "todo", "in_progress"].includes(main?.status ?? "")) throw conflict("Child tasks can only be moved while the main task is before Done");
+    if (status === "blocked" && task.id === main?.id) throw conflict("Main task cannot be blocked");
+    if (status !== task.status && task.status === "done" && task.id === main?.id) throw conflict(`Invalid task transition: ${task.status} -> ${status}`);
+    if (status === "done" && task.id === main?.id) throw conflict("Main task requires human acceptance before completion");
+    plan.status = status;
+    plan.blockedReason = status === "blocked" ? optionalString(body.blockedReason, "blockedReason") ?? null : null;
   }
   if (Object.hasOwn(body, "parentId") || Object.hasOwn(body, "parent_id")) {
+    assertTaskPlanMutable(database, task.commission_id);
     const parentId = nullableString(body.parentId ?? body.parent_id, "parentId", null);
     if (!parentId) throw conflict("A commission main task cannot be reparented or duplicated");
     const parent = assertParent(database, parentId, task.commission_id);
     if (parent.id === task.id || isDescendant(database, parent.id, task.id)) throw conflict("Task parent cycle");
+    plan.parent = parent;
+  }
+  return plan;
+}
+
+function moveTask(database: DatabaseSync, id: string, body: Record<string, unknown>): void {
+  const plan = taskMovePlan(database, id, body);
+  const { task } = plan;
+  if (plan.status !== undefined) {
+    const status = plan.status;
+    const now = new Date().toISOString();
+    const waiverReason = task.status === "done" && status !== "done" ? null : task.human_waiver_reason;
+    database.prepare("UPDATE tasks SET status = ?, blocked_reason = ?, human_waiver_reason = ?, updated_at = ? WHERE id = ?").run(status, plan.blockedReason ?? null, waiverReason, now, task.id);
+    if (status !== "done") database.prepare("UPDATE commissions SET status = 'active', updated_at = ? WHERE id = ? AND status = 'awaiting_acceptance'").run(now, task.commission_id);
+    if (status === "blocked") notify(database, "blocked", `任务阻塞：${task.title}`, plan.blockedReason ?? "任务已阻塞。", "task", task.id);
+    if (status === "done") notify(database, "completed", `任务完成：${task.title}`, "任务已完成。", "task", task.id);
+  }
+  if (plan.parent) {
     const oldParent = task.parent_id;
-    database.prepare("UPDATE tasks SET parent_id = ?, position = ?, updated_at = ? WHERE id = ?").run(parent.id, nextPosition(database, task.commission_id, parent.id), new Date().toISOString(), task.id);
+    database.prepare("UPDATE tasks SET parent_id = ?, position = ?, updated_at = ? WHERE id = ?").run(plan.parent.id, nextPosition(database, task.commission_id, plan.parent.id), new Date().toISOString(), task.id);
     compactSiblings(database, task.commission_id, oldParent);
-    compactSiblings(database, task.commission_id, parent.id);
+    compactSiblings(database, task.commission_id, plan.parent.id);
     renumberCommission(database, task.commission_id);
   }
 }
 
 function reorderTask(database: DatabaseSync, id: string, body: Record<string, unknown>): void {
   const task = activeTask(database, id);
+  assertTaskPlanMutable(database, task.commission_id);
   const siblings = database.prepare("SELECT id FROM tasks WHERE commission_id = ? AND parent_id IS ? AND archived_at IS NULL ORDER BY position, created_at, rowid").all(task.commission_id, task.parent_id) as Array<{ id: string }>;
   let ids: string[];
   if (body.orderedTaskIds !== undefined || body.ordered_task_ids !== undefined) {
@@ -483,7 +589,8 @@ function reorderTask(database: DatabaseSync, id: string, body: Record<string, un
 }
 
 function setDependencies(database: DatabaseSync, taskId: string, body: Record<string, unknown>): void {
-  activeTask(database, taskId);
+  const task = activeTask(database, taskId);
+  assertTaskPlanMutable(database, task.commission_id);
   const many = body.dependsOnTaskIds ?? body.depends_on_task_ids;
   if (many !== undefined) return replaceDependencies(database, taskId, stringArray(many, "dependsOnTaskIds"), enumValue(body.createdBy ?? body.created_by ?? "human", ["human", "planner_agent"] as const, "createdBy"));
   const dependencyId = requiredString(body.dependencyId ?? body.dependsOnTaskId ?? body.depends_on_task_id, "dependencyId");
@@ -507,7 +614,7 @@ function replaceDependencies(database: DatabaseSync, taskId: string, dependencie
 }
 
 function queryTasks(database: DatabaseSync, projectId: string, query: Record<string, string | undefined>): TaskView[] {
-  const conditions = ["commission.project_id = ?"];
+  const conditions = ["commission.project_id = ?", "task.deleted_at IS NULL"];
   const parameters: SQLInputValue[] = [projectId];
   if (query.includeArchived !== "true") conditions.push("task.archived_at IS NULL");
   for (const [field, column, values] of [["status", "task.status", STATUSES], ["priority", "task.priority", PRIORITIES]] as const) {
@@ -562,7 +669,9 @@ function decorateTask(database: DatabaseSync, task: TaskRow): TaskView {
     ...task,
     acceptanceCriteria: JSON.parse(task.acceptance_json) as unknown[],
     labels: database.prepare("SELECT label.id, label.name, label.color FROM labels label JOIN task_labels tl ON tl.label_id = label.id WHERE tl.task_id = ? ORDER BY label.name").all(task.id) as TaskView["labels"],
-    dependencyIds: dependencyIds(database, task.id),
+    dependencyIds: task.deleted_at && task.deleted_dependency_ids_json !== null
+      ? JSON.parse(task.deleted_dependency_ids_json) as string[]
+      : dependencyIds(database, task.id),
     latestRunStatus: (database.prepare("SELECT status FROM runs WHERE task_id = ? ORDER BY attempt_no DESC, rowid DESC LIMIT 1").get(task.id) as { status: string } | undefined)?.status ?? null
   };
 }
@@ -634,8 +743,8 @@ function acceptanceDetails(database: DatabaseSync, id: string) {
     commissionStatus: commission.status,
     deliveryDocument,
     tasks: database.prepare("SELECT id, number_path, title, status, blocked_reason, human_waiver_reason FROM tasks WHERE commission_id = ? AND id <> ? AND archived_at IS NULL ORDER BY number_path").all(task.commission_id, task.id),
-    runs: database.prepare("SELECT id, task_id, role, trigger_type, status, attempt_no, failure_summary FROM runs WHERE commission_id = ? ORDER BY rowid").all(task.commission_id),
-    evidence: database.prepare("SELECT evidence.* FROM evidence JOIN tasks ON tasks.id = evidence.task_id WHERE tasks.commission_id = ? ORDER BY evidence.created_at, evidence.rowid").all(task.commission_id)
+    runs: database.prepare("SELECT run.id, run.task_id, run.role, run.trigger_type, run.status, run.attempt_no, run.failure_summary FROM runs AS run JOIN tasks ON tasks.id = run.task_id WHERE run.commission_id = ? AND tasks.archived_at IS NULL ORDER BY run.rowid").all(task.commission_id),
+    evidence: database.prepare("SELECT evidence.* FROM evidence JOIN tasks ON tasks.id = evidence.task_id WHERE tasks.commission_id = ? AND tasks.archived_at IS NULL ORDER BY evidence.created_at, evidence.rowid").all(task.commission_id)
   };
 }
 
@@ -697,6 +806,17 @@ function activeTask(database: DatabaseSync, id: string): TaskRow {
   return task;
 }
 
+function assertTaskPlanMutable(database: DatabaseSync, commissionId: string): void {
+  const commission = database.prepare("SELECT status FROM commissions WHERE id = ? AND archived_at IS NULL").get(commissionId) as { status: string } | undefined;
+  if (!commission || !["planned", "backlog", "active", "paused", "blocked"].includes(commission.status)) throw conflict("Commission task plan cannot be changed in its current state");
+  assertNoConcurrentTaskPlanMutation(database, commissionId);
+}
+
+function assertNoConcurrentTaskPlanMutation(database: DatabaseSync, commissionId: string): void {
+  if (database.prepare("SELECT 1 FROM plan_revisions WHERE commission_id = ? AND status IN ('collecting', 'reviewing', 'awaiting_confirmation')").get(commissionId)) throw conflict("A plan revision is already in progress");
+  if (database.prepare("SELECT 1 FROM runs WHERE commission_id = ? AND status IN ('queued', 'preparing', 'running', 'waiting_approval', 'waiting_input') LIMIT 1").get(commissionId)) throw conflict("Stop active Runs before changing the task plan");
+}
+
 function commentsWithAttachments(database: DatabaseSync, taskId: string): Array<Record<string, unknown>> {
   const comments = database.prepare("SELECT * FROM comments WHERE task_id = ? ORDER BY created_at, rowid").all(taskId) as Array<Record<string, unknown>>;
   const attachments = database.prepare("SELECT * FROM attachments WHERE task_id = ? AND comment_id IS NOT NULL ORDER BY created_at, rowid").all(taskId) as Array<Record<string, unknown>>;
@@ -707,7 +827,9 @@ function commentsWithAttachments(database: DatabaseSync, taskId: string): Array<
     items.push(attachment);
     grouped.set(commentId, items);
   }
-  return comments.map((comment) => ({ ...comment, attachments: comment.deleted_at ? [] : grouped.get(String(comment.id)) ?? [] }));
+  const cards = database.prepare("SELECT * FROM plan_revision_cards WHERE comment_id IN (SELECT id FROM comments WHERE task_id = ?)").all(taskId) as Array<Record<string, unknown>>;
+  const cardByComment = new Map(cards.map((card) => [String(card.comment_id), { ...card, options: JSON.parse(String(card.options_json)), answer: card.answer_json ? JSON.parse(String(card.answer_json)) : null, options_json: undefined, answer_json: undefined }]));
+  return comments.map((comment) => ({ ...comment, attachments: comment.deleted_at ? [] : grouped.get(String(comment.id)) ?? [], revisionCard: cardByComment.get(String(comment.id)) ?? null }));
 }
 
 function assertParent(database: DatabaseSync, id: string, commissionId: string): TaskRow {

@@ -8,7 +8,8 @@ import test from "node:test";
 import Fastify from "fastify";
 import { addTaskComment, type AgentMentionHandler } from "./comments.ts";
 import { openWorkshopDatabase } from "./database.ts";
-import { registerTaskRoutes } from "./tasks.ts";
+import { beginPlanRevision } from "./plan-revisions.ts";
+import { registerTaskRoutes, updateCommissionAcceptance } from "./tasks.ts";
 
 test("creates, queries, reorders, moves, labels, and archives a task tree", async () => {
   const fixture = await taskFixture();
@@ -54,6 +55,7 @@ test("creates, queries, reorders, moves, labels, and archives a task tree", asyn
     assert.equal(crossColumn.statusCode, 200);
     assert.equal(crossColumn.json().status, "blocked");
     assert.equal((await fixture.server.inject({ method: "GET", url: `/api/tasks/${plan.mainTask.id}` })).json().status, "backlog");
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.mainTask.id}/move`, payload: { status: "blocked" } })).statusCode, 409);
 
     const labeled = await fixture.server.inject({ method: "GET", url: `/api/projects/${fixture.projectId}/tasks?label=backend&sort=due_date` });
     assert.equal(labeled.statusCode, 200);
@@ -86,6 +88,39 @@ test("creates, queries, reorders, moves, labels, and archives a task tree", asyn
   } finally {
     await fixture.close();
   }
+});
+
+test("CLI task writes stay direct but reject concurrent Runs and pending plan revisions", async () => {
+  const fixture = await taskFixture();
+  try {
+    const plan = (await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: {
+      mainTask: { title: "Main", acceptanceCriteria: [] },
+      tasks: [
+        { clientId: "A", title: "Child", acceptanceCriteria: [], dependsOn: [] },
+        { clientId: "B", title: "Parent", acceptanceCriteria: [], dependsOn: [] }
+      ]
+    } })).json() as { mainTask: { id: string }; tasks: Array<{ id: string }> };
+    const child = plan.tasks[0]!.id;
+    const parent = plan.tasks[1]!.id;
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE commission_id = ?").get(fixture.commissionA) as { count: number }).count, 0);
+
+    const run = randomUUID(), now = new Date().toISOString();
+    fixture.database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json) VALUES (?, ?, ?, ?, 'developer', 'manual', 'queued', 1, '{}', '{}')")
+      .run(run, fixture.projectId, fixture.commissionA, child);
+    assert.equal((await fixture.server.inject({ method: "PUT", url: `/api/tasks/${child}`, payload: { title: "Blocked edit" } })).statusCode, 409);
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${child}/move`, payload: { parentId: parent } })).statusCode, 409);
+    fixture.database.prepare("UPDATE runs SET status = 'cancelled', finished_at = ? WHERE id = ?").run(now, run);
+
+    const before = (fixture.database.prepare("SELECT coordination_revision FROM commissions WHERE id = ?").get(fixture.commissionA) as { coordination_revision: number }).coordination_revision;
+    assert.equal((await fixture.server.inject({ method: "PUT", url: `/api/tasks/${child}`, payload: { title: "Direct CLI edit" } })).statusCode, 200);
+    const after = (fixture.database.prepare("SELECT coordination_revision FROM commissions WHERE id = ?").get(fixture.commissionA) as { coordination_revision: number }).coordination_revision;
+    assert.ok(after > before);
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE commission_id = ? AND role = 'supervisor'").get(fixture.commissionA) as { count: number }).count, 0);
+
+    beginPlanRevision(fixture.database, fixture.commissionA, "等待人工确认");
+    assert.equal((await fixture.server.inject({ method: "PUT", url: `/api/tasks/${child}`, payload: { title: "Revision race" } })).statusCode, 409);
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${child}/move`, payload: { parentId: parent } })).statusCode, 409);
+  } finally { await fixture.close(); }
 });
 
 test("archives the complete task tree when the main task is archived", async () => {
@@ -268,8 +303,11 @@ test("allows cross-commission dependencies and rolls back cycles with their path
   }
 });
 
-test("human waiver advances the commission to main-task acceptance", async () => {
-  const fixture = await taskFixture();
+test("human waiver requests final coordination before main-task acceptance", async () => {
+  const handler = (async () => ({ action: "unavailable" as const })) as AgentMentionHandler;
+  const fixture = await taskFixture(handler);
+  const coordinated: string[] = [];
+  handler.coordinateFinal = async (commissionId) => { coordinated.push(commissionId); return true; };
   try {
     const response = await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: {
       mainTask: { title: "Main", acceptanceCriteria: ["Human approval"] },
@@ -281,25 +319,40 @@ test("human waiver advances the commission to main-task acceptance", async () =>
     const plan = response.json() as { mainTask: { id: string }; tasks: Array<{ id: string }> };
     fixture.database.prepare("UPDATE commissions SET status = 'active' WHERE id = ?").run(fixture.commissionA);
     fixture.database.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(plan.tasks[1]!.id);
+    const archivedRun = randomUUID();
+    fixture.database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json) SELECT ?, project_id, id, ?, 'reviewer', 'review', 'succeeded', 1, '{}', '{}' FROM commissions WHERE id = ?")
+      .run(archivedRun, plan.tasks[1]!.id, fixture.commissionA);
+    fixture.database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'review', 'failed', 'Archived evidence must be excluded', '{}', ?)")
+      .run(randomUUID(), plan.tasks[1]!.id, archivedRun, new Date().toISOString());
     assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[1]!.id}/archive` })).statusCode, 200);
     const waived = await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[0]!.id}/waive`, payload: { reason: "Verified externally" } });
     assert.equal(waived.statusCode, 200);
     assert.equal(waived.json().human_waiver_reason, "Verified externally");
-    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE id = ?").get(fixture.commissionA) as { status: string }).status, "awaiting_acceptance");
+    const repeatedDone = await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[0]!.id}/move`, payload: { status: "done" } });
+    assert.equal(repeatedDone.statusCode, 200);
+    assert.equal(repeatedDone.json().human_waiver_reason, "Verified externally");
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM evidence WHERE task_id = ? AND type = 'human_waiver'").get(plan.tasks[0]!.id) as { count: number }).count, 1);
+    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE id = ?").get(fixture.commissionA) as { status: string }).status, "active");
+    assert.deepEqual(coordinated, [fixture.commissionA]);
     assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM documents WHERE commission_id = ? AND type = 'plan'").get(fixture.commissionA) as { count: number }).count, 1);
     assert.match((fixture.database.prepare("SELECT content FROM comments WHERE task_id = ? ORDER BY rowid DESC LIMIT 1").get(plan.mainTask.id) as { content: string }).content, /@任务1\.1[\s\S]*人工豁免/);
 
+    assert.equal(updateCommissionAcceptance(fixture.database, fixture.commissionA), true);
     const acceptance = await fixture.server.inject({ method: "GET", url: `/api/tasks/${plan.mainTask.id}/acceptance` });
     assert.equal(acceptance.statusCode, 200);
+    assert.equal(acceptance.json().runs.length, 0);
+    assert.equal(acceptance.json().evidence.length, 1);
     assert.equal(acceptance.json().evidence[0].status, "waived");
     assert.match(acceptance.json().deliveryDocument.contentMarkdown, /## 变更摘要[\s\S]*## 文件清单[\s\S]*## 已知风险[\s\S]*## 未完成项[\s\S]*## 人工操作/);
     assert.doesNotMatch(acceptance.json().deliveryDocument.contentMarkdown, /Archived child/);
+    assert.doesNotMatch(acceptance.json().deliveryDocument.contentMarkdown, /Archived evidence must be excluded/);
     const rejected = await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.mainTask.id}/reject`, payload: { reason: "补充交付说明" } });
     assert.equal(rejected.statusCode, 200);
     assert.equal((fixture.database.prepare("SELECT status FROM tasks WHERE id = ?").get(plan.tasks[0]!.id) as { status: string }).status, "todo");
     assert.equal((fixture.database.prepare("SELECT kind FROM comments WHERE task_id = ? ORDER BY rowid DESC LIMIT 1").get(plan.mainTask.id) as { kind: string }).kind, "rejection");
     assert.match(currentDelivery(fixture.database, fixture.commissionA).content_markdown, /已拒绝：补充交付说明/);
     await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[0]!.id}/waive`, payload: { reason: "返工已复核" } });
+    assert.equal(updateCommissionAcceptance(fixture.database, fixture.commissionA), true);
     const accepted = await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.mainTask.id}/accept` });
     assert.equal(accepted.statusCode, 200);
     assert.equal(accepted.json().status, "done");
@@ -310,8 +363,11 @@ test("human waiver advances the commission to main-task acceptance", async () =>
   } finally { await fixture.close(); }
 });
 
-test("manually completing the final child advances the commission to main-task acceptance", async () => {
-  const fixture = await taskFixture();
+test("manually completing the final child requests final coordination", async () => {
+  const handler = (async () => ({ action: "unavailable" as const })) as AgentMentionHandler;
+  const fixture = await taskFixture(handler);
+  const coordinated: string[] = [];
+  handler.coordinateFinal = async (commissionId) => { coordinated.push(commissionId); return true; };
   try {
     const response = await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: {
       mainTask: { title: "Main", acceptanceCriteria: ["Human approval"] },
@@ -329,10 +385,105 @@ test("manually completing the final child advances the commission to main-task a
 
     assert.equal(moved.statusCode, 200);
     assert.equal(moved.json().status, "done");
-    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE id = ?").get(fixture.commissionA) as { status: string }).status, "awaiting_acceptance");
+    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE id = ?").get(fixture.commissionA) as { status: string }).status, "active");
     assert.equal((fixture.database.prepare("SELECT status FROM tasks WHERE id = ?").get(plan.mainTask.id) as { status: string }).status, "in_progress");
-    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE entity_type = 'task' AND entity_id = ? AND kind = 'acceptance'").get(plan.mainTask.id) as { count: number }).count, 1);
-    assert.ok(currentDelivery(fixture.database, fixture.commissionA));
+    assert.deepEqual(coordinated, [fixture.commissionA]);
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE entity_type = 'task' AND entity_id = ? AND kind = 'acceptance'").get(plan.mainTask.id) as { count: number }).count, 0);
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM documents WHERE commission_id = ? AND type = 'delivery'").get(fixture.commissionA) as { count: number }).count, 0);
+  } finally { await fixture.close(); }
+});
+
+test("moving work to In Progress coordinates on the server except for human child tasks", async () => {
+  const handler = (async () => ({ action: "unavailable" as const })) as AgentMentionHandler;
+  const fixture = await taskFixture(handler);
+  const coordinated: string[] = [];
+  handler.coordinateTask = async (taskId) => { coordinated.push(taskId); };
+  try {
+    const response = await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: {
+      mainTask: { title: "Main" },
+      tasks: [
+        { clientId: "AI", parentClientId: null, title: "AI child", ownerType: "ai", dependsOn: [] },
+        { clientId: "H", parentClientId: null, title: "Human child", ownerType: "human", dependsOn: [] }
+      ]
+    } });
+    const plan = response.json() as { mainTask: { id: string }; tasks: Array<{ id: string }> };
+
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.mainTask.id}/move`, payload: { status: "in_progress" } })).statusCode, 200);
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[0]!.id}/move`, payload: { status: "in_progress" } })).statusCode, 200);
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[1]!.id}/move`, payload: { status: "in_progress" } })).statusCode, 200);
+    assert.deepEqual(coordinated, [plan.mainTask.id, plan.mainTask.id]);
+  } finally { await fixture.close(); }
+});
+
+test("a failed coordination attempt leaves a durable pending revision after the state move", async () => {
+  const handler = (async () => ({ action: "unavailable" as const })) as AgentMentionHandler;
+  const fixture = await taskFixture(handler);
+  handler.coordinateTask = async () => { throw new Error("Coordinator unavailable"); };
+  try {
+    const response = await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: {
+      mainTask: { title: "Main" },
+      tasks: [{ clientId: "AI", parentClientId: null, title: "AI child", ownerType: "ai", dependsOn: [] }]
+    } });
+    const plan = response.json() as { mainTask: { id: string }; tasks: Array<{ id: string }> };
+
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[0]!.id}/move`, payload: { status: "in_progress" } })).statusCode, 500);
+    assert.equal((fixture.database.prepare("SELECT status FROM tasks WHERE id = ?").get(plan.tasks[0]!.id) as { status: string }).status, "in_progress");
+    assert.equal((fixture.database.prepare("SELECT coordination_pending FROM commissions WHERE id = ?").get(fixture.commissionA) as { coordination_pending: number }).coordination_pending, 1);
+
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[0]!.id}/move`, payload: { status: "todo" } })).statusCode, 200);
+    assert.equal((fixture.database.prepare("SELECT coordination_pending FROM commissions WHERE id = ?").get(fixture.commissionA) as { coordination_pending: number }).coordination_pending, 1);
+  } finally { await fixture.close(); }
+});
+
+test("server cancels a reserved Run before moving its task across columns", async () => {
+  const handler = (async () => ({ action: "unavailable" as const })) as AgentMentionHandler;
+  const fixture = await taskFixture(handler);
+  const cancelled: string[] = [];
+  handler.cancelTaskRun = async (taskId) => {
+    cancelled.push(taskId);
+    fixture.database.prepare("UPDATE runs SET status = 'cancelled', finished_at = ? WHERE task_id = ? AND status IN ('queued', 'preparing', 'running', 'waiting_approval', 'waiting_input')").run(new Date().toISOString(), taskId);
+    return true;
+  };
+  try {
+    const response = await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: {
+      mainTask: { title: "Main" },
+      tasks: [{ clientId: "T1", parentClientId: null, title: "Child", dependsOn: [] }]
+    } });
+    const plan = response.json() as { mainTask: { id: string }; tasks: Array<{ id: string }> };
+    fixture.database.prepare("UPDATE commissions SET status = 'active' WHERE id = ?").run(fixture.commissionA);
+    fixture.database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id IN (?, ?)").run(plan.mainTask.id, plan.tasks[0]!.id);
+    fixture.database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json) SELECT ?, project_id, id, ?, 'developer', 'scheduler', 'running', 1, '{}', '{}' FROM commissions WHERE id = ?")
+      .run(randomUUID(), plan.tasks[0]!.id, fixture.commissionA);
+
+    const moved = await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[0]!.id}/move`, payload: { status: "todo", boardMove: true } });
+
+    assert.equal(moved.statusCode, 200);
+    assert.equal(moved.json().status, "todo");
+    assert.deepEqual(cancelled, [plan.tasks[0]!.id]);
+    assert.equal((fixture.database.prepare("SELECT status FROM runs WHERE task_id = ?").get(plan.tasks[0]!.id) as { status: string }).status, "cancelled");
+  } finally { await fixture.close(); }
+});
+
+test("board moves can reopen a child for main-task coordination", async () => {
+  const fixture = await taskFixture();
+  try {
+    const response = await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: {
+      mainTask: { title: "Main", acceptanceCriteria: ["Human approval"] },
+      tasks: [{ clientId: "T1", parentClientId: null, title: "Child", acceptanceCriteria: ["Reviewed"], dependsOn: [] }]
+    } });
+    const plan = response.json() as { mainTask: { id: string }; tasks: Array<{ id: string }> };
+    fixture.database.prepare("UPDATE commissions SET status = 'awaiting_acceptance' WHERE id = ?").run(fixture.commissionA);
+    fixture.database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(plan.mainTask.id);
+    fixture.database.prepare("UPDATE tasks SET status = 'done', human_waiver_reason = 'stale' WHERE id = ?").run(plan.tasks[0]!.id);
+
+    const moved = await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[0]!.id}/move`, payload: { status: "todo", boardMove: true } });
+
+    assert.equal(moved.statusCode, 200);
+    assert.equal(moved.json().status, "todo");
+    assert.equal(moved.json().human_waiver_reason, null);
+    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE id = ?").get(fixture.commissionA) as { status: string }).status, "active");
+    fixture.database.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(plan.mainTask.id);
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[0]!.id}/move`, payload: { status: "in_progress", boardMove: true } })).statusCode, 409);
   } finally { await fixture.close(); }
 });
 

@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import type { FastifyInstance } from "fastify";
 
 const runFile = promisify(execFile);
-const CONTEXT_FILES = ["requirement.md", "task.md", "task-tree.md", "dependencies.md", "previous-runs.md", "project-profile.md", "messages.md"] as const;
+const CONTEXT_FILES = ["execution-policy.md", "requirement.md", "task.md", "task-tree.md", "dependencies.md", "plan-revision.md", "previous-runs.md", "project-profile.md", "messages.md"] as const;
 const RESERVED_ARGS = new Set(["--listen", "--cwd", "-C", "--model", "-m", "--sandbox", "-s", "--ask-for-approval", "-a", "--output-schema", "--json"]);
 export const COMMAND_APPROVAL_POLICY = "on-request";
 export const COMMAND_SANDBOX_MODE = "workspace-write" as const;

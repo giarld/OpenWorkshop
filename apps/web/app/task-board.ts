@@ -1,3 +1,5 @@
+import { closestCenter, pointerWithin, type CollisionDetection } from "@dnd-kit/core";
+
 export const TASK_STATUSES = ["backlog", "todo", "in_progress", "done", "blocked", "archived"] as const;
 export type TaskStatus = typeof TASK_STATUSES[number];
 export type TaskSort = "manual" | "priority" | "due_date" | "created_at" | "updated_at";
@@ -17,6 +19,12 @@ export type Task = {
   created_at: string;
   updated_at: string;
   archived_at: string | null;
+  read_only: number;
+  acceptanceCriteria: unknown[];
+  dependencyIds: string[];
+  deleted_at?: string | null;
+  deleted_reason?: string | null;
+  deleted_revision_id?: string | null;
   auto_approve_permissions: number;
   latestRunStatus?: string | null;
   labels: Array<{ id: string; name: string; color: string }>;
@@ -59,10 +67,24 @@ export function taskChildren(tasks: Task[], parentId: string, status?: TaskStatu
 
 export function canDropTask(task: Task, status: TaskStatus, tasks: Task[]): boolean {
   if (status === task.status) return true;
-  if (task.status === "done") return false;
+  const mainTask = tasks.find((item) => item.commission_id === task.commission_id && item.parent_id === null);
+  if (task.parent_id && !["backlog", "todo", "in_progress"].includes(mainTask?.status ?? "")) return false;
+  if (!task.parent_id && status === "blocked") return false;
   if (status === "done" && !task.parent_id) return false;
   if (status === "archived" && (task.status === "in_progress" || tasks.some((item) => item.parent_id === task.id && item.status !== "archived"))) return false;
   return true;
+}
+
+export const boardCollisionDetection: CollisionDetection = (args) => {
+  const task = args.active.data.current?.task as Task | undefined;
+  if (task?.parent_id !== null) return closestCenter({ ...args, droppableContainers: args.droppableContainers.filter(({ id }) => id !== args.active.id) });
+  const droppableContainers = args.droppableContainers.filter(({ id }) => String(id).startsWith(`column:${task.id}:`));
+  const collisions = pointerWithin({ ...args, droppableContainers });
+  return collisions.length ? collisions : closestCenter({ ...args, droppableContainers });
+};
+
+export function taskDropPreview(task: Task | undefined, status: TaskStatus, tasks: Task[]): Task | null {
+  return task && task.status !== status && canDropTask(task, status, tasks) ? { ...task, status } : null;
 }
 
 export function treeRoots(tasks: Task[]): Task[] {

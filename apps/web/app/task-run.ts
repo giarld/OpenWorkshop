@@ -31,6 +31,15 @@ export function isCommentSubmitShortcut(event: { key: string; ctrlKey: boolean; 
   return event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.isComposing;
 }
 
+export function canResumeTaskRun(taskStatus: string, run: { status: string; trigger_type: string } | undefined): boolean {
+  return taskStatus !== "archived" && run?.status === "interrupted" && !["coordinate", "plan_revision", "plan_revision_review"].includes(run.trigger_type);
+}
+
+export function taskLifecycleAction(taskStatus: string, deleted = false): "archive" | "unarchive" | null {
+  if (deleted) return null;
+  return taskStatus === "done" ? "archive" : taskStatus === "archived" ? "unarchive" : null;
+}
+
 const TOKEN_PRICES: Record<string, { input: number; cached: number; output: number }> = {
   "deepseek-v4-flash": { input: 0.14, cached: 0.0028, output: 0.28 },
   "deepseek-v4-pro": { input: 0.435, cached: 0.003625, output: 0.87 },

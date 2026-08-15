@@ -10,7 +10,9 @@ import { registerAuthentication } from "./auth.ts";
 import { addTaskComment } from "./comments.ts";
 import type { CodexAppServerOptions, CodexRunHandle, CodexRunOptions, NormalizedCodexEvent } from "./codex.ts";
 import { openWorkshopDatabase, SettingsStore } from "./database.ts";
+import { answerRevisionCard, beginPlanRevision, saveRevisionProposal } from "./plan-revisions.ts";
 import { appendRunEvent, approvalKind, codexTokenUsage, CodexRunController, EventHub, pruneRawRunEvents, registerProductionRunRoutes, registerRunRoutes, type RunClientLauncher, type RunController } from "./runs.ts";
+import { registerTaskRoutes } from "./tasks.ts";
 
 test("reads cumulative Codex token usage without double-counting cache", () => {
   assert.deepEqual(codexTokenUsage({ tokenUsage: { total: { totalTokens: 140, inputTokens: 100, cachedInputTokens: 80, cacheWriteInputTokens: 0, outputTokens: 40, reasoningOutputTokens: 10 } } }), { input: 100, output: 40, cached: 80 });
@@ -163,6 +165,46 @@ test("production assembly wires Codex controls, approvals, and live events", asy
   }
 });
 
+test("pausing an exclusive Run starts the next queued task", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-pause-queue-"));
+  const database = await openWorkshopDatabase(home);
+  const server = Fastify();
+  const calls: string[] = [];
+  try {
+    const { commissionId, taskId: mainTaskId } = seedTask(database, home);
+    const now = new Date().toISOString();
+    database.prepare("UPDATE commissions SET main_task_id = ? WHERE id = ?").run(mainTaskId, commissionId);
+    database.prepare("UPDATE tasks SET status = 'backlog' WHERE id = ?").run(mainTaskId);
+    for (const [numberPath, title] of [["1.1", "First"], ["1.2", "Second"]] as const) {
+      database.prepare(`INSERT INTO tasks (id, commission_id, parent_id, number_path, position, title, description, status, priority, owner_type, acceptance_json, review_round_limit, review_round_used, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 0, ?, ?, 'backlog', 'high', 'ai', '[]', 1, 0, ?, ?)`).run(randomUUID(), commissionId, mainTaskId, numberPath, title, title, now, now);
+    }
+    await registerProductionRunRoutes(server, database, fakeRunClientLauncher(database, calls));
+
+    const triggered = await server.inject({ method: "POST", url: `/api/tasks/${mainTaskId}/trigger` });
+    assert.equal(triggered.statusCode, 200);
+    const runIds = triggered.json().runIds as string[];
+    assert.equal(runIds.length, 2);
+    const runs = runIds.map((id) => database.prepare("SELECT id, task_id, status FROM runs WHERE id = ?").get(id) as { id: string; task_id: string; status: string });
+    const active = runs.find(({ status }) => status === "waiting_approval")!;
+    const queued = runs.find(({ status }) => status === "queued")!;
+
+    const paused = await server.inject({ method: "POST", url: `/api/tasks/${active.task_id}/pause` });
+    assert.equal(paused.statusCode, 200);
+    assert.equal(paused.json().status, "interrupted");
+    for (let attempt = 0; attempt < 20; attempt++) {
+      if ((database.prepare("SELECT status FROM runs WHERE id = ?").get(queued.id) as { status: string }).status !== "queued") break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(["preparing", "running", "waiting_approval"].includes((database.prepare("SELECT status FROM runs WHERE id = ?").get(queued.id) as { status: string }).status));
+    assert.ok(calls.includes(`interrupt:${active.id}`));
+  } finally {
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("passes image attachments as initial visual input when an @Agent mention creates a Run", async () => {
   const home = await mkdtemp(join(tmpdir(), "project-workshop-mentioned-run-image-"));
   const database = await openWorkshopDatabase(home);
@@ -217,6 +259,8 @@ test("starts a scheduling Agent when the main task is mentioned", async () => {
       VALUES (?, ?, ?, '1.1', 0, 'Child', 'Child work', 'todo', 'high', 'ai', '[]', 1, 0, ?, ?)`).run(childTaskId, commissionId, mainTaskId, now, now);
     database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json) SELECT ?, project_id, id, ?, 'reviewer', 'review', 'succeeded', 1, '{}', '{}' FROM commissions WHERE id = ?").run(previousRunId, childTaskId, commissionId);
     database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json) SELECT ?, project_id, id, ?, 'developer', 'resume', 'interrupted', 2, '{}', '{}' FROM commissions WHERE id = ?").run(interruptedRunId, childTaskId, commissionId);
+    database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'review', 'failed', 'Blocking review result', ?, ?)")
+      .run(randomUUID(), childTaskId, previousRunId, JSON.stringify({ passed: false, findings: [{ severity: "blocking", message: "Missing regression test" }] }), now);
     const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
       initialize: async () => undefined,
       startRun: async (options) => { prompts.push(options.prompt); return { threadId: "thread-coordinate", turnId: "turn-coordinate", completed: new Promise<NormalizedCodexEvent>(() => undefined) }; },
@@ -224,6 +268,7 @@ test("starts a scheduling Agent when the main task is mentioned", async () => {
       interrupt: async () => undefined,
       close: async () => undefined
     }), join(home, "attachments"));
+    database.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(childTaskId);
 
     const result = await mentionAgent(mainTaskId, "@Agent 请分析后推进");
     assert.equal(result.action, "triggered");
@@ -236,7 +281,166 @@ test("starts a scheduling Agent when the main task is mentioned", async () => {
     assert.match(taskTree, /1\.1 Child/);
     assert.match(taskTree, new RegExp(childTaskId));
     assert.match(taskTree, new RegExp(`Latest Run: ${interruptedRunId} · developer · interrupted`));
+    assert.match(taskTree, new RegExp(`Run history:.*${previousRunId}.*reviewer.*succeeded.*${interruptedRunId}.*developer.*interrupted`));
+    assert.match(taskTree, new RegExp(`Evidence: review/failed · run:${previousRunId} · Blocking review result`));
+    assert.match(taskTree, /Missing regression test/);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM runs WHERE task_id = ?").get(childTaskId) as { count: number }).count, 2);
+  } finally {
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("retries an active plan revision instead of coordinating the main task", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-main-task-revision-"));
+  const database = await openWorkshopDatabase(home);
+  const server = Fastify();
+  try {
+    const { commissionId, taskId } = seedTask(database, home);
+    database.prepare("UPDATE commissions SET main_task_id = ? WHERE id = ?").run(taskId, commissionId);
+    const revisionId = beginPlanRevision(database, commissionId, "调整计划");
+    const card = database.prepare("SELECT comment_id FROM plan_revision_cards WHERE plan_revision_id = ? AND status = 'pending'").get(revisionId) as { comment_id: string };
+    answerRevisionCard(database, taskId, card.comment_id, "合并任务");
+    saveRevisionProposal(database, revisionId, { summary: "合并任务", changes: [] });
+    const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
+      initialize: async () => undefined,
+      startRun: async () => ({ threadId: "thread-revision", turnId: "turn-revision", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
+      steer: async () => undefined,
+      interrupt: async () => undefined,
+      close: async () => undefined
+    }), join(home, "attachments"));
+
+    const result = await mentionAgent(taskId, "@Agent 再次尝试任务合并");
+
+    assert.equal(result.action, "triggered");
+    assert.equal((database.prepare("SELECT trigger_type FROM runs WHERE id = ?").get(result.runId!) as { trigger_type: string }).trigger_type, "plan_revision_review");
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM runs WHERE task_id = ? AND trigger_type = 'coordinate'").get(taskId) as { count: number }).count, 0);
+  } finally {
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("final board move cancels the server Run and starts main-task coordination", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-final-board-move-"));
+  const database = await openWorkshopDatabase(home);
+  const server = Fastify();
+  const prompts: string[] = [];
+  try {
+    const { commissionId, taskId: mainTaskId } = seedTask(database, home);
+    database.prepare("UPDATE commissions SET main_task_id = ? WHERE id = ?").run(mainTaskId, commissionId);
+    const handler = await registerProductionRunRoutes(server, database, () => ({
+      initialize: async () => undefined,
+      startRun: async (options) => { prompts.push(options.prompt); return { threadId: "thread-final-coordinate", turnId: "turn-final-coordinate", completed: new Promise<NormalizedCodexEvent>(() => undefined) }; },
+      steer: async () => undefined,
+      interrupt: async () => undefined,
+      close: async () => undefined
+    }), join(home, "attachments"));
+    registerTaskRoutes(server, database, handler, join(home, "attachments"));
+    const childTaskId = randomUUID();
+    const queuedRunId = randomUUID();
+    const now = new Date().toISOString();
+    database.prepare(`INSERT INTO tasks (id, commission_id, parent_id, number_path, position, title, description, status, priority, owner_type, acceptance_json, review_round_limit, review_round_used, created_at, updated_at)
+      VALUES (?, ?, ?, '1.1', 0, 'Child', 'Child work', 'in_progress', 'high', 'ai', '[]', 1, 0, ?, ?)`).run(childTaskId, commissionId, mainTaskId, now, now);
+    database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json) SELECT ?, project_id, id, ?, 'developer', 'scheduler', 'queued', 1, '{}', '{}' FROM commissions WHERE id = ?")
+      .run(queuedRunId, childTaskId, commissionId);
+
+    const moved = await server.inject({ method: "POST", url: `/api/tasks/${childTaskId}/move`, payload: { status: "done", boardMove: true } });
+
+    assert.equal(moved.statusCode, 200);
+    assert.equal(moved.json().status, "done");
+    assert.equal((database.prepare("SELECT status FROM runs WHERE id = ?").get(queuedRunId) as { status: string }).status, "cancelled");
+    assert.equal((database.prepare("SELECT status FROM commissions WHERE id = ?").get(commissionId) as { status: string }).status, "active");
+    const coordinator = database.prepare("SELECT status FROM runs WHERE task_id = ? AND trigger_type = 'coordinate' ORDER BY rowid DESC LIMIT 1").get(mainTaskId) as { status: string } | undefined;
+    assert.equal(coordinator?.status, "running");
+    assert.match(prompts[0]!, /scan every Done child/);
+  } finally {
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("reconcile context distinguishes a successful Reviewer Run from a failed review", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-review-reconcile-"));
+  const database = await openWorkshopDatabase(home);
+  const server = Fastify();
+  const prompts: string[] = [];
+  try {
+    const { commissionId, taskId } = seedTask(database, home);
+    const reviewerRunId = randomUUID();
+    const now = new Date().toISOString();
+    const review = { passed: false, summary: "Reviewer found four blocking gaps", checks: [], findings: [{ severity: "blocking", file: "tests/example.cpp", line: 10, message: "Missing coverage" }] };
+    database.prepare("UPDATE tasks SET status = 'blocked', blocked_reason = 'Review exhausted' WHERE id = ?").run(taskId);
+    database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json) SELECT ?, project_id, id, ?, 'reviewer', 'review', 'succeeded', 1, '{}', '{}' FROM commissions WHERE id = ?")
+      .run(reviewerRunId, taskId, commissionId);
+    database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'review', 'failed', ?, ?, ?)")
+      .run(randomUUID(), taskId, reviewerRunId, review.summary, JSON.stringify(review), now);
+    appendRunEvent(database, new EventHub(), reviewerRunId, "agent_message.completed", "agentMessage completed", { method: "item/completed", item: { type: "agentMessage", id: "review-message", text: JSON.stringify(review) } });
+    addTaskComment(database, { taskId, authorType: "human", content: "人工已修复并测试通过" });
+    const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
+      initialize: async () => undefined,
+      startRun: async (options) => { prompts.push(options.prompt); return { threadId: "thread-reconcile", turnId: "turn-reconcile", completed: new Promise<NormalizedCodexEvent>(() => undefined) }; },
+      steer: async () => undefined,
+      interrupt: async () => undefined,
+      close: async () => undefined
+    }), join(home, "attachments"));
+
+    const result = await mentionAgent(taskId, "@Agent 已人工修复并测试通过");
+    assert.equal(result.action, "triggered");
+    const previousRuns = await readFile(join(home, ".openworkshop", "runs", result.runId!, "previous-runs.md"), "utf8");
+    assert.match(previousRuns, /Attempt 1 · reviewer · Run succeeded · review · Review failed · Reviewer found four blocking gaps/);
+    assert.match(previousRuns, /agent_message\.completed/);
+    assert.match(previousRuns, /Missing coverage/);
+    assert.match(prompts[0]!, /distinguish Run execution status from the structured review result/);
+    assert.match(prompts[0]!, /human or external process changed or validated the current workspace/);
+    assert.match(prompts[0]!, /Never use wait_human for final acceptance or task closure of a child task/);
+  } finally {
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("Run validation policy keeps main-task instructions global and child instructions local", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-validation-scope-"));
+  const database = await openWorkshopDatabase(home);
+  const server = Fastify();
+  const prompts: string[] = [];
+  try {
+    const { commissionId, taskId: mainTaskId } = seedTask(database, home);
+    const childTaskId = randomUUID();
+    const siblingTaskId = randomUUID();
+    const now = new Date().toISOString();
+    database.prepare("UPDATE commissions SET main_task_id = ? WHERE id = ?").run(mainTaskId, commissionId);
+    database.prepare(`INSERT INTO tasks (id, commission_id, parent_id, number_path, position, title, description, status, priority, owner_type, acceptance_json, review_round_limit, review_round_used, created_at, updated_at)
+      VALUES (?, ?, ?, '1.1', 0, 'Child', '', 'todo', 'high', 'ai', '[]', 1, 0, ?, ?),
+             (?, ?, ?, '1.2', 1, 'Sibling', '', 'todo', 'high', 'ai', '[]', 1, 0, ?, ?)`)
+      .run(childTaskId, commissionId, mainTaskId, now, now, siblingTaskId, commissionId, mainTaskId, now, now);
+    addTaskComment(database, { taskId: mainTaskId, authorType: "human", content: "主任务要求使用 Release 构建并运行 CTest" });
+    addTaskComment(database, { taskId: childTaskId, authorType: "human", content: "仅此任务跳过慢速压力测试" });
+    addTaskComment(database, { taskId: siblingTaskId, authorType: "human", content: "仅兄弟任务使用 Debug 构建" });
+    const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
+      initialize: async () => undefined,
+      startRun: async (options) => { prompts.push(options.prompt); return { threadId: "thread-policy", turnId: "turn-policy", completed: new Promise<NormalizedCodexEvent>(() => undefined) }; },
+      steer: async () => undefined,
+      interrupt: async () => undefined,
+      close: async () => undefined
+    }), join(home, "attachments"));
+
+    const result = await mentionAgent(childTaskId, "@Agent 执行并验证");
+    assert.equal(result.action, "triggered");
+    const runDirectory = join(home, ".openworkshop", "runs", result.runId!);
+    const policy = await readFile(join(runDirectory, "execution-policy.md"), "utf8");
+    const messages = await readFile(join(runDirectory, "messages.md"), "utf8");
+    assert.match(policy, /execute relevant build, test, and validation commands autonomously/);
+    assert.match(policy, /主任务要求使用 Release 构建并运行 CTest/);
+    assert.doesNotMatch(policy, /仅兄弟任务使用 Debug 构建/);
+    assert.match(messages, /仅此任务跳过慢速压力测试/);
+    assert.doesNotMatch(messages, /仅兄弟任务使用 Debug 构建/);
+    assert.match(prompts[0]!, new RegExp(join(runDirectory, "execution-policy.md").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   } finally {
     await server.close();
     database.close();
@@ -260,9 +464,11 @@ test("recovered scheduling Agent rebuilds task Run context after restart", async
     database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(mainTaskId);
     database.prepare(`INSERT INTO tasks (id, commission_id, parent_id, number_path, position, title, description, status, priority, owner_type, acceptance_json, review_round_limit, review_round_used, created_at, updated_at)
       VALUES (?, ?, ?, '1.1', 0, 'Interrupted child', '', 'in_progress', 'high', 'ai', '[]', 1, 0, ?, ?)`).run(childTaskId, commissionId, mainTaskId, now, now);
+    const coordinationRevision = (database.prepare("SELECT coordination_revision FROM commissions WHERE id = ?").get(commissionId) as { coordination_revision: number }).coordination_revision;
+    database.prepare("UPDATE commissions SET coordination_pending = 1 WHERE id = ?").run(commissionId);
     database.prepare("INSERT INTO execution_grants (id, commission_id, root_task_id, scope, status, created_at) VALUES (?, ?, ?, 'commission_tree', 'active', ?)").run(grantId, commissionId, mainTaskId, now);
-    database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, execution_grant_id, status, attempt_no, config_snapshot_json, context_snapshot_json) VALUES (?, ?, ?, ?, 'supervisor', 'coordinate', ?, 'running', 1, '{}', ?)")
-      .run(coordinateRunId, projectId, commissionId, mainTaskId, grantId, JSON.stringify({ version: 1, files: { "task-tree.md": "STALE CHILD STATUS: running" } }));
+    database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, execution_grant_id, status, attempt_no, config_snapshot_json, context_snapshot_json, coordination_revision) VALUES (?, ?, ?, ?, 'supervisor', 'coordinate', ?, 'running', 1, '{}', ?, ?)")
+      .run(coordinateRunId, projectId, commissionId, mainTaskId, grantId, JSON.stringify({ version: 1, files: { "task-tree.md": "STALE CHILD STATUS: running" } }), coordinationRevision);
     database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json) VALUES (?, ?, ?, ?, 'developer', 'scheduler', 'running', 1, '{}', '{}')")
       .run(childRunId, projectId, commissionId, childTaskId);
     await registerProductionRunRoutes(server, database, () => ({
@@ -382,6 +588,50 @@ test("steers an @Agent image that arrives while a Run is preparing", async () =>
   }
 });
 
+test("interrupts a Run cancelled while Codex is starting the turn", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-starting-run-cancel-"));
+  const database = await openWorkshopDatabase(home);
+  const { taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  let provideHandle!: (handle: CodexRunHandle) => void;
+  let startRunEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { startRunEntered = resolve; });
+  let complete!: (event: NormalizedCodexEvent) => void;
+  const completed = new Promise<NormalizedCodexEvent>((resolve) => { complete = resolve; });
+  const interrupts: string[] = [];
+  const terminal: string[] = [];
+  let reachTerminal!: () => void;
+  const terminalReached = new Promise<void>((resolve) => { reachTerminal = resolve; });
+  const controller = new CodexRunController(database, new EventHub(), () => ({
+    initialize: async () => undefined,
+    startRun: async () => {
+      startRunEntered();
+      return new Promise<CodexRunHandle>((resolve) => { provideHandle = resolve; });
+    },
+    steer: async () => undefined,
+    interrupt: async (threadId, turnId) => {
+      interrupts.push(`${threadId}:${turnId}`);
+      complete(codexEvent("turn.interrupted", "Turn interrupted", "turn/completed", { turn: { id: turnId, status: "interrupted" } }));
+    },
+    close: async () => undefined
+  }), async (id) => { terminal.push(id); reachTerminal(); });
+  try {
+    const starting = controller.start(runId, home);
+    await entered;
+    await controller.interrupt(runId, "cancel");
+    provideHandle({ threadId: "thread-starting", turnId: "turn-starting", completed });
+    await starting;
+    await terminalReached;
+    assert.deepEqual(interrupts, ["thread-starting:turn-starting"]);
+    assert.deepEqual(terminal, [runId]);
+  } finally {
+    await controller.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("does not steer an @Agent image already included in the initial Run snapshot", async () => {
   const home = await mkdtemp(join(tmpdir(), "project-workshop-preparing-run-initial-image-"));
   const database = await openWorkshopDatabase(home);
@@ -412,6 +662,71 @@ test("does not steer an @Agent image already included in the initial Run snapsho
     database.close();
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("restores pending approvals and Coordinator state when interrupting Codex fails", async () => {
+  const fixture = await runFixture({ interrupt: async () => { throw new Error("interrupt failed"); } });
+  try {
+    const approvalId = randomUUID();
+    const commissionId = (fixture.database.prepare("SELECT commission_id FROM runs WHERE id = ?").get(fixture.runId) as { commission_id: string }).commission_id;
+    fixture.database.prepare("INSERT INTO approvals (id, run_id, codex_request_id, kind, request_json, status, created_at) VALUES (?, ?, 'request-failed-interrupt', 'command', '{}', 'pending', ?)")
+      .run(approvalId, fixture.runId, new Date().toISOString());
+    fixture.database.prepare("UPDATE runs SET status = 'waiting_approval', trigger_type = 'coordinate' WHERE id = ?").run(fixture.runId);
+    fixture.database.prepare("UPDATE commissions SET coordination_pending = 1 WHERE id = ?").run(commissionId);
+
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${fixture.taskId}/cancel` })).statusCode, 500);
+    assert.deepEqual({ ...fixture.database.prepare("SELECT status, finished_at FROM runs WHERE id = ?").get(fixture.runId) }, { status: "waiting_approval", finished_at: null });
+    assert.deepEqual({ ...fixture.database.prepare("SELECT status, decided_at FROM approvals WHERE id = ?").get(approvalId) }, { status: "pending", decided_at: null });
+    assert.equal((fixture.database.prepare("SELECT coordination_pending FROM commissions WHERE id = ?").get(commissionId) as { coordination_pending: number }).coordination_pending, 1);
+  } finally { await fixture.close(); }
+});
+
+test("keeps a Run cancelled when Codex initialization later fails", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-initialize-cancel-"));
+  const database = await openWorkshopDatabase(home);
+  const { taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  let enteredInitialize!: () => void;
+  let rejectInitialize!: (error: Error) => void;
+  const initializeEntered = new Promise<void>((resolve) => { enteredInitialize = resolve; });
+  const initializing = new Promise<void>((_resolve, reject) => { rejectInitialize = reject; });
+  const hub = new EventHub();
+  const controller = new CodexRunController(database, hub, () => ({
+    initialize: async () => { enteredInitialize(); await initializing; },
+    startRun: async () => ({ threadId: "unused", turnId: "unused", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
+    steer: async () => undefined,
+    interrupt: async () => undefined,
+    close: async () => undefined
+  }));
+  const server = Fastify();
+  registerRunRoutes(server, database, controller, hub);
+  try {
+    const starting = controller.start(runId, home);
+    await initializeEntered;
+    assert.equal((await server.inject({ method: "POST", url: `/api/tasks/${taskId}/cancel` })).json().status, "cancelled");
+    rejectInitialize(new Error("initialize failed"));
+    await assert.rejects(starting, /initialize failed/);
+    assert.deepEqual({ ...database.prepare("SELECT status, failure_summary FROM runs WHERE id = ?").get(runId) }, { status: "cancelled", failure_summary: null });
+  } finally {
+    await controller.close();
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("releases claimed attachments when cancelling a queued Run", async () => {
+  const fixture = await runFixture();
+  try {
+    const commissionId = (fixture.database.prepare("SELECT commission_id FROM tasks WHERE id = ?").get(fixture.taskId) as { commission_id: string }).commission_id;
+    const attachment = await storeAttachment(fixture.database, join(fixture.home, "attachments"), { commissionId, taskId: fixture.taskId, originalName: "queued.txt", mediaType: "text/plain", data: Buffer.from("queued") });
+    fixture.database.prepare("UPDATE runs SET status = 'queued', started_at = NULL WHERE id = ?").run(fixture.runId);
+    fixture.database.prepare("UPDATE attachments SET run_id = ? WHERE id = ?").run(fixture.runId, attachment.id);
+
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${fixture.taskId}/cancel` })).json().status, "cancelled");
+    assert.equal((fixture.database.prepare("SELECT run_id FROM attachments WHERE id = ?").get(attachment.id) as { run_id: string | null }).run_id, null);
+  } finally { await fixture.close(); }
 });
 
 test("serves run details and executes steer, approval, pause, resume, interrupt, and cancel controls", async () => {
@@ -460,6 +775,12 @@ test("serves run details and executes steer, approval, pause, resume, interrupt,
     assert.equal((await fixture.server.inject({ method: "POST", url: `/api/runs/${interruptRunId}/interrupt` })).json().status, "cancelled");
     const cancelRunId = seedRun(fixture.database, fixture.taskId, 3);
     assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${fixture.taskId}/cancel` })).json().status, "cancelled");
+    const queuedRunId = seedRun(fixture.database, fixture.taskId, 4);
+    fixture.database.prepare("UPDATE runs SET status = 'queued' WHERE id = ?").run(queuedRunId);
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${fixture.taskId}/cancel` })).json().status, "cancelled");
+    const queuedInterruptRunId = seedRun(fixture.database, fixture.taskId, 5);
+    fixture.database.prepare("UPDATE runs SET status = 'queued' WHERE id = ?").run(queuedInterruptRunId);
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/runs/${queuedInterruptRunId}/interrupt` })).json().status, "cancelled");
 
     assert.deepEqual(calls, [
       `steer:${fixture.runId}:Check Windows too`,

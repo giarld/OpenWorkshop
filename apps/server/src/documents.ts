@@ -56,8 +56,8 @@ export function generateAcceptanceDocuments(database: DatabaseSync, commissionId
   if (requirement) upsertGeneratedDocument(database, commission, "requirement", `${commission.title} requirement`, requirement.content_markdown, { requirementVersionId: commission.active_requirement_version_id });
 
   const tasks = database.prepare("SELECT number_path, title, status, blocked_reason, human_waiver_reason FROM tasks WHERE commission_id = ? AND archived_at IS NULL ORDER BY number_path").all(commissionId) as Array<Record<string, unknown>>;
-  const evidence = database.prepare("SELECT evidence.type, evidence.status, evidence.summary, evidence.payload_json FROM evidence JOIN tasks ON tasks.id = evidence.task_id WHERE tasks.commission_id = ? ORDER BY evidence.created_at").all(commissionId) as Array<Record<string, unknown>>;
-  const runs = database.prepare("SELECT role, status, failure_summary FROM runs WHERE commission_id = ? ORDER BY rowid").all(commissionId) as Array<Record<string, unknown>>;
+  const evidence = database.prepare("SELECT evidence.type, evidence.status, evidence.summary, evidence.payload_json FROM evidence JOIN tasks ON tasks.id = evidence.task_id WHERE tasks.commission_id = ? AND tasks.archived_at IS NULL ORDER BY evidence.created_at").all(commissionId) as Array<Record<string, unknown>>;
+  const runs = database.prepare("SELECT run.role, run.status, run.failure_summary FROM runs AS run JOIN tasks ON tasks.id = run.task_id WHERE run.commission_id = ? AND tasks.archived_at IS NULL ORDER BY run.rowid").all(commissionId) as Array<Record<string, unknown>>;
   const source = { commissionId, tasks, evidence, runs };
   const reviews = evidence.filter((item) => item.type === "review");
   const rejection = database.prepare("SELECT content FROM comments WHERE task_id = ? AND kind = 'rejection' ORDER BY created_at DESC, rowid DESC LIMIT 1").get(commission.main_task_id) as { content: string } | undefined;

@@ -2,14 +2,15 @@
 
 import {
   DndContext,
+  DragOverlay,
   KeyboardSensor,
   PointerSensor,
-  closestCenter,
   useDndContext,
   useDroppable,
   useSensor,
   useSensors,
-  type DragEndEvent
+  type DragEndEvent,
+  type DragStartEvent
 } from "@dnd-kit/core";
 import { SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
@@ -22,13 +23,15 @@ import { DeliveryWorkspace } from "./delivery-workspace";
 import { CommissionWorkspace } from "./commission-workspace";
 import { UsageStatisticsWorkspace } from "./usage-statistics-workspace";
 import { PROJECT_NAME_MAX_LENGTH, activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, initialWorkspaceView, isStaleWorkspaceHash, projectIdAfterArchive, projectNameError, projectRunLabels, workspaceContentState, type ManagedProject, type WorkspaceView } from "./project-management";
-import { clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, tokenPrice, tokenUsageTotals, upsertComment, type CodeChange, type MentionTrigger, type ReviewFinding, type RunEvent, type RunQuestion } from "./task-run";
+import { canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, taskLifecycleAction, tokenPrice, tokenUsageTotals, upsertComment, type CodeChange, type MentionTrigger, type ReviewFinding, type RunEvent, type RunQuestion } from "./task-run";
 import {
   TASK_STATUSES,
+  boardCollisionDetection,
   canDropTask,
   filterAndSortTasks,
   preferredProjectId,
   taskChildren,
+  taskDropPreview,
   taskSwimlaneGroups,
   taskSwimlanes,
   treeRoots,
@@ -42,10 +45,12 @@ import {
 type Project = ManagedProject;
 type RootPath = { id: string; path: string; real_path: string };
 type Commission = { id: string; title: string; status: string };
-type Run = { id: string; task_id: string; role: string; status: string; attempt_no: number; started_at: string | null; finished_at: string | null; failure_summary: string | null; token_input: number | null; token_output: number | null; token_cached: number | null; configSnapshot?: { model?: string } };
+type Run = { id: string; task_id: string; role: string; trigger_type: string; status: string; attempt_no: number; started_at: string | null; finished_at: string | null; failure_summary: string | null; token_input: number | null; token_output: number | null; token_cached: number | null; configSnapshot?: { model?: string } };
+type TaskEvidence = { id: string; run_id: string | null; type: string; status: string; summary: string; payload_json: string; created_at: string };
 type TaskAttachment = { id: string; task_id: string; comment_id: string | null; run_id: string | null; original_name: string; media_type: string; size_bytes: number };
 type AttachmentUploadProgress = { phase: "uploading" | "complete"; current: number; total: number; fileName: string };
-type TaskComment = { id: string; task_id: string; parent_id: string | null; run_id: string | null; author_type: "human" | "agent" | "system"; agent_role: string | null; kind: string; content: string; created_at: string; deleted_at: string | null; attachments: TaskAttachment[] };
+type RevisionCard = { comment_id: string; interaction_type: "boolean" | "single_choice" | "multiple_choice" | "text"; purpose: "question" | "final_confirmation"; options: string[]; status: "pending" | "answered" | "superseded"; answer: Record<string, unknown> | null };
+type TaskComment = { id: string; task_id: string; parent_id: string | null; run_id: string | null; author_type: "human" | "agent" | "system"; agent_role: string | null; kind: string; content: string; created_at: string; deleted_at: string | null; attachments: TaskAttachment[]; revisionCard: RevisionCard | null };
 type CommentPostResponse = TaskComment & { agentMention?: { action: "steered" | "queued" | "triggered" | "unavailable"; message?: string } };
 type View = WorkspaceView;
 type BoardView = "board" | "list";
@@ -81,6 +86,8 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
   const [projectId, setProjectId] = useState("");
   const [projectCommissions, setProjectCommissions] = useState<Commission[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [historyTasks, setHistoryTasks] = useState<Task[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [view, setView] = useState<View>("commissions");
   const [viewLoaded, setViewLoaded] = useState(false);
   const [boardView, setBoardView] = useState<BoardView>("board");
@@ -88,26 +95,22 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
   const [descending, setDescending] = useState(false);
   const [filters, setFilters] = useState<TaskFilters>(EMPTY_FILTERS);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set([ARCHIVED_SWIMLANE_ID]));
-  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [message, setMessage] = useState("");
   const [associationError, setAssociationError] = useState("");
-  const [taskCreationError, setTaskCreationError] = useState("");
   const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [loading, setLoading] = useState(true);
   const [taskDialogTask, setTaskDialogTask] = useState<Task | null>(null);
-  const [propertyTask, setPropertyTask] = useState<Task | null>(null);
-  const [propertyBusy, setPropertyBusy] = useState(false);
-  const [propertyError, setPropertyError] = useState("");
   const [managedProject, setManagedProject] = useState<Project | null>(null);
   const [projectManagementBusy, setProjectManagementBusy] = useState(false);
   const [projectManagementError, setProjectManagementError] = useState("");
   const [taskRuns, setTaskRuns] = useState<Run[]>([]);
   const [taskTokenRuns, setTaskTokenRuns] = useState<Run[]>([]);
+  const [taskEvidence, setTaskEvidence] = useState<TaskEvidence[]>([]);
   const [taskRunEvents, setTaskRunEvents] = useState<Record<string, RunEvent[]>>({});
   const [taskBusy, setTaskBusy] = useState(false);
   const [notificationTarget, setNotificationTarget] = useState<{ entityType: "task" | "approval"; entityId: string; projectId: string | null } | null>(null);
   const taskDialog = useRef<HTMLDialogElement>(null);
-  const propertyDialog = useRef<HTMLDialogElement>(null);
+  const historyDialog = useRef<HTMLDialogElement>(null);
   const projectManagementDialog = useRef<HTMLDialogElement>(null);
   const projectIdRef = useRef(projectId);
   const projectDataRequestGate = useRef(createProjectDataRequestGate()).current;
@@ -150,12 +153,6 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     if (taskDialogTask && element && !element.open) element.showModal();
     if (!taskDialogTask && element?.open) element.close();
   }, [taskDialogTask]);
-
-  useEffect(() => {
-    const element = propertyDialog.current;
-    if (propertyTask && element && !element.open) element.showModal();
-    if (!propertyTask && element?.open) element.close();
-  }, [propertyTask]);
 
   useEffect(() => {
     const element = projectManagementDialog.current;
@@ -225,74 +222,32 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     const status = (overId.startsWith("column:") ? overId.split(":").at(-1) : target?.status) as TaskStatus | undefined;
     if (!status) return;
     if (!canDropTask(task, status, tasks)) { setMessage("该任务不能进入目标列表。"); return; }
-    if (status === "archived") return void archiveTasks([task.id]);
+    if (status === "archived") return;
     if (status !== task.status) {
-      if (status === "in_progress" && task.owner_type === "ai") {
+      if (status === "in_progress") {
         const previous = tasks;
-        setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: "in_progress", latestRunStatus: "queued" } : item));
+        setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status } : item));
         setMessage("");
-        try { await triggerTask(task); await loadCurrentProjectTasks(); setMessage("任务已启动，Agent 正在接管执行。"); }
-        catch (error) { setTasks(previous); setMessage((error as Error).message); }
+        try {
+          await api(`/api/tasks/${task.id}/move`, { method: "POST", body: JSON.stringify({ status, boardMove: true }) });
+          await loadCurrentProjectTasks();
+          setMessage(task.parent_id === null || task.owner_type === "ai" ? "任务状态已更新，调度 Agent 正在分析并纠正。" : "任务状态已更新。");
+        } catch (error) {
+          await loadCurrentProjectTasks().catch(() => setTasks(previous));
+          setMessage((error as Error).message);
+        }
         return;
       }
-      return void mutateTask(task, "/move", { status }, { status });
+      const previous = tasks;
+      setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status, latestRunStatus: null } : item));
+      setMessage("");
+      try {
+        await api(`/api/tasks/${task.id}/move`, { method: "POST", body: JSON.stringify({ status, boardMove: true }) });
+        await loadCurrentProjectTasks();
+        setMessage("任务状态已更新，已有执行已停止。");
+      } catch (error) { await loadCurrentProjectTasks().catch(() => setTasks(previous)); setMessage((error as Error).message); }
+      return;
     }
-    if (sort === "manual" && target && target.id !== task.id && target.parent_id === task.parent_id) {
-      await mutateTask(task, "/reorder", { position: target.position });
-    }
-  }
-
-  async function mutateTask(task: Task, path: string, body: Record<string, unknown>, optimistic?: Partial<Task>) {
-    const previous = tasks;
-    if (optimistic) setTasks((current) => current.map((item) => item.id === task.id ? { ...item, ...optimistic } : item));
-    setMessage("");
-    try {
-      await api(`/api/tasks/${task.id}${path}`, { method: "POST", body: JSON.stringify(body) });
-      await loadCurrentProjectTasks();
-    } catch (error) {
-      setTasks(previous);
-      setMessage((error as Error).message);
-    }
-  }
-
-  async function archiveTasks(ids: string[]) {
-    const selectedIds = new Set(ids);
-    const eligible = tasks.filter((task) => selectedIds.has(task.id) && task.status === "done");
-    const ordered = eligible.filter((task) => {
-      let parentId = task.parent_id;
-      while (parentId) {
-        if (selectedIds.has(parentId)) return false;
-        parentId = tasks.find((item) => item.id === parentId)?.parent_id ?? null;
-      }
-      return true;
-    }).sort((a, b) => b.number_path.split(".").length - a.number_path.split(".").length);
-    if (!ordered.length) { setMessage("只有 Done 任务可以归档。"); return; }
-    const archivesTree = ordered.some((task) => !task.parent_id);
-    if (!window.confirm(archivesTree ? "归档主任务会同时归档其所有子任务，是否继续？" : `确认归档选中的 ${ordered.length} 个任务？`)) return;
-    setMessage("");
-    const failures: string[] = [];
-    const archived: Task[] = [];
-    for (const task of ordered) {
-      try { await api(`/api/tasks/${task.id}/archive`, { method: "POST" }); archived.push(task); }
-      catch (error) { failures.push(`${task.number_path} ${task.title}: ${(error as Error).message}`); }
-    }
-    setSelected(new Set());
-    if (taskDialogTask && archived.some((task) => task.id === taskDialogTask.id || (!task.parent_id && task.commission_id === taskDialogTask.commission_id))) setTaskDialogTask(null);
-    await loadCurrentProjectTasks();
-    setMessage(failures.length ? failures.join("；") : archivesTree ? "主任务及其全部子任务已归档。" : `已归档 ${archived.length} 个任务。`);
-  }
-
-  async function unarchiveTask(task: Task) {
-    const restoresTree = !task.parent_id;
-    if (!window.confirm(restoresTree ? "解除主任务归档会同时恢复其全部子任务，并统一回到 Done，是否继续？" : "解除该任务归档并恢复到 Done？")) return;
-    setTaskBusy(true); setMessage("");
-    try {
-      const restored = await api<Task>(`/api/tasks/${task.id}/unarchive`, { method: "POST" });
-      await loadCurrentProjectTasks();
-      setTaskDialogTask((current) => current?.id === restored.id ? restored : current);
-      setMessage(restoresTree ? "主任务及其全部子任务已解除归档并回到 Done。" : "任务已解除归档并回到 Done。");
-    } catch (error) { setMessage((error as Error).message); }
-    finally { setTaskBusy(false); }
   }
 
   function toggleCollapsed(id: string) {
@@ -306,9 +261,9 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     projectLoadingRequestGate.invalidate();
     setTasks([]);
     setProjectCommissions([]);
-    setSelected(new Set());
     setTaskDialogTask(null);
-    setPropertyTask(null);
+    historyDialog.current?.close();
+    setHistoryTasks([]);
     setMessage("");
     setLoading(Boolean(nextProjectId));
     setProjectId(nextProjectId);
@@ -377,30 +332,6 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     finally { setProjectManagementBusy(false); }
   }
 
-  async function createTask(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const data = new FormData(form);
-    const commissionId = String(data.get("commissionId") ?? "");
-    setMessage("");
-    setTaskCreationError("");
-    try {
-      await api(`/api/commissions/${commissionId}/tasks`, { method: "POST", body: JSON.stringify({
-        title: data.get("title"),
-        description: data.get("description"),
-        priority: data.get("priority"),
-        ownerType: data.get("ownerType"),
-        dueDate: data.get("dueDate") || null
-      }) });
-      await loadCurrentProjectTasks();
-      form.reset();
-      form.closest("details")?.removeAttribute("open");
-      setMessage("任务已创建并进入 Backlog。");
-    } catch (error) {
-      setTaskCreationError(`创建失败：${(error as Error).message}`);
-    }
-  }
-
   async function refreshProject() {
     const requestedProjectId = projectIdRef.current;
     if (requestedProjectId) await loadProjectSnapshot(requestedProjectId, false);
@@ -461,38 +392,31 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     setTaskDialogTask(task);
     setTaskRuns([]);
     setTaskTokenRuns([]);
+    setTaskEvidence([]);
     setTaskRunEvents({});
     await refreshTaskDialog(task.id, true);
   }
 
-  async function saveTaskProperties(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!propertyTask) return;
-    const data = new FormData(event.currentTarget);
-    setPropertyBusy(true);
-    setPropertyError("");
+  async function openHistory() {
+    const requestedProjectId = projectIdRef.current;
+    if (!requestedProjectId) return;
+    historyDialog.current?.showModal();
+    setHistoryLoading(true);
     try {
-      const updated = await api<Task>(`/api/tasks/${propertyTask.id}`, { method: "PUT", body: JSON.stringify({
-        ownerType: data.get("ownerType"),
-        priority: data.get("priority"),
-        dueDate: data.get("dueDate") || null,
-        autoApprovePermissions: data.get("autoApprovePermissions") === "on"
-      }) });
-      setTasks((current) => current.map((task) => task.id === updated.id ? updated : task));
-      setTaskDialogTask((current) => current?.id === updated.id ? updated : current);
-      setPropertyTask(null);
-      setMessage("任务属性已保存。");
-    } catch (error) { setPropertyError((error as Error).message); }
-    finally { setPropertyBusy(false); }
+      const nextTasks = await api<Task[]>(`/api/projects/${requestedProjectId}/task-history`);
+      if (requestedProjectId === projectIdRef.current) setHistoryTasks(nextTasks);
+    } catch (error) { setMessage((error as Error).message); }
+    finally { if (requestedProjectId === projectIdRef.current) setHistoryLoading(false); }
   }
 
   async function refreshTaskDialog(taskId: string, includeHistory = false) {
     try {
-      const tree = !tasks.find((task) => task.id === taskId)?.parent_id;
-      const [task, runs, tokenRuns] = await Promise.all([api<Task>(`/api/tasks/${taskId}`), api<Run[]>(`/api/tasks/${taskId}/runs`), tree ? api<Run[]>(`/api/tasks/${taskId}/runs?scope=tree`) : Promise.resolve(null)]);
+      const tree = (tasks.find((task) => task.id === taskId) ?? historyTasks.find((task) => task.id === taskId))?.parent_id === null;
+      const [task, runs, tokenRuns, evidence] = await Promise.all([api<Task>(`/api/tasks/${taskId}`), api<Run[]>(`/api/tasks/${taskId}/runs`), tree ? api<Run[]>(`/api/tasks/${taskId}/runs?scope=tree`) : Promise.resolve(null), api<TaskEvidence[]>(`/api/tasks/${taskId}/evidence`)]);
       setTaskDialogTask((current) => current?.id === taskId ? task : current);
       setTaskRuns(runs);
       setTaskTokenRuns(tokenRuns ?? runs);
+      setTaskEvidence(evidence);
       const targets = includeHistory ? runs : runs.slice(0, 1);
       const loaded = await Promise.all(targets.map(async (run) => [run.id, await api<RunEvent[]>(`/api/runs/${run.id}/events`)] as const));
       setTaskRunEvents((current) => Object.fromEntries([...Object.entries(includeHistory ? {} : current).filter(([id]) => runs.some((run) => run.id === id)), ...loaded]));
@@ -506,6 +430,24 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
       if (path === "trigger") await triggerTask(taskDialogTask);
       else await api(`/api/tasks/${taskDialogTask.id}/${path}`, { method: "POST" });
       await refreshProject(); await refreshTaskDialog(taskDialogTask.id); setMessage(success);
+    } catch (error) { setMessage((error as Error).message); }
+    finally { setTaskBusy(false); }
+  }
+
+  async function taskLifecycle(task: Task) {
+    const action = taskLifecycleAction(task.status);
+    if (!action) return;
+    const tree = task.parent_id === null;
+    const prompt = action === "archive"
+      ? tree ? "归档主任务会同时归档其所有子任务，是否继续？" : "归档该任务？"
+      : tree ? "解除主任务归档会同时恢复其全部子任务，并统一回到 Done，是否继续？" : "解除该任务归档并恢复到 Done？";
+    if (!window.confirm(prompt)) return;
+    setTaskBusy(true); setMessage("");
+    try {
+      await api(`/api/tasks/${task.id}/${action}`, { method: "POST" });
+      await refreshProject();
+      await refreshTaskDialog(task.id);
+      setMessage(action === "archive" ? tree ? "主任务及其全部子任务已归档。" : "任务已归档。" : tree ? "主任务及其全部子任务已解除归档并回到 Done。" : "任务已解除归档并回到 Done。");
     } catch (error) { setMessage((error as Error).message); }
     finally { setTaskBusy(false); }
   }
@@ -539,23 +481,6 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     </form>
   </details>;
 
-  const taskCommissions = projectCommissions.filter((commission) => ["planned", "backlog", "active", "paused", "blocked"].includes(commission.status));
-  const createTaskDialog = <details className="create-task">
-    <summary>创建任务</summary>
-    <form onSubmit={createTask}>
-      {taskCommissions.length ? <>
-        <label>委托<select name="commissionId" required>{taskCommissions.map((commission) => <option key={commission.id} value={commission.id}>{commission.title}</option>)}</select></label>
-        <label>标题<input name="title" required /></label>
-        <label>描述<textarea name="description" rows={3} /></label>
-        <label>优先级<select name="priority" defaultValue="none"><option value="none">无</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="urgent">紧急</option></select></label>
-        <label>负责人<select name="ownerType" defaultValue="ai"><option value="ai">AI</option><option value="human">人工</option></select></label>
-        <label>截止日期<input name="dueDate" type="date" /></label>
-        {taskCreationError && <p className="workspace-message" role="alert">{taskCreationError}</p>}
-        <div className="dialog-actions"><button type="button" className="secondary" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>取消</button><button type="submit">创建</button></div>
-      </> : <><p>暂无可创建任务的已批准委托，请先完成委托需求批准。</p><button type="button" className="secondary" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>关闭</button></>}
-    </form>
-  </details>;
-
   const contentState = workspaceContentState(view, loading);
 
   if (loading && !projects.length) return <section className="task-workspace" aria-label="任务工作区">
@@ -576,7 +501,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
       {header}
       <div className="project-bar">
         <div className="project-picker"><label>当前项目<select value={projectId} onChange={(event) => selectProject(event.target.value)}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label><p>{loading ? "正在加载项目数据…" : `${overview.total} 个未归档任务 · ${projectCommissions.length} 个委托`}</p></div>
-        <div className="project-actions">{!loading && createTaskDialog}{associate}</div>
+        <div className="project-actions">{associate}</div>
       </div>
       <section className="workspace-content" id="workspace-content" tabIndex={-1}>
         {message && <p className="workspace-message" role="status">{message}</p>}
@@ -597,12 +522,13 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
           <label>标签<select value={filters.label} onChange={(event) => setFilters({ ...filters, label: event.target.value })}><option value="">全部</option>{labels.map((label) => <option key={label}>{label}</option>)}</select></label>
           <label>委托<select value={filters.commission} onChange={(event) => setFilters({ ...filters, commission: event.target.value })}><option value="">全部</option>{commissions.map((id) => <option key={id} value={id}>{id.slice(0, 8)}</option>)}</select></label>
           <button className="secondary compact" onClick={() => setFilters(EMPTY_FILTERS)}>清除筛选</button>
-        </div>{boardView === "board" ? <TaskBoard tasks={tasks} visibleTasks={visibleTasks} commissionTitles={commissionTitles} collapsed={collapsed} manual={sort === "manual"} sensors={sensors} onDragEnd={handleDragEnd} onToggle={toggleCollapsed} onOpen={openTask} /> : <TaskList tasks={visibleTasks} collapsed={collapsed} selected={selected} onToggle={toggleCollapsed} onSelect={setSelected} onArchive={(ids) => archiveTasks(ids)} onUnarchive={unarchiveTask} onOpen={openTask} />}</>}
+          <button className="secondary compact history-task-trigger" onClick={() => void openHistory()}>历史任务</button>
+        </div>{boardView === "board" ? <TaskBoard tasks={tasks} visibleTasks={visibleTasks} commissionTitles={commissionTitles} collapsed={collapsed} manual={sort === "manual"} sensors={sensors} onDragEnd={handleDragEnd} onToggle={toggleCollapsed} onOpen={openTask} /> : <TaskList tasks={visibleTasks} collapsed={collapsed} onToggle={toggleCollapsed} onOpen={openTask} />}</>}
         </>}
       </section>
     </div>
-    <TaskRunDialog dialog={taskDialog} task={taskDialogTask} tasks={tasks} runs={taskRuns} tokenRuns={taskTokenRuns} eventsByRun={taskRunEvents} busy={taskBusy} message={message} onClose={() => setTaskDialogTask(null)} onOpenTask={openTask} onProperties={(task) => { setPropertyError(""); setPropertyTask(task); }} onArchive={(task) => archiveTasks([task.id])} onUnarchive={unarchiveTask} onAction={taskAction} onAnswer={answerRunInput} onApprovals={() => { setTaskDialogTask(null); setView("notifications"); }} />
-    <TaskPropertyDialog dialog={propertyDialog} task={propertyTask} busy={propertyBusy} error={propertyError} onClose={() => setPropertyTask(null)} onSubmit={saveTaskProperties} />
+    <TaskRunDialog dialog={taskDialog} task={taskDialogTask} tasks={[...tasks, ...historyTasks]} runs={taskRuns} tokenRuns={taskTokenRuns} evidence={taskEvidence} eventsByRun={taskRunEvents} busy={taskBusy} message={message} onClose={() => setTaskDialogTask(null)} onOpenTask={openTask} onAction={taskAction} onLifecycle={taskLifecycle} onAnswer={answerRunInput} onApprovals={() => { setTaskDialogTask(null); setView("notifications"); }} />
+    <HistoryTasksDialog dialog={historyDialog} tasks={historyTasks} commissions={commissionTitles} loading={historyLoading} onOpen={openTask} />
     <ProjectManagementDialog dialog={projectManagementDialog} project={managedProject} busy={projectManagementBusy} error={projectManagementError} onClose={() => setManagedProject(null)} onSubmit={saveManagedProject} onArchive={archiveManagedProject} />
   </section>;
 }
@@ -671,13 +597,17 @@ function WorkspaceOverview({ total, completed, running, attention, completion }:
 }
 
 function TaskBoard({ tasks, visibleTasks, commissionTitles, collapsed, manual, sensors, onDragEnd, onToggle, onOpen }: { tasks: Task[]; visibleTasks: Task[]; commissionTitles: Map<string, string>; collapsed: Set<string>; manual: boolean; sensors: ReturnType<typeof useSensors>; onDragEnd(event: DragEndEvent): void; onToggle(id: string): void; onOpen(task: Task): void }) {
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [overlayWidth, setOverlayWidth] = useState<number | null>(null);
   const lanes = taskSwimlaneGroups(tasks, visibleTasks);
   const cards = [...lanes.active, ...lanes.archived].flatMap((lane) => lane.tasks);
+  const activeTask = activeId ? tasks.find((task) => task.id === activeId) ?? null : null;
   const archiveGroupCollapsed = collapsed.has(ARCHIVED_SWIMLANE_ID);
   const dragging = useRef(false);
-  const finishDrag = (event?: DragEndEvent) => { if (event) onDragEnd(event); window.setTimeout(() => { dragging.current = false; }, 0); };
+  const finishDrag = (event?: DragEndEvent) => { if (event) onDragEnd(event); setActiveId(null); setOverlayWidth(null); window.setTimeout(() => { dragging.current = false; }, 0); };
+  const startDrag = (event: DragStartEvent) => { dragging.current = true; setActiveId(String(event.active.id)); setOverlayWidth(event.active.rect.current.initial?.width ?? null); };
   const openCard = (task: Task) => { if (!dragging.current) onOpen(task); };
-  return <DndContext sensors={sensors} collisionDetection={closestCenter} onDragStart={() => { dragging.current = true; }} onDragEnd={finishDrag} onDragCancel={() => finishDrag()}>
+  return <DndContext sensors={sensors} collisionDetection={boardCollisionDetection} onDragStart={startDrag} onDragEnd={finishDrag} onDragCancel={() => finishDrag()}>
     <div className="swimlane-board">
       <div className="swimlane-statuses">{TASK_STATUSES.map((status) => <div key={status} className={`status-${status}`}><strong>{STATUS_LABELS[status]}</strong><span>{cards.filter((task) => task.status === status).length}</span></div>)}</div>
       {lanes.active.map((lane) => <TaskSwimlane key={lane.root.id} lane={lane} title={commissionTitles.get(lane.root.commission_id) ?? lane.root.title} collapsed={collapsed} manual={manual} onToggle={onToggle} onOpen={openCard} />)}
@@ -693,6 +623,7 @@ function TaskBoard({ tasks, visibleTasks, commissionTitles, collapsed, manual, s
         </div>}
       </section>
     </div>
+    <DragOverlay>{activeTask && <article className="task-card task-card-overlay" style={overlayWidth ? { width: overlayWidth } : undefined}><TaskCardContent task={activeTask} /></article>}</DragOverlay>
   </DndContext>;
 }
 
@@ -718,10 +649,12 @@ function SwimlaneColumn({ rootId, status, tasks, manual, onOpen }: { rootId: str
   const overTask = drag.over?.data.current?.task as Task | undefined;
   const active = isOver || Boolean(overTask && overTask.status === status && tasks.some((task) => task.id === overTask.id));
   const valid = !dragged || canDropTask(dragged, status, tasks);
+  const preview = active && tasks.some((task) => task.id === dragged?.id) ? taskDropPreview(dragged, status, tasks) : null;
   return <section ref={setNodeRef} className={`swimlane-column status-${status} ${active ? `drop-active ${valid ? "drop-valid" : "drop-invalid"}` : ""}`} aria-label={`${STATUS_LABELS[status]} 列`}>
     <SortableContext items={columnTasks.map((task) => task.id)} strategy={verticalListSortingStrategy}>
       {columnTasks.map((task) => <TaskCard key={task.id} task={task} manual={manual} onOpen={onOpen} />)}
-      {!columnTasks.length && <p className="drop-hint">拖到此列</p>}
+      {preview && <article className="task-card task-card-drop-preview" aria-hidden="true"><TaskCardContent task={preview} /></article>}
+      {!columnTasks.length && !preview && <p className="drop-hint">拖到此列</p>}
     </SortableContext>
   </section>;
 }
@@ -734,48 +667,53 @@ function TaskCard({ task, manual, onOpen }: { task: Task; manual: boolean; onOpe
   const sortable = useSortable({ id: task.id, disabled: task.status === "archived", data: { task } });
   const style = { transform: CSS.Transform.toString(sortable.transform), transition: sortable.transition };
   return <article ref={sortable.setNodeRef} style={style} className={`task-card ${sortable.isDragging ? "dragging" : ""}`} id={`task-${task.id}`} {...sortable.attributes} {...sortable.listeners} onClick={(event) => { const target = event.target as HTMLElement; if (target.closest(".task-card") === event.currentTarget && !target.closest("button, input, select, textarea, a")) onOpen(task); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === "Enter") { event.preventDefault(); onOpen(task); } }} title={manual ? "单击查看详情，按住后拖动任务" : "单击查看详情，按住后跨列移动"}>
+    <TaskCardContent task={task} />
+  </article>;
+}
+
+function TaskCardContent({ task }: { task: Task }) {
+  return <>
     <div className="task-card-heading">
       <div><strong><TaskTitle task={task} /></strong><p>{task.description || "无描述"}</p></div>
     </div>
     <TaskMeta task={task} />
-  </article>;
-}
-
-function TaskPropertyDialog({ dialog, task, busy, error, onClose, onSubmit }: { dialog: React.RefObject<HTMLDialogElement | null>; task: Task | null; busy: boolean; error: string; onClose(): void; onSubmit(event: FormEvent<HTMLFormElement>): Promise<void> }) {
-  return <dialog ref={dialog} className="commission-dialog task-property-dialog" onClose={onClose}>
-    <header className="commission-dialog-header"><div><p className="eyebrow">Task Properties</p><h2>任务属性</h2>{task && <p><TaskTitle task={task} /></p>}</div><button type="button" className="secondary dialog-close" onClick={onClose}>关闭</button></header>
-    {task && <form key={task.id} className="commission-dialog-body commission-form" onSubmit={(event) => void onSubmit(event)}>
-      <label>负责人<select name="ownerType" defaultValue={task.owner_type}><option value="ai">AI</option><option value="human">人工</option></select></label>
-      <label>优先级<select name="priority" defaultValue={task.priority}><option value="none">无</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="urgent">紧急</option></select></label>
-      <label>截止日期<input name="dueDate" type="date" defaultValue={task.due_date ?? ""} /></label>
-      <label className="task-permission-option"><span><input name="autoApprovePermissions" type="checkbox" defaultChecked={Boolean(task.auto_approve_permissions)} />自动审批 Agent 沙盒权限请求</span><small>仅自动批准沙盒权限；命令、文件修改和高风险操作仍需人工审批。</small></label>
-      {error && <p className="workspace-message" role="alert">保存失败：{error}</p>}
-      <div className="dialog-actions"><button type="button" className="secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" disabled={busy}>{busy ? "保存中…" : "保存属性"}</button></div>
-    </form>}
-  </dialog>;
-}
-
-function TaskList({ tasks, collapsed, selected, onToggle, onSelect, onArchive, onUnarchive, onOpen }: { tasks: Task[]; collapsed: Set<string>; selected: Set<string>; onToggle(id: string): void; onSelect(value: Set<string>): void; onArchive(ids: string[]): void; onUnarchive(task: Task): void; onOpen(task: Task): void }) {
-  const rows = treeRoots(tasks);
-  return <div className="list-view">
-    <div className="bulk-bar"><span>已选择 {selected.size} 项</span><button disabled={!selected.size} onClick={() => onArchive([...selected])}>批量归档</button></div>
-    <div className="task-table" role="treegrid"><div className="task-row task-row-head"><span>任务</span><span>状态</span><span>负责人</span><span>优先级</span><span>操作</span></div>{rows.map((task) => <TaskRow key={task.id} task={task} tasks={tasks} depth={0} collapsed={collapsed} selected={selected} onToggle={onToggle} onSelect={onSelect} onArchive={onArchive} onUnarchive={onUnarchive} onOpen={onOpen} />)}</div>
-  </div>;
-}
-
-function TaskRow({ task, tasks, depth, collapsed, selected, onToggle, onSelect, onArchive, onUnarchive, onOpen }: { task: Task; tasks: Task[]; depth: number; collapsed: Set<string>; selected: Set<string>; onToggle(id: string): void; onSelect(value: Set<string>): void; onArchive(ids: string[]): void; onUnarchive(task: Task): void; onOpen(task: Task): void }) {
-  const children = taskChildren(tasks, task.id);
-  return <>
-    <div className="task-row" role="row" style={{ "--depth": depth } as React.CSSProperties}>
-      <span className="task-name"><input type="checkbox" checked={selected.has(task.id)} disabled={task.status !== "done"} onChange={(event) => { const next = new Set(selected); if (event.target.checked) next.add(task.id); else next.delete(task.id); onSelect(next); }} aria-label={`选择 ${task.title}`} />{children.length ? <button className="icon-button" onClick={() => onToggle(task.id)}>{collapsed.has(task.id) ? "▸" : "▾"}</button> : <span className="indent-spacer" />}<strong><TaskTitle task={task} /></strong></span>
-      <span><i className={`status-dot status-${task.status}`} />{STATUS_LABELS[task.status]}</span><span>{task.owner_type === "human" ? "人工" : "AI"}</span><span>{task.priority}</span><span className="task-row-actions"><button className="secondary compact" onClick={() => onOpen(task)}>查看与推进</button>{task.status === "done" && <button className="secondary compact" onClick={() => onArchive([task.id])}>归档</button>}{task.status === "archived" && <button className="secondary compact" onClick={() => onUnarchive(task)}>解除归档</button>}</span>
-    </div>
-    {!collapsed.has(task.id) && children.map((child) => <TaskRow key={child.id} task={child} tasks={tasks} depth={depth + 1} collapsed={collapsed} selected={selected} onToggle={onToggle} onSelect={onSelect} onArchive={onArchive} onUnarchive={onUnarchive} onOpen={onOpen} />)}
   </>;
 }
 
-function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, eventsByRun, busy, message, onClose, onOpenTask, onProperties, onArchive, onUnarchive, onAction, onAnswer, onApprovals }: { dialog: React.RefObject<HTMLDialogElement | null>; task: Task | null; tasks: Task[]; runs: Run[]; tokenRuns: Run[]; eventsByRun: Record<string, RunEvent[]>; busy: boolean; message: string; onClose(): void; onOpenTask(task: Task): Promise<void>; onProperties(task: Task): void; onArchive(task: Task): void; onUnarchive(task: Task): void; onAction(path: "trigger" | "pause" | "resume" | "cancel", success: string): Promise<void>; onAnswer(event: FormEvent<HTMLFormElement>, requestId: string, questions: RunQuestion[]): Promise<void>; onApprovals(): void }) {
-  const [activeTab, setActiveTab] = useState<"comments" | "runs" | "changes">("comments");
+function HistoryTasksDialog({ dialog, tasks, commissions, loading, onOpen }: { dialog: React.RefObject<HTMLDialogElement | null>; tasks: Task[]; commissions: Map<string, string>; loading: boolean; onOpen(task: Task): void }) {
+  const [search, setSearch] = useState("");
+  const [commission, setCommission] = useState("");
+  const visible = tasks.filter((task) => (!commission || task.commission_id === commission) && `${task.number_path} ${task.title} ${task.description} ${task.deleted_reason ?? ""}`.toLocaleLowerCase().includes(search.toLocaleLowerCase()));
+  return <dialog ref={dialog} className="commission-dialog history-task-dialog">
+    <header className="commission-dialog-header"><div><p className="eyebrow">Task History</p><h2>历史任务</h2><p>计划修订中删除的任务仅供查阅，不参与后续执行。</p></div><button type="button" className="secondary dialog-close" onClick={() => dialog.current?.close()}>关闭</button></header>
+    <section className="commission-dialog-body history-task-page"><div className="filters"><label>搜索<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="标题、描述或删除原因" /></label><label>委托<select value={commission} onChange={(event) => setCommission(event.target.value)}><option value="">全部</option>{[...new Set(tasks.map((task) => task.commission_id))].map((id) => <option key={id} value={id}>{commissions.get(id) ?? id.slice(0, 8)}</option>)}</select></label></div>
+    <div className="task-table history-task-table" role="table"><div className="task-row task-row-head"><span>任务</span><span>所属委托</span><span>删除原因</span><span>删除时间</span><span>发起修订</span><span>操作</span></div>{visible.map((task) => <div className="task-row" role="row" key={task.id}>
+      <span className="task-name"><strong>{task.number_path} {task.title}</strong></span><span>{commissions.get(task.commission_id) ?? task.commission_id.slice(0, 8)}</span><span>{task.deleted_reason || "未记录"}</span><span>{task.deleted_at ? new Date(task.deleted_at).toLocaleString() : "-"}</span><span>{task.deleted_revision_id ? <code title={task.deleted_revision_id}>{task.deleted_revision_id.slice(0, 8)}</code> : "-"}</span><span><button className="secondary compact" onClick={() => onOpen(task)}>查看历史</button></span>
+    </div>)}</div>{loading ? <p className="task-tab-empty">正在加载历史任务…</p> : !visible.length && <p className="task-tab-empty">暂无符合条件的历史任务。</p>}
+    </section>
+  </dialog>;
+}
+
+function TaskList({ tasks, collapsed, onToggle, onOpen }: { tasks: Task[]; collapsed: Set<string>; onToggle(id: string): void; onOpen(task: Task): void }) {
+  const rows = treeRoots(tasks);
+  return <div className="list-view">
+    <div className="task-table" role="treegrid"><div className="task-row task-row-head"><span>任务</span><span>状态</span><span>负责人</span><span>优先级</span><span>操作</span></div>{rows.map((task) => <TaskRow key={task.id} task={task} tasks={tasks} depth={0} collapsed={collapsed} onToggle={onToggle} onOpen={onOpen} />)}</div>
+  </div>;
+}
+
+function TaskRow({ task, tasks, depth, collapsed, onToggle, onOpen }: { task: Task; tasks: Task[]; depth: number; collapsed: Set<string>; onToggle(id: string): void; onOpen(task: Task): void }) {
+  const children = taskChildren(tasks, task.id);
+  return <>
+    <div className="task-row" role="row" style={{ "--depth": depth } as React.CSSProperties}>
+      <span className="task-name">{children.length ? <button className="icon-button" onClick={() => onToggle(task.id)}>{collapsed.has(task.id) ? "▸" : "▾"}</button> : <span className="indent-spacer" />}<strong><TaskTitle task={task} /></strong></span>
+      <span><i className={`status-dot status-${task.status}`} />{STATUS_LABELS[task.status]}</span><span>{task.owner_type === "human" ? "人工" : "AI"}</span><span>{task.priority}</span><span className="task-row-actions"><button className="secondary compact" onClick={() => onOpen(task)}>查看与推进</button></span>
+    </div>
+    {!collapsed.has(task.id) && children.map((child) => <TaskRow key={child.id} task={child} tasks={tasks} depth={depth + 1} collapsed={collapsed} onToggle={onToggle} onOpen={onOpen} />)}
+  </>;
+}
+
+function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsByRun, busy, message, onClose, onOpenTask, onAction, onLifecycle, onAnswer, onApprovals }: { dialog: React.RefObject<HTMLDialogElement | null>; task: Task | null; tasks: Task[]; runs: Run[]; tokenRuns: Run[]; evidence: TaskEvidence[]; eventsByRun: Record<string, RunEvent[]>; busy: boolean; message: string; onClose(): void; onOpenTask(task: Task): Promise<void>; onAction(path: "trigger" | "pause" | "resume" | "cancel", success: string): Promise<void>; onLifecycle(task: Task): Promise<void>; onAnswer(event: FormEvent<HTMLFormElement>, requestId: string, questions: RunQuestion[]): Promise<void>; onApprovals(): void }) {
+  const [activeTab, setActiveTab] = useState<"comments" | "runs" | "evidence" | "changes">("comments");
   const [openRunIds, setOpenRunIds] = useState<Set<string>>(new Set());
   const [comments, setComments] = useState<TaskComment[]>([]);
   const [commentsLoaded, setCommentsLoaded] = useState(false);
@@ -805,6 +743,7 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, eventsByRun, busy
   const questions = runQuestions(inputEvent);
   const requestId = String(inputEvent?.payload.requestId ?? "");
   const codeChanges = runs.flatMap((run, index) => runCodeChanges(eventsByRun[run.id] ?? []).map((change) => ({ run, change, current: index === 0 })));
+  const lifecycleAction = task ? taskLifecycleAction(task.status, Boolean(task.deleted_at)) : null;
   async function submitComment(event: FormEvent<HTMLFormElement>): Promise<boolean> {
     event.preventDefault();
     if (!task) return false;
@@ -833,20 +772,30 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, eventsByRun, busy
       setComments((current) => current.map((item) => item.id === comment.id ? { ...item, content: "", deleted_at: new Date().toISOString() } : item));
     } catch (error) { setCommentError((error as Error).message); }
   }
+  async function respondRevisionCard(comment: TaskComment, answer: string | string[]) {
+    if (!task) return;
+    setCommentBusy(true); setCommentError("");
+    try {
+      const response = await api<CommentPostResponse>(`/api/tasks/${task.id}/comments/${comment.id}/respond`, { method: "POST", body: JSON.stringify({ answer }) });
+      setComments(await api<TaskComment[]>(`/api/tasks/${task.id}/comments`));
+      if (response.agentMention?.action === "unavailable") setCommentError(`回答已保存，但 Agent 未响应：${response.agentMention.message ?? "当前不可用"}`);
+    } catch (error) { setCommentError((error as Error).message); }
+    finally { setCommentBusy(false); }
+  }
   return <dialog ref={dialog} className="commission-dialog task-run-dialog" onClose={onClose}>
-    <header className="commission-dialog-header"><div><p className="eyebrow">Task Execution</p><h2>任务运行</h2>{task && <p><TaskTitle task={task} /></p>}</div><div className="task-run-header-actions">{task && task.status !== "archived" && <button className="secondary" onClick={() => onProperties(task)}>任务属性</button>}<button className="secondary dialog-close" onClick={onClose}>关闭</button></div></header>
+    <header className="commission-dialog-header"><div><p className="eyebrow">Task Execution</p><h2>任务运行</h2>{task && <p><TaskTitle task={task} /></p>}</div><div className="task-run-header-actions"><button className="secondary dialog-close" onClick={onClose}>关闭</button></div></header>
     {task && <div className="task-run-layout commission-dialog-body">
     <main className="task-run-content">
-      <div className="task-run-summary"><span className={`status-pill status-${task.status}`}>{STATUS_LABELS[task.status]}</span><span>{task.owner_type === "human" ? "人工任务" : "AI 任务"}</span><span>{latest ? `Run #${latest.attempt_no} · ${latest.role} · ${latest.status}` : "尚未运行"}</span>{latest && active && <RunElapsedTimer run={latest} />}</div>
+      <div className="task-run-summary"><span>{latest ? `Run #${latest.attempt_no} · ${latest.role} · ${latest.status}` : "尚未运行"}</span>{latest && active && <RunElapsedTimer run={latest} />}</div>
       <TaskTokenSummary runs={tokenRuns} tree={!task.parent_id} />
-      <p>{task.description || "无任务描述。"}</p>
+      {lifecycleAction && <div className="task-run-actions"><button className="secondary" disabled={busy} onClick={() => void onLifecycle(task)}>{lifecycleAction === "archive" ? task.parent_id ? "归档任务" : "归档任务组" : task.parent_id ? "解除归档" : "解除任务组归档"}</button></div>}
+      <TaskReadonlyProperties task={task} tasks={tasks} />
       <div className="task-run-actions">
-        {!active && latest?.status === "interrupted" && <button disabled={busy} onClick={() => void onAction("resume", "任务已恢复执行。")}>恢复执行</button>}
+        {!active && canResumeTaskRun(task.status, latest) && <button disabled={busy} onClick={() => void onAction("resume", "任务已恢复执行。")}>恢复执行</button>}
         {!active && canTrigger && <button disabled={busy} onClick={() => void onAction("trigger", task.parent_id ? "任务已启动。" : "已触发当前可运行的子任务。")}>{task.status === "blocked" ? "重新执行" : !task.parent_id && task.status === "in_progress" ? "继续执行" : "启动执行"}</button>}
-        {controllable && <><button disabled={busy} onClick={() => void onAction("pause", "任务已暂停，可稍后恢复。")}>暂停</button><button className="secondary" disabled={busy} onClick={() => void onAction("cancel", "当前 Run 已取消。")}>取消 Run</button></>}
+        {controllable && <button disabled={busy} onClick={() => void onAction("pause", "任务已暂停，可稍后恢复。")}>暂停</button>}
+        {active && <button className="secondary" disabled={busy} onClick={() => void onAction("cancel", "当前 Run 已取消。")}>取消 Run</button>}
         {latest?.status === "waiting_approval" && <button onClick={onApprovals}>前往处理审批</button>}
-        {task.status === "done" && <button className="secondary" disabled={busy} onClick={() => onArchive(task)}>{task.parent_id ? "归档任务" : "归档任务组"}</button>}
-        {task.status === "archived" && <button className="secondary" disabled={busy} onClick={() => onUnarchive(task)}>{task.parent_id ? "解除归档" : "解除任务组归档"}</button>}
       </div>
       {latest?.status === "waiting_input" && requestId && questions.length > 0 && <form className="run-input-form" onSubmit={(event) => void onAnswer(event, requestId, questions)}><h3>Agent 等待你的输入</h3>{questions.map((question) => <fieldset key={question.id}><legend>{question.header || question.question}</legend>{question.options.length ? question.options.map((option) => <label key={option.label}><input type="radio" name={question.id} value={option.label} required disabled={busy} /><span><strong>{option.label}</strong>{option.description && <small>{option.description}</small>}</span></label>) : <label>{question.question}<input name={question.id} required disabled={busy} /></label>}</fieldset>)}<button disabled={busy}>提交并继续</button></form>}
       {latest?.failure_summary && <p className="workspace-message" role="alert">失败原因：{latest.failure_summary}</p>}
@@ -854,11 +803,12 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, eventsByRun, busy
     </main>
     <section className="task-run-tabs">
       <div className="task-run-tab-list" role="tablist" aria-label="任务协作记录">
-        {([['comments', '评论'], ['runs', '运行记录'], ['changes', '修改记录']] as const).map(([id, label]) => <button key={id} type="button" role="tab" aria-selected={activeTab === id} className={activeTab === id ? "active" : ""} onClick={() => setActiveTab(id)}>{label}{id === "comments" && comments.length > 0 ? ` ${comments.length}` : id === "runs" && runs.length > 0 ? ` ${runs.length}` : id === "changes" && codeChanges.length > 0 ? ` ${codeChanges.length}` : ""}</button>)}
+        {([['comments', '评论'], ['runs', '运行记录'], ['evidence', '评审证据'], ['changes', '修改记录']] as const).map(([id, label]) => <button key={id} type="button" role="tab" aria-selected={activeTab === id} className={activeTab === id ? "active" : ""} onClick={() => setActiveTab(id)}>{label}{id === "comments" && comments.length > 0 ? ` ${comments.length}` : id === "runs" && runs.length > 0 ? ` ${runs.length}` : id === "evidence" && evidence.length > 0 ? ` ${evidence.length}` : id === "changes" && codeChanges.length > 0 ? ` ${codeChanges.length}` : ""}</button>)}
       </div>
       <div className="task-run-tab-panel" role="tabpanel">
-        {activeTab === "comments" && <TaskComments key={task.id} comments={comments} loaded={commentsLoaded} tasks={tasks.filter((item) => item.commission_id === task.commission_id)} mentionTasks={tasks.filter((item) => item.commission_id === task.commission_id && item.status !== "archived")} readOnly={task.status === "archived"} busy={commentBusy} error={commentError} uploadProgress={commentUploadProgress} onSubmit={submitComment} onDelete={deleteComment} onOpenTask={onOpenTask} />}
+        {activeTab === "comments" && <TaskComments key={task.id} comments={comments} loaded={commentsLoaded} tasks={tasks.filter((item) => item.commission_id === task.commission_id)} mentionTasks={tasks.filter((item) => item.commission_id === task.commission_id && item.status !== "archived")} readOnly={task.status === "archived"} busy={commentBusy} error={commentError} uploadProgress={commentUploadProgress} onSubmit={submitComment} onDelete={deleteComment} onRespond={respondRevisionCard} onOpenTask={onOpenTask} />}
         {activeTab === "runs" && <div className="run-records">{runs.length ? runs.map((run, index) => <RunTimelineGroup key={run.id} run={run} events={eventsByRun[run.id] ?? []} current={index === 0} open={openRunIds.has(run.id)} onToggle={(nextOpen) => setOpenRunIds((current) => { const next = new Set(current); if (nextOpen) next.add(run.id); else next.delete(run.id); return next; })} />) : <p className="task-tab-empty">启动任务后可在这里跟进执行过程。</p>}</div>}
+        {activeTab === "evidence" && <EvidenceRecords evidence={evidence} />}
         {activeTab === "changes" && <CodeChanges changes={codeChanges} />}
       </div>
     </section>
@@ -866,7 +816,26 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, eventsByRun, busy
   </dialog>;
 }
 
-function TaskComments({ comments, loaded, tasks, mentionTasks, readOnly, busy, error, uploadProgress, onSubmit, onDelete, onOpenTask }: { comments: TaskComment[]; loaded: boolean; tasks: Task[]; mentionTasks: Task[]; readOnly: boolean; busy: boolean; error: string; uploadProgress: AttachmentUploadProgress | null; onSubmit(event: FormEvent<HTMLFormElement>): Promise<boolean>; onDelete(comment: TaskComment): Promise<void>; onOpenTask(task: Task): Promise<void> }) {
+function TaskReadonlyProperties({ task, tasks }: { task: Task; tasks: Task[] }) {
+  const parent = task.parent_id ? tasks.find((item) => item.id === task.parent_id) : undefined;
+  const dependencies = new Map(tasks.map((item) => [item.id, item]));
+  return <section className="task-readonly-properties" aria-label="任务属性">
+    <h3>任务属性</h3>
+    <TaskMeta task={task} />
+    <dl>
+      <div><dt>执行模式</dt><dd>{task.read_only ? "只读" : "可写"}</dd></div>
+      <div><dt>父任务</dt><dd>{task.parent_id ? parent ? `${parent.number_path} ${parent.title}` : task.parent_id : "无"}</dd></div>
+      <div><dt>同级顺序</dt><dd>{task.position + 1}</dd></div>
+      <div><dt>创建时间</dt><dd>{new Date(task.created_at).toLocaleString()}</dd></div>
+      <div><dt>更新时间</dt><dd>{new Date(task.updated_at).toLocaleString()}</dd></div>
+    </dl>
+    <div><strong>描述</strong><p>{task.description || "无任务描述。"}</p></div>
+    <div><strong>验收标准</strong>{task.acceptanceCriteria.length ? <ul>{task.acceptanceCriteria.map((criterion, index) => <li key={index}>{typeof criterion === "string" ? criterion : JSON.stringify(criterion)}</li>)}</ul> : <p>未设置</p>}</div>
+    <div><strong>依赖任务</strong>{task.dependencyIds.length ? <ul>{task.dependencyIds.map((id) => { const dependency = dependencies.get(id); return <li key={id}>{dependency ? `${dependency.number_path} ${dependency.title}` : id}</li>; })}</ul> : <p>无</p>}</div>
+  </section>;
+}
+
+function TaskComments({ comments, loaded, tasks, mentionTasks, readOnly, busy, error, uploadProgress, onSubmit, onDelete, onRespond, onOpenTask }: { comments: TaskComment[]; loaded: boolean; tasks: Task[]; mentionTasks: Task[]; readOnly: boolean; busy: boolean; error: string; uploadProgress: AttachmentUploadProgress | null; onSubmit(event: FormEvent<HTMLFormElement>): Promise<boolean>; onDelete(comment: TaskComment): Promise<void>; onRespond(comment: TaskComment, answer: string | string[]): Promise<void>; onOpenTask(task: Task): Promise<void> }) {
   const [replyTo, setReplyTo] = useState<TaskComment | null>(null);
   const [mention, setMention] = useState<MentionTrigger | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
@@ -902,7 +871,7 @@ function TaskComments({ comments, loaded, tasks, mentionTasks, readOnly, busy, e
   useEffect(() => {
     if (mention) mentionOptionRefs.current[mentionIndex]?.scrollIntoView({ block: "nearest" });
   }, [mention, mentionIndex]);
-  const submit = async (event: FormEvent<HTMLFormElement>) => { if (await onSubmit(event)) { setReplyTo(null); setMention(null); } };
+  const submit = async (event: FormEvent<HTMLFormElement>) => { if (await onSubmit(event)) { setReplyTo(null); setMention(null); window.requestAnimationFrame(() => { const target = commentList.current; if (target) target.scrollTop = target.scrollHeight; }); } };
   const refreshMention = (target: HTMLTextAreaElement) => {
     setMention(mentionTriggerAtCursor(target.value, target.selectionStart ?? target.value.length));
     setMentionIndex(0);
@@ -918,7 +887,7 @@ function TaskComments({ comments, loaded, tasks, mentionTasks, readOnly, busy, e
   return <div className="task-comments">
     <div ref={commentList} className="task-comment-list">{rows.length ? rows.map(({ comment, depth }) => <article key={comment.id} className={`task-comment comment-${comment.author_type}`} style={{ "--comment-depth": Math.min(depth, 4) } as React.CSSProperties}>
       <CommentAvatar value={comment.author_type === "human" ? avatars.humanAvatar : comment.author_type === "agent" ? avatars.agentAvatar : "系"} />
-      <div className={`comment-card ${comment.deleted_at ? "deleted" : ""}`}><header><span><strong>{comment.author_type === "human" ? "人工负责人" : comment.agent_role ? ROLE_LABELS[comment.agent_role] ?? comment.agent_role : comment.author_type === "agent" ? "AI Agent" : "系统"}</strong>{comment.author_type === "agent" && <small>Agent</small>}{comment.run_id && <small>Run</small>}</span><time>{new Date(comment.created_at).toLocaleString()}</time></header>{comment.deleted_at ? <p className="comment-deleted">评论已删除</p> : <>{comment.content && <CommentMarkdown content={comment.content} tasks={tasks} onOpenTask={onOpenTask} />}<AttachmentList taskId={comment.task_id} attachments={comment.attachments ?? []} /></>}{!readOnly && !comment.deleted_at && <footer><button type="button" className="comment-reply" onClick={() => { setReplyTo(comment); window.setTimeout(() => textarea.current?.focus(), 0); }}>回复</button><button type="button" className="comment-delete" onClick={() => void onDelete(comment)}>删除</button></footer>}</div>
+      <div className={`comment-card ${comment.deleted_at ? "deleted" : ""} ${comment.revisionCard ? "revision-card" : ""}`}><header><span><strong>{comment.author_type === "human" ? "人工负责人" : comment.agent_role ? ROLE_LABELS[comment.agent_role] ?? comment.agent_role : comment.author_type === "agent" ? "AI Agent" : "系统"}</strong>{comment.author_type === "agent" && <small>Agent</small>}{comment.run_id && <small>Run</small>}</span><time>{new Date(comment.created_at).toLocaleString()}</time></header>{comment.deleted_at ? <p className="comment-deleted">评论已删除</p> : <>{comment.content && <CommentMarkdown content={comment.content} tasks={tasks} onOpenTask={onOpenTask} />}<AttachmentList taskId={comment.task_id} attachments={comment.attachments ?? []} />{comment.revisionCard && <PlanRevisionCard comment={comment} busy={busy || readOnly} onRespond={onRespond} />}</>}{!readOnly && !comment.deleted_at && !comment.revisionCard && <footer><button type="button" className="comment-reply" onClick={() => { setReplyTo(comment); window.setTimeout(() => textarea.current?.focus(), 0); }}>回复</button><button type="button" className="comment-delete" onClick={() => void onDelete(comment)}>删除</button></footer>}</div>
     </article>) : <p className="task-tab-empty">{readOnly ? "该归档任务没有历史评论。" : "暂无评论，输入一条协作信息开始讨论。"}</p>}</div>
     {readOnly ? <p className="task-tab-empty">归档任务的评论为只读，历史记录仍会保留。</p> : <form className="task-comment-form" onSubmit={(event) => void submit(event)}>
       {replyTo && <div className="comment-replying"><span>回复 {replyTo.author_type === "human" ? "人工负责人" : replyTo.agent_role ? ROLE_LABELS[replyTo.agent_role] ?? replyTo.agent_role : "系统"}：{replyTo.content.slice(0, 60)}</span><button type="button" className="secondary compact" onClick={() => setReplyTo(null)}>取消回复</button></div>}
@@ -946,6 +915,17 @@ function TaskComments({ comments, loaded, tasks, mentionTasks, readOnly, busy, e
       {error && <p className="workspace-message" role="alert">{error}</p>}
     </form>}
   </div>;
+}
+
+function PlanRevisionCard({ comment, busy, onRespond }: { comment: TaskComment; busy: boolean; onRespond(comment: TaskComment, answer: string | string[]): Promise<void> }) {
+  const card = comment.revisionCard!;
+  if (card.status !== "pending") return <p className="revision-card-state">{card.status === "answered" ? "已回答" : "已失效"}</p>;
+  if (card.interaction_type === "text") return <p className="revision-card-state">请在下方评论框直接回复，提交后将继续修订分析。</p>;
+  if (card.interaction_type === "boolean") return <div className="revision-card-actions">{card.options.map((option, index) => <button key={option} type="button" className={index ? "secondary" : ""} disabled={busy} onClick={() => void onRespond(comment, option)}>{option}</button>)}</div>;
+  return <form className="revision-card-options" onSubmit={(event) => { event.preventDefault(); const values = new FormData(event.currentTarget).getAll("answer").map(String); void onRespond(comment, card.interaction_type === "multiple_choice" ? values : values[0] ?? ""); }}>
+    {card.options.map((option) => <label key={option}><input type={card.interaction_type === "multiple_choice" ? "checkbox" : "radio"} name="answer" value={option} required={card.interaction_type === "single_choice"} disabled={busy} />{option}</label>)}
+    <button disabled={busy}>确认</button>
+  </form>;
 }
 
 function CommentAvatar({ value }: { value: string }) {
@@ -1070,6 +1050,10 @@ function CodeChanges({ changes }: { changes: Array<{ run: Run; change: CodeChang
     <header><span><small>{current ? "当前执行" : "历史执行"} · Run #{run.attempt_no} · {kindLabels[change.kind] ?? change.kind}</small><strong>{change.path}</strong>{change.movePath && <small>移动自 {change.movePath}</small>}</span><time>{new Date(change.event.created_at).toLocaleString()}</time></header>
     {change.diff ? <pre className="code-diff" aria-label={`${change.path} 的代码差异`}>{diffLines(change.diff).map((line, index) => <span key={index} className={`diff-${line.kind}`}>{line.text || " "}</span>)}</pre> : <p>Agent 已报告文件变化，但未提供 Diff。</p>}
   </article>) : <p className="task-tab-empty">Agent 修改文件后，最新 Diff 会显示在这里。</p>}</div>;
+}
+
+function EvidenceRecords({ evidence }: { evidence: TaskEvidence[] }) {
+  return <div className="code-change-list">{evidence.length ? evidence.map((item) => <article key={item.id} className="code-change-record"><header><span><small>{item.type} · {item.status}{item.run_id ? ` · Run ${item.run_id.slice(0, 8)}` : ""}</small><strong>{item.summary}</strong></span><time>{new Date(item.created_at).toLocaleString()}</time></header>{item.payload_json && item.payload_json !== "{}" && <details><summary>查看结构化详情</summary><pre>{item.payload_json}</pre></details>}</article>) : <p className="task-tab-empty">该任务暂无评审证据。</p>}</div>;
 }
 
 function RunTimelineGroup({ run, events, current, open, onToggle }: { run: Run; events: RunEvent[]; current: boolean; open: boolean; onToggle(open: boolean): void }) {

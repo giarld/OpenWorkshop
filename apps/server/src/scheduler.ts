@@ -8,6 +8,7 @@ import type { FastifyInstance } from "fastify";
 import { resolvedRoleConfig } from "./agent-settings.ts";
 import { addMainTaskComment, addRunCommentOnce } from "./comments.ts";
 import { notify } from "./notifications.ts";
+import { REVISION_INTERACTIONS, beginPlanRevision, createRevisionCard, parseRevisionProposal, publishRevisionConfirmation, revisionForRun, saveRevisionProposal, type RevisionProposal, type RevisionQuestion } from "./plan-revisions.ts";
 import type { CommandRunner, VcsInfo } from "./projects.ts";
 import { updateCommissionAcceptance } from "./tasks.ts";
 
@@ -22,7 +23,7 @@ type GrantRow = { id: string; commission_id: string; root_task_id: string; scope
 type RunRow = {
   id: string; project_id: string; commission_id: string; task_id: string; role: string; trigger_type: string; trigger_ref_id: string | null;
   execution_grant_id: string | null; retry_root_run_id: string | null; status: string; attempt_no: number; config_snapshot_json: string;
-  context_snapshot_json: string; workspace_path: string | null; workspace_mode: LockMode | null;
+  context_snapshot_json: string; workspace_path: string | null; workspace_mode: LockMode | null; coordination_revision: number | null;
 };
 export type RunnableTask = { id: string; projectId: string; commissionId: string; readOnly: boolean };
 export type WorkspacePlan = { cwd: string; lock: LockMode; worktree: boolean };
@@ -69,18 +70,56 @@ export class Scheduler {
     const { grant, runId } = transaction(this.database, () => {
       const task = this.database.prepare("SELECT task.commission_id, commission.status FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id WHERE task.id = ? AND task.archived_at IS NULL AND task.id = commission.main_task_id").get(taskId) as { commission_id: string; status: string } | undefined;
       if (!task) throw conflict("Coordination is only available for the main task");
-      const grant = (task.status === "active" ? this.database.prepare("SELECT * FROM execution_grants WHERE commission_id = ? AND root_task_id = ? AND scope = 'commission_tree' AND status = 'active' ORDER BY created_at DESC LIMIT 1").get(task.commission_id, taskId) as GrantRow | undefined : undefined) ?? createExecutionGrantUnsafe(this.database, taskId);
+      if (this.database.prepare("SELECT 1 FROM plan_revisions WHERE commission_id = ? AND status IN ('collecting', 'reviewing', 'awaiting_confirmation')").get(task.commission_id)) throw conflict("Answer the pending plan revision card before coordinating again");
+      let grant = task.status === "active" ? this.database.prepare("SELECT * FROM execution_grants WHERE commission_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1").get(task.commission_id) as GrantRow | undefined : undefined;
+      if (grant?.scope === "target_closure") {
+        this.database.prepare("UPDATE execution_grants SET root_task_id = ?, scope = 'commission_tree' WHERE id = ?").run(taskId, grant.id);
+        grant = { ...grant, root_task_id: taskId, scope: "commission_tree" };
+      }
+      grant ??= createExecutionGrantUnsafe(this.database, taskId);
       if (grant.scope !== "commission_tree") throw conflict("Coordination is only available for the main task");
       const now = new Date().toISOString();
       this.database.prepare("UPDATE tasks SET status = 'in_progress', blocked_reason = NULL, updated_at = ? WHERE id = ? AND status <> 'done'").run(now, taskId);
       const covered = coveredTaskIds(this.database, grant.id);
       if (covered.length) this.database.prepare(`UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id IN (${covered.map(() => "?").join(", ")}) AND status = 'backlog'`).run(now, ...covered);
-      const runId = reserveRun(this.database, grant.id, taskId, "coordinate", grant.id, null, undefined, "{}", "supervisor");
+      const revision = (this.database.prepare("SELECT coordination_revision FROM commissions WHERE id = ?").get(task.commission_id) as { coordination_revision: number }).coordination_revision;
+      this.database.prepare("UPDATE commissions SET coordination_pending = 1 WHERE id = ?").run(task.commission_id);
+      const existing = this.database.prepare(`SELECT id FROM runs WHERE task_id = ? AND trigger_type = 'coordinate' AND status IN (${RESERVED_RUN_STATUSES.map(() => "?").join(", ")}) ORDER BY rowid DESC LIMIT 1`).get(taskId, ...RESERVED_RUN_STATUSES) as { id: string } | undefined;
+      const runId = existing?.id ?? reserveRun(this.database, grant.id, taskId, "coordinate", grant.id, null, undefined, "{}", "supervisor", revision);
       beforeStart?.([runId]);
       return { grant, runId };
     });
     await this.startQueued();
     return { grant, runIds: [runId] };
+  }
+
+  async coordinateFinal(commissionId: string): Promise<boolean> {
+    const mainTaskId = finalCoordinationMainTask(this.database, commissionId);
+    if (!mainTaskId) return false;
+    this.database.prepare("UPDATE commissions SET coordination_pending = 1 WHERE id = ?").run(commissionId);
+    await this.coordinate(mainTaskId);
+    return true;
+  }
+
+  async revise(revisionId: string): Promise<string> {
+    const runId = transaction(this.database, () => {
+      const revision = revisionForRun(this.database, revisionId);
+      if (!["collecting", "reviewing"].includes(revision.status)) throw conflict("Plan revision is not ready for supervisor work");
+      let grant = this.database.prepare("SELECT * FROM execution_grants WHERE commission_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1").get(revision.commission_id) as GrantRow | undefined;
+      if (grant?.scope === "target_closure") {
+        this.database.prepare("UPDATE execution_grants SET root_task_id = ?, scope = 'commission_tree' WHERE id = ?").run(revision.main_task_id, grant.id);
+        grant = { ...grant, root_task_id: revision.main_task_id, scope: "commission_tree" };
+      }
+      grant ??= createExecutionGrantUnsafe(this.database, revision.main_task_id);
+      if (grant.scope !== "commission_tree") throw conflict("Plan revision requires a commission-tree grant");
+      const trigger = revision.status === "reviewing" ? "plan_revision_review" : "plan_revision";
+      const existing = this.database.prepare(`SELECT id FROM runs WHERE task_id = ? AND trigger_type = ? AND status IN (${RESERVED_RUN_STATUSES.map(() => "?").join(", ")}) ORDER BY rowid DESC LIMIT 1`).get(revision.main_task_id, trigger, ...RESERVED_RUN_STATUSES) as { id: string } | undefined;
+      if (existing) return existing.id;
+      this.database.prepare("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ? AND status <> 'done'").run(new Date().toISOString(), revision.main_task_id);
+      return reserveRun(this.database, grant.id, revision.main_task_id, trigger, revision.id, null, undefined, JSON.stringify({ revisionId }), "supervisor");
+    });
+    await this.startQueued();
+    return runId;
   }
 
   async resume(taskId: string, previousRunId: string): Promise<string> {
@@ -105,8 +144,12 @@ export class Scheduler {
   async recover(): Promise<string[]> {
     const blocked: string[] = [];
     const retries = recoverInterruptedRuns(this.database, blocked);
-    const commissions = this.database.prepare("SELECT id FROM commissions WHERE status IN ('active', 'blocked') AND archived_at IS NULL").all() as Array<{ id: string }>;
-    for (const { id } of commissions) if (!blocked.includes(id)) updateCommissionAcceptance(this.database, id);
+    const commissions = this.database.prepare("SELECT id FROM commissions WHERE status IN ('active', 'blocked') AND archived_at IS NULL AND NOT EXISTS (SELECT 1 FROM plan_revisions WHERE plan_revisions.commission_id = commissions.id AND plan_revisions.status IN ('collecting', 'reviewing', 'awaiting_confirmation'))").all() as Array<{ id: string }>;
+    for (const { id } of commissions) {
+      if (!blocked.includes(id)) await this.coordinateFinal(id);
+    }
+    const pending = this.database.prepare("SELECT main_task_id FROM commissions WHERE coordination_pending = 1 AND status IN ('active', 'blocked') AND archived_at IS NULL AND main_task_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM plan_revisions WHERE plan_revisions.commission_id = commissions.id AND plan_revisions.status IN ('collecting', 'reviewing', 'awaiting_confirmation'))").all() as Array<{ main_task_id: string }>;
+    for (const { main_task_id } of pending) await this.coordinate(main_task_id);
     await this.startQueued();
     return retries;
   }
@@ -127,8 +170,75 @@ export class Scheduler {
 
   async terminal(runId: string): Promise<void> {
     const run = runById(this.database, runId);
+    if (run.trigger_type === "coordinate") {
+      const coordination = this.database.prepare("SELECT coordination_revision FROM commissions WHERE id = ?").get(run.commission_id) as { coordination_revision: number };
+      if (run.coordination_revision !== coordination.coordination_revision) {
+        await this.cleanup(run.id, run.status === "cancelled");
+        const pending = (this.database.prepare("SELECT coordination_pending FROM commissions WHERE id = ?").get(run.commission_id) as { coordination_pending: number }).coordination_pending;
+        if (pending) await this.coordinate(run.task_id); else await this.startQueued();
+        return;
+      }
+      this.database.prepare("UPDATE commissions SET coordination_pending = 0 WHERE id = ? AND coordination_revision = ?").run(run.commission_id, coordination.coordination_revision);
+    }
     if (["interrupted", "cancelled"].includes(run.status)) {
       await this.cleanup(run.id, run.status === "cancelled");
+      await this.startQueued();
+      return;
+    }
+    if (["plan_revision", "plan_revision_review"].includes(run.trigger_type)) {
+      if (run.status !== "succeeded") {
+        await this.cleanup(run.id);
+        transaction(this.database, () => {
+          const revision = revisionForRun(this.database, run.trigger_ref_id!);
+          this.database.prepare("UPDATE plan_revisions SET status = 'collecting', updated_at = ? WHERE id = ?").run(new Date().toISOString(), revision.id);
+          createRevisionCard(this.database, revision.id, revision.main_task_id, { type: "text", prompt: "## 计划修订待确认\n\n主管 Agent 未能完成本轮分析，请补充调整要求后重试。", options: [] });
+        });
+        return;
+      }
+      if (run.trigger_type === "plan_revision") {
+        let decision: PlanRevisionDecision;
+        try { decision = parsePlanRevisionDecision(runAgentOutput(this.database, run.id)); }
+        catch (error) {
+          transaction(this.database, () => {
+            const revision = revisionForRun(this.database, run.trigger_ref_id!);
+            createRevisionCard(this.database, revision.id, revision.main_task_id, { type: "text", prompt: `## 计划修订待确认\n\n主管 Agent 返回了无效结果：${error instanceof Error ? error.message : "未知错误"}\n\n请补充调整要求后重试。`, options: [] });
+          });
+          await this.cleanup(run.id, false);
+          return;
+        }
+        transaction(this.database, () => {
+          const revision = revisionForRun(this.database, run.trigger_ref_id!);
+          if (decision.action === "ask") createRevisionCard(this.database, revision.id, revision.main_task_id, decision.question);
+          else saveRevisionProposal(this.database, revision.id, decision.proposal);
+        });
+        await this.cleanup(run.id, false);
+        if (decision.action === "review") await this.revise(run.trigger_ref_id!);
+        return;
+      }
+      let decision: PlanRevisionReview;
+      try { decision = parsePlanRevisionReview(runAgentOutput(this.database, run.id)); }
+      catch (error) {
+        transaction(this.database, () => {
+          const revision = revisionForRun(this.database, run.trigger_ref_id!);
+          this.database.prepare("UPDATE plan_revisions SET status = 'collecting', updated_at = ? WHERE id = ?").run(new Date().toISOString(), revision.id);
+          createRevisionCard(this.database, revision.id, revision.main_task_id, { type: "text", prompt: `## 计划修订待确认\n\n审查结果无效：${error instanceof Error ? error.message : "未知错误"}\n\n请补充信息后重新审查。`, options: [] });
+        });
+        await this.cleanup(run.id, false);
+        return;
+      }
+      try {
+        transaction(this.database, () => {
+          const revision = revisionForRun(this.database, run.trigger_ref_id!);
+          if (decision.approved) publishRevisionConfirmation(this.database, revision.id, decision.summary, run.id);
+          else {
+            this.database.prepare("UPDATE plan_revisions SET status = 'collecting', updated_at = ? WHERE id = ?").run(new Date().toISOString(), revision.id);
+            const question = decision.question
+              ? { ...decision.question, prompt: `## 计划修订审查未通过\n\n${decision.summary}\n\n${decision.question.prompt}` }
+              : { type: "text" as const, prompt: `## 计划修订审查未通过\n\n${decision.summary}\n\n请补充必要信息。`, options: [] };
+            createRevisionCard(this.database, revision.id, revision.main_task_id, question);
+          }
+        });
+      } finally { await this.cleanup(run.id, false); }
       return;
     }
     if (run.status === "failed" && run.trigger_type === "coordinate" && run.execution_grant_id) {
@@ -155,7 +265,7 @@ export class Scheduler {
       let decision: CoordinatorDecision;
       try { decision = parseCoordinatorDecision(runAgentOutput(this.database, run.id)); }
       catch (error) { decision = { action: "wait_human", summary: error instanceof Error ? error.message : "调度 Agent 返回了无效结果" }; }
-      let outcome: "queued" | "blocked";
+      let outcome: "queued" | "settled" | "blocked" | "revision";
       try { outcome = transaction(this.database, () => applyCoordinatorDecision(this.database, run, decision)); }
       catch (error) {
         decision = { action: "wait_human", summary: error instanceof Error ? error.message : "调度决策无法执行" };
@@ -227,7 +337,6 @@ export class Scheduler {
           addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "system", content: `任务完成：代码审查通过。\n\n${review.summary}` });
           addMainTaskComment(this.database, { sourceTaskId: run.task_id, runId: run.id, content: `子任务已完成，代码审查通过。\n\n${review.summary}` });
           notify(this.database, "completed", `任务完成：${completedTask.title}`, review.summary, "task", run.task_id);
-          updateCommissionAcceptance(this.database, run.commission_id);
           return "passed" as const;
         }
         const failedReviews = consecutiveFailedReviewCount(this.database, run.task_id);
@@ -244,7 +353,10 @@ export class Scheduler {
         reserveRun(this.database, run.execution_grant_id!, run.task_id, "rework", run.id);
         return "rework" as const;
       });
-      if (outcome === "passed") await this.cleanup(run.id);
+      if (outcome === "passed") {
+        await this.cleanup(run.id);
+        if (await this.coordinateFinal(run.commission_id)) return;
+      }
       else if (outcome === "blocked") await this.cleanup(run.id, false);
       else await this.startQueued();
     }
@@ -361,6 +473,7 @@ export class Scheduler {
 
 export function registerSchedulerRoutes(server: FastifyInstance, scheduler: Scheduler): void {
   server.post<{ Params: { id: string } }>("/api/tasks/:id/trigger", async (request) => scheduler.trigger(request.params.id));
+  server.post<{ Params: { id: string } }>("/api/tasks/:id/coordinate", async (request) => scheduler.coordinate(request.params.id));
 }
 
 export function createExecutionGrant(database: DatabaseSync, taskId: string): GrantRow {
@@ -410,6 +523,7 @@ export function runnableTasks(database: DatabaseSync, grantId: string, globalLim
     JOIN root_paths AS root ON root.id = project.root_path_id
     WHERE commission.id = ? AND commission.archived_at IS NULL AND project.archived_at IS NULL AND root.enabled = 1`).get(grant.commission_id) as { project_id: string; status: string } | undefined;
   if (!commission || commission.status !== "active") return [];
+  if (database.prepare("SELECT 1 FROM plan_revisions WHERE commission_id = ? AND status IN ('collecting', 'reviewing', 'awaiting_confirmation')").get(grant.commission_id)) return [];
   if (grant.scope === "target_closure" && (database.prepare("SELECT status FROM tasks WHERE id = ?").get(grant.root_task_id) as { status: string }).status === "done") {
     database.prepare("UPDATE execution_grants SET status = 'exhausted' WHERE id = ?").run(grant.id); return [];
   }
@@ -474,10 +588,20 @@ export function recoverInterruptedRuns(database: DatabaseSync, blockedCommission
     const now = new Date().toISOString(); const retries: string[] = [];
     for (const run of interrupted) {
       database.prepare("UPDATE runs SET status = 'interrupted', finished_at = ?, failure_code = 'server_restart' WHERE id = ?").run(now, run.id);
+      if (["plan_revision", "plan_revision_review"].includes(run.trigger_type)) {
+        if (!run.execution_grant_id || grantById(database, run.execution_grant_id).status !== "active") continue;
+        database.prepare("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?").run(now, run.task_id);
+        retries.push(reserveRun(database, run.execution_grant_id, run.task_id, run.trigger_type, run.trigger_ref_id ?? "", run.id, run.config_snapshot_json, run.context_snapshot_json, "supervisor"));
+        continue;
+      }
+      if (run.trigger_type === "coordinate") {
+        const revision = (database.prepare("SELECT coordination_revision FROM commissions WHERE id = ?").get(run.commission_id) as { coordination_revision: number }).coordination_revision;
+        if (run.coordination_revision !== revision) continue;
+      }
       const root = run.retry_root_run_id ?? run.id;
       if (run.trigger_type === "coordinate" && run.retry_root_run_id) {
         database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(now, run.task_id);
-        database.prepare("UPDATE commissions SET status = 'blocked', updated_at = ? WHERE id = ?").run(now, run.commission_id);
+        database.prepare("UPDATE commissions SET status = 'blocked', coordination_pending = 0, updated_at = ? WHERE id = ?").run(now, run.commission_id);
         if (run.execution_grant_id) database.prepare("UPDATE execution_grants SET status = 'exhausted' WHERE id = ? AND status = 'active'").run(run.execution_grant_id);
         addRunCommentOnce(database, { taskId: run.task_id, runId: run.id, authorType: "system", kind: "blocker", content: "调度 Run 连续两次因服务重启中断，已停止自动恢复，请人工检查后重新触发调度。" });
         notify(database, "blocked", "调度需要人工处理", "调度 Run 连续两次因服务重启中断。", "task", run.task_id);
@@ -487,7 +611,7 @@ export function recoverInterruptedRuns(database: DatabaseSync, blockedCommission
       if (run.retry_root_run_id || database.prepare("SELECT 1 FROM runs WHERE retry_root_run_id = ?").get(root)) continue;
       if (!run.execution_grant_id || grantById(database, run.execution_grant_id).status !== "active") continue;
       database.prepare("UPDATE tasks SET status = ?, blocked_reason = NULL, updated_at = ? WHERE id = ?").run(run.trigger_type === "coordinate" ? "in_progress" : "todo", now, run.task_id);
-      retries.push(reserveRun(database, run.execution_grant_id, run.task_id, run.trigger_type === "coordinate" ? "coordinate" : "auto_retry", run.id, root, run.config_snapshot_json, run.trigger_type === "coordinate" ? "{}" : run.context_snapshot_json, run.role));
+      retries.push(reserveRun(database, run.execution_grant_id, run.task_id, run.trigger_type === "coordinate" ? "coordinate" : "auto_retry", run.id, root, run.config_snapshot_json, run.trigger_type === "coordinate" ? "{}" : run.context_snapshot_json, run.role, run.coordination_revision));
     }
     return retries;
   });
@@ -500,14 +624,14 @@ function reserveRoutedRun(database: DatabaseSync, grantId: string, taskId: strin
     : reserveRun(database, grantId, taskId, "scheduler", grantId);
 }
 
-function reserveRun(database: DatabaseSync, grantId: string, taskId: string, triggerType: string, triggerRefId: string, retryRootRunId: string | null = null, config?: string, context = "{}", role = "developer"): string {
+function reserveRun(database: DatabaseSync, grantId: string, taskId: string, triggerType: string, triggerRefId: string, retryRootRunId: string | null = null, config?: string, context = "{}", role = "developer", coordinationRevision: number | null = null): string {
   const task = database.prepare("SELECT commission.project_id, task.commission_id FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id WHERE task.id = ?").get(taskId) as { project_id: string; commission_id: string };
   const id = randomUUID();
   const attempt = count(database, "SELECT COALESCE(MAX(attempt_no), 0) AS count FROM runs WHERE task_id = ?", taskId) + 1;
   const resolved = resolvedRoleConfig(database, task.project_id, role);
   const configSnapshot = config ?? JSON.stringify(role === "supervisor" ? { ...resolved, sandboxMode: "read-only", approvalPolicy: "never", networkAccess: false } : resolved);
-  database.prepare(`INSERT OR IGNORE INTO runs (id, project_id, commission_id, task_id, role, trigger_type, trigger_ref_id, execution_grant_id, retry_root_run_id, status, attempt_no, config_snapshot_json, context_snapshot_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`).run(id, task.project_id, task.commission_id, taskId, role, triggerType, triggerRefId, grantId, retryRootRunId, attempt, configSnapshot, context);
+  database.prepare(`INSERT OR IGNORE INTO runs (id, project_id, commission_id, task_id, role, trigger_type, trigger_ref_id, execution_grant_id, retry_root_run_id, status, attempt_no, config_snapshot_json, context_snapshot_json, coordination_revision)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`).run(id, task.project_id, task.commission_id, taskId, role, triggerType, triggerRefId, grantId, retryRootRunId, attempt, configSnapshot, context, coordinationRevision);
   const reserved = database.prepare(`SELECT id FROM runs WHERE task_id = ? AND status IN (${RESERVED_RUN_STATUSES.map(() => "?").join(", ")})`).get(taskId, ...RESERVED_RUN_STATUSES) as { id: string } | undefined;
   if (!reserved) throw new Error("Run reservation failed");
   return reserved.id;
@@ -527,10 +651,12 @@ export function parseSupervisorDecision(output: string): SupervisorDecision {
   return { action: decision.action as SupervisorAction, summary: decision.summary.trim() };
 }
 
-const COORDINATOR_ACTIONS = ["proceed", "replan", "wait_human"] as const;
-const COORDINATOR_TASK_ACTIONS = ["start", "retry", "resume"] as const;
-type CoordinatorTaskAction = { taskId: string; action: typeof COORDINATOR_TASK_ACTIONS[number] };
+const COORDINATOR_ACTIONS = ["proceed", "complete", "block", "replan", "wait_human"] as const;
+const COORDINATOR_TASK_ACTIONS = ["start", "retry", "resume", "block"] as const;
+type CoordinatorTaskAction = { taskId: string; action: typeof COORDINATOR_TASK_ACTIONS[number]; reason?: string };
 type CoordinatorDecision = { action: typeof COORDINATOR_ACTIONS[number]; summary: string; tasks?: CoordinatorTaskAction[] };
+type PlanRevisionDecision = { action: "ask"; question: RevisionQuestion } | { action: "review"; proposal: RevisionProposal };
+type PlanRevisionReview = { approved: boolean; summary: string; question?: RevisionQuestion };
 
 function parseCoordinatorDecision(output: string): CoordinatorDecision {
   const json = /```(?:json)?\s*([\s\S]*?)```/i.exec(output)?.[1] ?? output.slice(output.indexOf("{"), output.lastIndexOf("}") + 1);
@@ -543,17 +669,34 @@ function parseCoordinatorDecision(output: string): CoordinatorDecision {
     if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("Coordinator returned invalid task action");
     const action = item as Record<string, unknown>;
     if (typeof action.taskId !== "string" || !action.taskId || !COORDINATOR_TASK_ACTIONS.includes(action.action as CoordinatorTaskAction["action"])) throw new Error("Coordinator returned invalid task action");
-    return { taskId: action.taskId, action: action.action as CoordinatorTaskAction["action"] };
+    if (action.action === "block" && (typeof action.reason !== "string" || !action.reason.trim())) throw new Error("Coordinator block action requires a reason");
+    return { taskId: action.taskId, action: action.action as CoordinatorTaskAction["action"], ...(action.action === "block" ? { reason: String(action.reason).trim() } : {}) };
   }) : (() => { throw new Error("Coordinator returned invalid tasks"); })();
   if (decision.action === "proceed" && !tasks.length) throw new Error("Coordinator proceed decision requires task actions");
-  if (decision.action !== "proceed" && tasks.length) throw new Error("Coordinator task actions require proceed");
+  if (decision.action === "block" && (!tasks.length || tasks.some(({ action }) => action !== "block"))) throw new Error("Coordinator block decision requires block actions");
+  if (decision.action !== "proceed" && decision.action !== "block" && tasks.length) throw new Error("Coordinator task actions require proceed or block");
+  if (decision.action === "proceed" && tasks.some(({ action }) => action === "block")) throw new Error("Coordinator block actions require a block decision");
   if (new Set(tasks.map(({ taskId }) => taskId)).size !== tasks.length) throw new Error("Coordinator task actions must be unique");
   return { action: decision.action as CoordinatorDecision["action"], summary: decision.summary.trim(), ...(tasks.length ? { tasks } : {}) };
 }
 
-function applyCoordinatorDecision(database: DatabaseSync, run: RunRow, decision: CoordinatorDecision): "queued" | "blocked" {
+function applyCoordinatorDecision(database: DatabaseSync, run: RunRow, decision: CoordinatorDecision): "queued" | "settled" | "blocked" | "revision" {
   const now = new Date().toISOString();
   addRunCommentOnce(database, { taskId: run.task_id, runId: run.id, authorType: "agent", agentRole: "supervisor", content: `## 调度决策：${decision.action}\n\n${decision.action === "wait_human" ? "@负责人 " : ""}${decision.summary}` });
+  if (decision.action === "block") {
+    for (const { taskId, reason } of decision.tasks ?? []) {
+      const task = database.prepare(`SELECT task.id, task.title, task.status, commission.main_task_id FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id WHERE task.id = ? AND task.commission_id = ?`).get(taskId, run.commission_id) as { id: string; title: string; status: string; main_task_id: string | null } | undefined;
+      if (!task || task.id === task.main_task_id || task.status !== "done") throw conflict(`只能阻塞待复核的 Done 子任务：${taskId}`);
+      const blockedReason = reason ?? decision.summary;
+      database.prepare("UPDATE tasks SET status = 'blocked', blocked_reason = ?, human_waiver_reason = NULL, updated_at = ? WHERE id = ?").run(blockedReason, now, task.id);
+      addMainTaskComment(database, { sourceTaskId: task.id, runId: run.id, kind: "blocker", content: `收口复核发现子任务实际未完成。\n\n${blockedReason}` });
+      notify(database, "blocked", `任务阻塞：${task.title}`, blockedReason, "task", task.id);
+    }
+    database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(now, run.task_id);
+    database.prepare("UPDATE commissions SET status = 'blocked', updated_at = ? WHERE id = ?").run(now, run.commission_id);
+    database.prepare("UPDATE execution_grants SET status = 'exhausted' WHERE id = ?").run(run.execution_grant_id);
+    return "blocked";
+  }
   if (decision.action === "proceed") {
     const actions = decision.tasks ?? [];
     const rows = actions.map(({ taskId, action }) => {
@@ -564,24 +707,73 @@ function applyCoordinatorDecision(database: DatabaseSync, run: RunRow, decision:
       if (database.prepare("SELECT 1 FROM task_dependencies AS dependency JOIN tasks AS required ON required.id = dependency.depends_on_task_id WHERE dependency.task_id = ? AND required.status <> 'done' LIMIT 1").get(task.id)) throw conflict(`调度目标依赖未完成：${taskId}`);
       if (database.prepare(`SELECT 1 FROM runs WHERE task_id = ? AND status IN (${RESERVED_RUN_STATUSES.map(() => "?").join(", ")})`).get(task.id, ...RESERVED_RUN_STATUSES)) throw conflict(`调度目标已有 Run：${taskId}`);
       const previous = database.prepare("SELECT * FROM runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1").get(task.id) as RunRow | undefined;
-      if (action === "start" && task.status !== "todo") throw conflict(`调度目标不是 Todo：${taskId}`);
+      if (action === "start" && !["todo", "in_progress"].includes(task.status)) throw conflict(`调度目标不能启动：${taskId}`);
       if (action === "retry" && task.status !== "blocked") throw conflict(`调度目标不是 Blocked：${taskId}`);
       if (action === "resume" && (task.status !== "in_progress" || previous?.status !== "interrupted")) throw conflict(`调度目标没有可恢复的 Interrupted Run：${taskId}`);
       return { task, action, previous };
     });
     for (const { task, action, previous } of rows) {
-      if (action !== "start") database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(now, task.id);
+      if (action !== "start" || task.status !== "todo") database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, human_waiver_reason = NULL, updated_at = ? WHERE id = ?").run(now, task.id);
       if (action === "resume") reserveRun(database, run.execution_grant_id!, task.id, "resume", previous!.id, null, previous!.config_snapshot_json, previous!.context_snapshot_json, previous!.role);
       else reserveRoutedRun(database, run.execution_grant_id!, task.id);
     }
     return "queued";
   }
-  const reason = decision.action === "replan" ? `调度 Agent 建议重新规划：${decision.summary}` : `等待人工处理：${decision.summary}`;
+  if (decision.action === "complete") {
+    if (!updateCommissionAcceptance(database, run.commission_id)) throw conflict("委托仍有未完成任务，不能进入验收");
+    database.prepare("UPDATE execution_grants SET status = 'exhausted' WHERE id = ?").run(run.execution_grant_id);
+    return "settled";
+  }
+  if (decision.action === "replan") {
+    beginPlanRevision(database, run.commission_id, decision.summary);
+    database.prepare("UPDATE tasks SET status = 'in_progress', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(now, run.task_id);
+    notify(database, "blocked", "计划修订等待确认", decision.summary, "task", run.task_id);
+    return "revision";
+  }
+  const reason = `等待人工处理：${decision.summary}`;
   database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(now, run.task_id);
   database.prepare("UPDATE commissions SET status = 'blocked', updated_at = ? WHERE id = ?").run(now, run.commission_id);
   database.prepare("UPDATE execution_grants SET status = 'exhausted' WHERE id = ?").run(run.execution_grant_id);
   notify(database, "blocked", "调度需要人工处理", reason, "task", run.task_id);
   return "blocked";
+}
+
+export function parsePlanRevisionDecision(output: string): PlanRevisionDecision {
+  const value = parseJsonObject(output, "Plan revision supervisor");
+  if (value.action === "ask") return { action: "ask", question: parseRevisionQuestion(value.question) };
+  if (value.action === "review") return { action: "review", proposal: parseRevisionProposal(value.proposal) };
+  throw new Error("Plan revision supervisor returned an invalid action");
+}
+
+export function parsePlanRevisionReview(output: string): PlanRevisionReview {
+  const value = parseJsonObject(output, "Plan revision reviewer");
+  if (typeof value.approved !== "boolean" || typeof value.summary !== "string" || !value.summary.trim()) throw new Error("Plan revision reviewer returned an invalid decision");
+  const decision: PlanRevisionReview = { approved: value.approved, summary: value.summary.trim() };
+  if (!value.approved && value.question !== undefined) {
+    try { decision.question = parseRevisionQuestion(value.question); } catch { /* fall back to a text card carrying the review summary */ }
+  }
+  return decision;
+}
+
+function parseRevisionQuestion(value: unknown): RevisionQuestion {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Plan revision question is invalid");
+  const question = value as Record<string, unknown>;
+  const type = question.type;
+  const options = question.options === undefined ? [] : question.options;
+  if (!REVISION_INTERACTIONS.includes(type as RevisionQuestion["type"]) || typeof question.prompt !== "string" || !question.prompt.trim() || !Array.isArray(options) || options.some((option) => typeof option !== "string" || !option.trim())) throw new Error("Plan revision question is invalid");
+  if (type === "boolean" && options.length !== 2) throw new Error("Plan revision boolean requires exactly two options");
+  if (type === "single_choice" && options.length < 2) throw new Error("Plan revision question requires at least two options");
+  if (type === "multiple_choice" && !options.length) throw new Error("Plan revision question requires options");
+  if (type === "text" && options.length) throw new Error("Plan revision text question cannot have options");
+  return { type: type as RevisionQuestion["type"], prompt: question.prompt.trim(), options: options.map(String) };
+}
+
+function parseJsonObject(output: string, label: string): Record<string, unknown> {
+  const json = /```(?:json)?\s*([\s\S]*?)```/i.exec(output)?.[1] ?? output.slice(output.indexOf("{"), output.lastIndexOf("}") + 1);
+  let value: unknown;
+  try { value = JSON.parse(json); } catch { throw new Error(`${label} returned invalid JSON`); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} returned invalid JSON`);
+  return value as Record<string, unknown>;
 }
 
 function applySupervisorDecision(database: DatabaseSync, run: RunRow, decision: SupervisorDecision): "queued" | "blocked" {
@@ -592,7 +784,8 @@ function applySupervisorDecision(database: DatabaseSync, run: RunRow, decision: 
     database.prepare("UPDATE tasks SET status = 'blocked', blocked_reason = ?, updated_at = ? WHERE id = ?").run(reason, now, run.task_id);
     const task = database.prepare("SELECT title FROM tasks WHERE id = ?").get(run.task_id) as { title: string };
     addRunCommentOnce(database, { taskId: run.task_id, runId: run.id, authorType: "system", kind: "blocker", content: reason });
-    addMainTaskComment(database, { sourceTaskId: run.task_id, runId: run.id, kind: "blocker", content: `主管恢复判断要求人工处理。\n\n${decision.summary}` });
+    if (decision.action === "replan") beginPlanRevision(database, run.commission_id, decision.summary);
+    else addMainTaskComment(database, { sourceTaskId: run.task_id, runId: run.id, kind: "blocker", content: `主管恢复判断要求人工处理。\n\n${decision.summary}` });
     notify(database, "blocked", `任务阻塞：${task.title}`, reason, "task", run.task_id);
     return "blocked";
   }
@@ -614,6 +807,13 @@ function applySupervisorDecision(database: DatabaseSync, run: RunRow, decision: 
 
 function databaseRunTriggeredBy(database: DatabaseSync, runId: string, role: string): string | undefined {
   return (database.prepare("SELECT id FROM runs WHERE trigger_ref_id = ? AND role = ? ORDER BY rowid LIMIT 1").get(runId, role) as { id: string } | undefined)?.id;
+}
+
+function finalCoordinationMainTask(database: DatabaseSync, commissionId: string): string | undefined {
+  const main = database.prepare("SELECT main_task_id FROM commissions WHERE id = ? AND status IN ('active', 'blocked') AND archived_at IS NULL").get(commissionId) as { main_task_id: string | null } | undefined;
+  if (!main?.main_task_id) return undefined;
+  const state = database.prepare("SELECT COUNT(*) AS total, SUM(status <> 'done') AS unfinished FROM tasks WHERE commission_id = ? AND id <> ? AND archived_at IS NULL").get(commissionId, main.main_task_id) as { total: number; unfinished: number | null };
+  return state.total > 0 && !state.unfinished ? main.main_task_id : undefined;
 }
 
 export type ReviewResult = { passed: boolean; summary: string; checks: unknown[]; findings: unknown[] };
@@ -672,11 +872,12 @@ function reviewComment(review: ReviewResult): string {
 
 function canStartRun(database: DatabaseSync, run: RunRow): boolean {
   if (!run.execution_grant_id || grantById(database, run.execution_grant_id).status !== "active") return false;
+  if (run.trigger_type === "coordinate" && !database.prepare("SELECT 1 FROM commissions WHERE id = ? AND coordination_revision = ? AND coordination_pending = 1").get(run.commission_id, run.coordination_revision)) return false;
   if (!database.prepare(`SELECT 1 FROM commissions AS commission
     JOIN projects AS project ON project.id = commission.project_id
     JOIN root_paths AS root ON root.id = project.root_path_id
     WHERE commission.id = ? AND commission.status = 'active' AND commission.archived_at IS NULL AND project.archived_at IS NULL AND root.enabled = 1`).get(run.commission_id)) return false;
-  const taskStatus = run.trigger_type === "review" || run.trigger_type === "rework" || run.trigger_type === "coordinate" ? "in_progress" : "todo";
+  const taskStatus = ["review", "rework", "coordinate", "plan_revision", "plan_revision_review"].includes(run.trigger_type) ? "in_progress" : "todo";
   if (!database.prepare("SELECT 1 FROM tasks WHERE id = ? AND status = ? AND archived_at IS NULL").get(run.task_id, taskStatus)) return false;
   if (database.prepare("SELECT 1 FROM task_dependencies AS dependency JOIN tasks AS required ON required.id = dependency.depends_on_task_id WHERE dependency.task_id = ? AND required.status <> 'done' LIMIT 1").get(run.task_id)) return false;
   if (database.prepare("SELECT 1 FROM approvals JOIN runs ON runs.id = approvals.run_id WHERE runs.project_id = ? AND approvals.kind = 'high_risk' AND approvals.status = 'pending' LIMIT 1").get(run.project_id)) return false;

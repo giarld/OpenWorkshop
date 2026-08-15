@@ -253,3 +253,5 @@ Web 工作台 / Workshop CLI
 ```bash
 npm test
 ```
+
+`task create/update/reorder/dependency/archive/unarchive` 等结构管理命令继续保留，但属于项目主管 Agent 级能力。CLI 命令直接执行，不额外启动 supervisor 调度；服务端会拒绝活动 Run 或待确认计划修订期间的结构修改，并递增任务树协调版本，使已经排队的 Coordinator 刷新上下文。Web 人工界面不直接提供任务结构编辑或删除；人工应在主任务评论中提出调整要求，由项目主管生成修订、经过 supervisor 审查并通过“计划修订待确认卡”确认后执行。修订中逻辑删除的任务可从任务看板筛选栏右侧的“历史任务”弹出页只读查看，不再参与调度、依赖、统计或验收。

@@ -66,7 +66,12 @@ test("compresses a clarified commission and restores its documents, tasks, histo
     const dependentTaskId = insertTask(database, otherCommissionId);
     const now = new Date().toISOString();
     database.prepare("UPDATE commissions SET main_task_id = ? WHERE id = ?").run(taskId, commissionId);
-    database.prepare("INSERT INTO comments (id, task_id, author_type, kind, content, created_at) VALUES (?, ?, 'human', 'normal', 'history', ?)").run(randomUUID(), taskId, now);
+    const commentId = randomUUID();
+    database.prepare("INSERT INTO comments (id, task_id, author_type, kind, content, created_at) VALUES (?, ?, 'human', 'normal', 'history', ?)").run(commentId, taskId, now);
+    const revisionId = randomUUID();
+    const coordinationRevision = (database.prepare("SELECT coordination_revision FROM commissions WHERE id = ?").get(commissionId) as { coordination_revision: number }).coordination_revision;
+    database.prepare("INSERT INTO plan_revisions (id, commission_id, base_coordination_revision, status, created_at, updated_at) VALUES (?, ?, ?, 'collecting', ?, ?)").run(revisionId, commissionId, coordinationRevision, now, now);
+    database.prepare("INSERT INTO plan_revision_cards (comment_id, plan_revision_id, interaction_type, purpose, options_json, status) VALUES (?, ?, 'text', 'question', '[]', 'pending')").run(commentId, revisionId);
     const notificationId = randomUUID();
     database.prepare("INSERT INTO notifications (id, kind, title, body, entity_type, entity_id, created_at) VALUES (?, 'blocked', 'Historical', 'Do not replay', 'task', ?, ?)").run(notificationId, taskId, now);
     const runId = randomUUID();
@@ -97,6 +102,8 @@ test("compresses a clarified commission and restores its documents, tasks, histo
     const archiving = archiveCommission(database, attachmentsRoot, commissionId);
     assert.equal((database.prepare("SELECT lifecycle_operation FROM commissions WHERE id = ?").get(commissionId) as { lifecycle_operation: string }).lifecycle_operation, "archiving");
     assert.throws(() => database.prepare("INSERT INTO comments (id, task_id, author_type, kind, content, created_at) VALUES (?, ?, 'human', 'normal', 'late write', ?)").run(randomUUID(), taskId, now), /lifecycle operation/i);
+    assert.throws(() => database.prepare("UPDATE plan_revisions SET status = 'reviewing' WHERE id = ?").run(revisionId), /lifecycle operation/i);
+    assert.throws(() => database.prepare("UPDATE plan_revision_cards SET status = 'answered' WHERE comment_id = ?").run(commentId), /lifecycle operation/i);
     const archivedCommission = await archiving as { archive_path: string; archive_size_bytes: number; status: string };
     assert.equal(archivedCommission.status, "archived");
     assert.ok(archivedCommission.archive_size_bytes > 0);
@@ -135,6 +142,10 @@ test("compresses a clarified commission and restores its documents, tasks, histo
     const restored = reactivationResults.find((result): result is PromiseFulfilledResult<Record<string, unknown>> => result.status === "fulfilled")!.value as { status: string; active_requirement_version_id: string; main_task_id: string; archive_path: null };
     assert.deepEqual({ status: restored.status, requirement: restored.active_requirement_version_id, task: restored.main_task_id, archive: restored.archive_path }, { status: "planned", requirement: requirement.id, task: taskId, archive: null });
     assert.equal((database.prepare("SELECT content FROM comments WHERE task_id = ?").get(taskId) as { content: string }).content, "history");
+    assert.equal((database.prepare("SELECT status FROM plan_revisions WHERE id = ?").get(revisionId) as { status: string }).status, "collecting");
+    assert.equal((database.prepare("SELECT status FROM plan_revision_cards WHERE comment_id = ?").get(commentId) as { status: string }).status, "pending");
+    assert.deepEqual({ ...database.prepare("SELECT coordination_revision FROM commissions WHERE id = ?").get(commissionId) }, { coordination_revision: coordinationRevision });
+    assert.deepEqual({ ...database.prepare("SELECT base_coordination_revision FROM plan_revisions WHERE id = ?").get(revisionId) }, { base_coordination_revision: coordinationRevision });
     assert.equal((database.prepare("SELECT system_notified_at FROM notifications WHERE id = ?").get(notificationId) as { system_notified_at: string }).system_notified_at, now);
     assert.equal((database.prepare("SELECT summary FROM run_events WHERE run_id = ?").get(runId) as { summary: string }).summary, "done");
     assert.equal((database.prepare("SELECT content_markdown FROM document_versions WHERE id = ?").get(versionId) as { content_markdown: string }).content_markdown, "# Document");

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canDropTask, filterAndSortTasks, preferredProjectId, taskChildren, taskSwimlaneGroups, taskSwimlanes, workspaceOverviewStats, type Task } from "./task-board.ts";
+import type { ClientRect, CollisionDetection, DroppableContainer } from "@dnd-kit/core";
+import { boardCollisionDetection, canDropTask, filterAndSortTasks, preferredProjectId, taskChildren, taskDropPreview, taskSwimlaneGroups, taskSwimlanes, workspaceOverviewStats, type Task } from "./task-board.ts";
 
 const base = {
   commission_id: "commission",
@@ -12,6 +13,9 @@ const base = {
   created_at: "2026-08-01T00:00:00Z",
   updated_at: "2026-08-01T00:00:00Z",
   archived_at: null,
+  read_only: 0,
+  acceptanceCriteria: [],
+  dependencyIds: [],
   auto_approve_permissions: 0,
   labels: []
 } satisfies Partial<Task>;
@@ -79,6 +83,37 @@ test("moves a swimlane into the archived group when its main task is archived", 
 test("matches board drop feedback to server transition rules", () => {
   assert.equal(canDropTask(tasks[1]!, "in_progress", tasks), true);
   assert.equal(canDropTask(tasks[0]!, "done", tasks), false);
+  assert.equal(canDropTask(tasks[0]!, "blocked", tasks), false);
   assert.equal(canDropTask(tasks[0]!, "archived", tasks), false);
-  assert.equal(canDropTask({ ...tasks[1]!, status: "done" }, "todo", tasks), false);
+  assert.equal(canDropTask({ ...tasks[1]!, status: "done" }, "todo", tasks), true);
+  assert.equal(canDropTask({ ...tasks[1]!, status: "done" }, "todo", tasks.map((task) => task.id === "main" ? { ...task, status: "done" } : task)), false);
+});
+
+test("uses the pointer position within the main task swimlane columns", () => {
+  const rect = (left: number, top = 0, width = 100, height = 100): ClientRect => ({ left, top, width, height, right: left + width, bottom: top + height });
+  const droppable = (id: string): DroppableContainer => ({ id, key: id, disabled: false, data: { current: undefined }, node: { current: null }, rect: { current: null } });
+  const droppableRects = new Map([
+    ["column:main:todo", rect(0, 0, 100, 900)],
+    ["column:main:in_progress", rect(100, 0, 100, 900)],
+    ["column:main:done", rect(200, 0, 100, 900)],
+    ["todo-child", rect(0)],
+    ["done-child", rect(200)]
+  ]);
+  const args: Parameters<CollisionDetection>[0] = {
+    active: { id: "main", data: { current: { task: tasks[0] } }, rect: { current: { initial: null, translated: null } } },
+    collisionRect: rect(60),
+    droppableRects,
+    droppableContainers: [...droppableRects.keys()].map(droppable),
+    pointerCoordinates: { x: 110, y: 50 }
+  };
+
+  assert.equal(boardCollisionDetection(args)[0]?.id, "column:main:in_progress");
+  assert.equal(boardCollisionDetection({ ...args, active: { ...args.active, data: { current: { task: tasks[1] } } } })[0]?.id, "todo-child");
+});
+
+test("creates a static cross-column preview without mutating the task", () => {
+  const preview = taskDropPreview(tasks[1], "in_progress", tasks);
+
+  assert.deepEqual({ id: preview?.id, status: preview?.status }, { id: "same", status: "in_progress" });
+  assert.equal(tasks[1]?.status, "todo");
 });

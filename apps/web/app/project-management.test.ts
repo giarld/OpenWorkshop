@@ -33,6 +33,7 @@ test("restores a valid workspace page and rejects stale values", () => {
   assert.equal(storedWorkspaceView("projects"), "projects");
   assert.equal(storedWorkspaceView("settings"), "settings");
   assert.equal(storedWorkspaceView("usage"), "usage");
+  assert.equal(storedWorkspaceView("history"), "board");
   assert.equal(storedWorkspaceView("removed-page"), "commissions");
   assert.equal(storedWorkspaceView(null), "commissions");
 });
@@ -40,6 +41,7 @@ test("restores a valid workspace page and rejects stale values", () => {
 test("keeps the saved workspace page on refresh instead of letting a stale hash override it", () => {
   assert.equal(initialWorkspaceView("delivery", "#task-old"), "delivery");
   assert.equal(initialWorkspaceView("settings", "#approval-old"), "settings");
+  assert.equal(initialWorkspaceView("history", ""), "board");
   assert.equal(initialWorkspaceView(null, "#task-current"), "board");
   assert.equal(initialWorkspaceView("removed-page", "#approval-current"), "notifications");
   assert.equal(initialWorkspaceView(null, ""), "commissions");
