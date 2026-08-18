@@ -716,17 +716,15 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsB
   const [activeTab, setActiveTab] = useState<"comments" | "runs" | "evidence" | "changes">("comments");
   const [openRunIds, setOpenRunIds] = useState<Set<string>>(new Set());
   const [comments, setComments] = useState<TaskComment[]>([]);
-  const [commentsLoaded, setCommentsLoaded] = useState(false);
   const [commentBusy, setCommentBusy] = useState(false);
   const [commentError, setCommentError] = useState("");
   const [commentUploadProgress, setCommentUploadProgress] = useState<AttachmentUploadProgress | null>(null);
   useEffect(() => {
     setActiveTab("comments");
     setCommentError("");
-    setCommentsLoaded(false);
     if (!task) { setComments([]); return; }
     let current = true;
-    const load = () => void api<TaskComment[]>(`/api/tasks/${task.id}/comments`).then((items) => { if (current) { setComments(items); setCommentsLoaded(true); } }).catch((error: Error) => { if (current && !comments.length) setCommentError(error.message); });
+    const load = () => void api<TaskComment[]>(`/api/tasks/${task.id}/comments`).then((items) => { if (current) setComments(items); }).catch((error: Error) => { if (current && !comments.length) setCommentError(error.message); });
     load();
     const timer = window.setInterval(load, 2000);
     return () => { current = false; window.clearInterval(timer); };
@@ -784,7 +782,7 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsB
   }
   return <dialog ref={dialog} className="commission-dialog task-run-dialog" onClose={onClose}>
     <header className="commission-dialog-header"><div><p className="eyebrow">Task Execution</p><h2>任务运行</h2>{task && <p><TaskTitle task={task} /></p>}</div><div className="task-run-header-actions"><button className="secondary dialog-close" onClick={onClose}>关闭</button></div></header>
-    {task && <div className="task-run-layout commission-dialog-body">
+    {task && <div key={task.id} className="task-run-layout commission-dialog-body">
     <main className="task-run-content">
       <div className="task-run-summary"><span>{latest ? `Run #${latest.attempt_no} · ${latest.role} · ${latest.status}` : "尚未运行"}</span>{latest && active && <RunElapsedTimer run={latest} />}</div>
       <TaskTokenSummary runs={tokenRuns} tree={!task.parent_id} />
@@ -806,7 +804,7 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsB
         {([['comments', '评论'], ['runs', '运行记录'], ['evidence', '评审证据'], ['changes', '修改记录']] as const).map(([id, label]) => <button key={id} type="button" role="tab" aria-selected={activeTab === id} className={activeTab === id ? "active" : ""} onClick={() => setActiveTab(id)}>{label}{id === "comments" && comments.length > 0 ? ` ${comments.length}` : id === "runs" && runs.length > 0 ? ` ${runs.length}` : id === "evidence" && evidence.length > 0 ? ` ${evidence.length}` : id === "changes" && codeChanges.length > 0 ? ` ${codeChanges.length}` : ""}</button>)}
       </div>
       <div className="task-run-tab-panel" role="tabpanel">
-        {activeTab === "comments" && <TaskComments key={task.id} comments={comments} loaded={commentsLoaded} tasks={tasks.filter((item) => item.commission_id === task.commission_id)} mentionTasks={tasks.filter((item) => item.commission_id === task.commission_id && item.status !== "archived")} readOnly={task.status === "archived"} busy={commentBusy} error={commentError} uploadProgress={commentUploadProgress} onSubmit={submitComment} onDelete={deleteComment} onRespond={respondRevisionCard} onOpenTask={onOpenTask} />}
+        {activeTab === "comments" && <TaskComments key={task.id} comments={comments} tasks={tasks.filter((item) => item.commission_id === task.commission_id)} mentionTasks={tasks.filter((item) => item.commission_id === task.commission_id && item.status !== "archived")} readOnly={task.status === "archived"} busy={commentBusy} error={commentError} uploadProgress={commentUploadProgress} onSubmit={submitComment} onDelete={deleteComment} onRespond={respondRevisionCard} onOpenTask={onOpenTask} />}
         {activeTab === "runs" && <div className="run-records">{runs.length ? runs.map((run, index) => <RunTimelineGroup key={run.id} run={run} events={eventsByRun[run.id] ?? []} current={index === 0} open={openRunIds.has(run.id)} onToggle={(nextOpen) => setOpenRunIds((current) => { const next = new Set(current); if (nextOpen) next.add(run.id); else next.delete(run.id); return next; })} />) : <p className="task-tab-empty">启动任务后可在这里跟进执行过程。</p>}</div>}
         {activeTab === "evidence" && <EvidenceRecords evidence={evidence} />}
         {activeTab === "changes" && <CodeChanges changes={codeChanges} />}
@@ -835,13 +833,12 @@ function TaskReadonlyProperties({ task, tasks }: { task: Task; tasks: Task[] }) 
   </section>;
 }
 
-function TaskComments({ comments, loaded, tasks, mentionTasks, readOnly, busy, error, uploadProgress, onSubmit, onDelete, onRespond, onOpenTask }: { comments: TaskComment[]; loaded: boolean; tasks: Task[]; mentionTasks: Task[]; readOnly: boolean; busy: boolean; error: string; uploadProgress: AttachmentUploadProgress | null; onSubmit(event: FormEvent<HTMLFormElement>): Promise<boolean>; onDelete(comment: TaskComment): Promise<void>; onRespond(comment: TaskComment, answer: string | string[]): Promise<void>; onOpenTask(task: Task): Promise<void> }) {
+function TaskComments({ comments, tasks, mentionTasks, readOnly, busy, error, uploadProgress, onSubmit, onDelete, onRespond, onOpenTask }: { comments: TaskComment[]; tasks: Task[]; mentionTasks: Task[]; readOnly: boolean; busy: boolean; error: string; uploadProgress: AttachmentUploadProgress | null; onSubmit(event: FormEvent<HTMLFormElement>): Promise<boolean>; onDelete(comment: TaskComment): Promise<void>; onRespond(comment: TaskComment, answer: string | string[]): Promise<void>; onOpenTask(task: Task): Promise<void> }) {
   const [replyTo, setReplyTo] = useState<TaskComment | null>(null);
   const [mention, setMention] = useState<MentionTrigger | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const textarea = useRef<HTMLTextAreaElement>(null);
   const commentList = useRef<HTMLDivElement>(null);
-  const initialScrollDone = useRef(false);
   const mentionOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [avatars, setAvatars] = useState<AvatarSettings>(DEFAULT_AVATARS);
   const rows = commentThreadRows(comments);
@@ -851,15 +848,6 @@ function TaskComments({ comments, loaded, tasks, mentionTasks, readOnly, busy, e
     window.addEventListener(AVATAR_SETTINGS_EVENT, update);
     return () => window.removeEventListener(AVATAR_SETTINGS_EVENT, update);
   }, []);
-  useEffect(() => {
-    if (!loaded || initialScrollDone.current) return;
-    initialScrollDone.current = true;
-    const frame = window.requestAnimationFrame(() => {
-      const target = commentList.current;
-      if (target) target.scrollTop = target.scrollHeight;
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [loaded]);
   const mentionOptions = useMemo(() => {
     const options = [
       { id: "role-agent", group: "角色", value: "@Agent", label: "AI Agent", description: "执行或介入当前任务" },
@@ -871,7 +859,7 @@ function TaskComments({ comments, loaded, tasks, mentionTasks, readOnly, busy, e
   useEffect(() => {
     if (mention) mentionOptionRefs.current[mentionIndex]?.scrollIntoView({ block: "nearest" });
   }, [mention, mentionIndex]);
-  const submit = async (event: FormEvent<HTMLFormElement>) => { if (await onSubmit(event)) { setReplyTo(null); setMention(null); window.requestAnimationFrame(() => { const target = commentList.current; if (target) target.scrollTop = target.scrollHeight; }); } };
+  const submit = async (event: FormEvent<HTMLFormElement>) => { if (await onSubmit(event)) { setReplyTo(null); setMention(null); window.requestAnimationFrame(() => commentList.current?.parentElement?.scrollIntoView({ block: "end", inline: "nearest" })); } };
   const refreshMention = (target: HTMLTextAreaElement) => {
     setMention(mentionTriggerAtCursor(target.value, target.selectionStart ?? target.value.length));
     setMentionIndex(0);
@@ -887,7 +875,7 @@ function TaskComments({ comments, loaded, tasks, mentionTasks, readOnly, busy, e
   return <div className="task-comments">
     <div ref={commentList} className="task-comment-list">{rows.length ? rows.map(({ comment, depth }) => <article key={comment.id} className={`task-comment comment-${comment.author_type}`} style={{ "--comment-depth": Math.min(depth, 4) } as React.CSSProperties}>
       <CommentAvatar value={comment.author_type === "human" ? avatars.humanAvatar : comment.author_type === "agent" ? avatars.agentAvatar : "系"} />
-      <div className={`comment-card ${comment.deleted_at ? "deleted" : ""} ${comment.revisionCard ? "revision-card" : ""}`}><header><span><strong>{comment.author_type === "human" ? "人工负责人" : comment.agent_role ? ROLE_LABELS[comment.agent_role] ?? comment.agent_role : comment.author_type === "agent" ? "AI Agent" : "系统"}</strong>{comment.author_type === "agent" && <small>Agent</small>}{comment.run_id && <small>Run</small>}</span><time>{new Date(comment.created_at).toLocaleString()}</time></header>{comment.deleted_at ? <p className="comment-deleted">评论已删除</p> : <>{comment.content && <CommentMarkdown content={comment.content} tasks={tasks} onOpenTask={onOpenTask} />}<AttachmentList taskId={comment.task_id} attachments={comment.attachments ?? []} />{comment.revisionCard && <PlanRevisionCard comment={comment} busy={busy || readOnly} onRespond={onRespond} />}</>}{!readOnly && !comment.deleted_at && !comment.revisionCard && <footer><button type="button" className="comment-reply" onClick={() => { setReplyTo(comment); window.setTimeout(() => textarea.current?.focus(), 0); }}>回复</button><button type="button" className="comment-delete" onClick={() => void onDelete(comment)}>删除</button></footer>}</div>
+      <div className={`comment-card ${comment.deleted_at ? "deleted" : ""} ${comment.revisionCard ? "revision-card" : ""}`}><header><span><strong>{comment.author_type === "human" ? "人工负责人" : comment.agent_role ? ROLE_LABELS[comment.agent_role] ?? comment.agent_role : comment.author_type === "agent" ? "AI Agent" : "系统"}</strong>{comment.author_type === "agent" && <small>Agent</small>}{comment.run_id && <small>Run</small>}</span><time>{new Date(comment.created_at).toLocaleString()}</time></header>{comment.deleted_at ? <p className="comment-deleted">评论已删除</p> : <>{comment.content && <CommentMarkdown content={comment.content} tasks={tasks} onOpenTask={onOpenTask} />}<AttachmentList taskId={comment.task_id} attachments={comment.attachments ?? []} />{comment.revisionCard && <PlanRevisionCard comment={comment} busy={busy || readOnly} onRespond={onRespond} />}</>}{!readOnly && !comment.deleted_at && !comment.revisionCard && <footer><button type="button" className="comment-reply" onClick={() => { setReplyTo(comment); window.setTimeout(() => textarea.current?.focus(), 0); }}>回复</button>{comment.author_type === "human" && <button type="button" className="comment-delete" onClick={() => void onDelete(comment)}>删除</button>}</footer>}</div>
     </article>) : <p className="task-tab-empty">{readOnly ? "该归档任务没有历史评论。" : "暂无评论，输入一条协作信息开始讨论。"}</p>}</div>
     {readOnly ? <p className="task-tab-empty">归档任务的评论为只读，历史记录仍会保留。</p> : <form className="task-comment-form" onSubmit={(event) => void submit(event)}>
       {replyTo && <div className="comment-replying"><span>回复 {replyTo.author_type === "human" ? "人工负责人" : replyTo.agent_role ? ROLE_LABELS[replyTo.agent_role] ?? replyTo.agent_role : "系统"}：{replyTo.content.slice(0, 60)}</span><button type="button" className="secondary compact" onClick={() => setReplyTo(null)}>取消回复</button></div>}

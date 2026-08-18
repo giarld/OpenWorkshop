@@ -333,6 +333,9 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
 
   server.delete<{ Params: { id: string; commentId: string } }>("/api/tasks/:id/comments/:commentId", async (request, reply) => {
     activeTask(database, request.params.id);
+    const comment = database.prepare("SELECT author_type FROM comments WHERE id = ? AND task_id = ?").get(request.params.commentId, request.params.id) as { author_type: string } | undefined;
+    if (!comment) throw notFound("Comment not found");
+    if (comment.author_type !== "human") throw conflict("Only human comments can be deleted");
     if (database.prepare("SELECT 1 FROM plan_revision_cards WHERE comment_id = ?").get(request.params.commentId)) throw conflict("Plan revision cards cannot be deleted");
     const result = database.prepare("UPDATE comments SET content = '', deleted_at = COALESCE(deleted_at, ?) WHERE id = ? AND task_id = ?")
       .run(new Date().toISOString(), request.params.commentId, request.params.id);

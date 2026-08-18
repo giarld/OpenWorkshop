@@ -248,7 +248,9 @@ test("supports issue-style replies, @Agent routing, and AI mentions of the human
     assert.ok(deletedRoot.deleted_at);
     assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM comments WHERE parent_id = ?").get(root.json().id) as { count: number }).count, 1);
 
-    addTaskComment(fixture.database, { taskId: task.id, authorType: "agent", agentRole: "developer", content: "@负责人 请确认风险。" });
+    const agentComment = addTaskComment(fixture.database, { taskId: task.id, authorType: "agent", agentRole: "developer", content: "@负责人 请确认风险。" });
+    assert.equal((await fixture.server.inject({ method: "DELETE", url: `/api/tasks/${task.id}/comments/${agentComment.id}` })).statusCode, 409);
+    assert.equal((fixture.database.prepare("SELECT content FROM comments WHERE id = ?").get(agentComment.id) as { content: string }).content, "@负责人 请确认风险。");
     assert.equal((fixture.database.prepare("SELECT kind FROM notifications WHERE entity_type = 'task' AND entity_id = ? ORDER BY rowid DESC LIMIT 1").get(task.id) as { kind: string }).kind, "mention");
     fixture.database.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(task.id);
     assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${task.id}/archive` })).statusCode, 200);
