@@ -244,6 +244,7 @@ function clearCommissionRows(database: DatabaseSync, commissionId: string, notif
   database.prepare("DELETE FROM plan_revision_cards WHERE plan_revision_id IN (SELECT id FROM plan_revisions WHERE commission_id = ?)").run(commissionId);
   database.prepare("UPDATE tasks SET deleted_revision_id = NULL WHERE commission_id = ?").run(commissionId);
   database.prepare("DELETE FROM plan_revisions WHERE commission_id = ?").run(commissionId);
+  database.prepare("DELETE FROM attachments WHERE commission_id = ?").run(commissionId);
   database.prepare("DELETE FROM comments WHERE task_id IN (SELECT id FROM tasks WHERE commission_id = ?)").run(commissionId);
   database.prepare("DELETE FROM task_labels WHERE task_id IN (SELECT id FROM tasks WHERE commission_id = ?)").run(commissionId);
   database.prepare("DELETE FROM task_dependencies WHERE task_id IN (SELECT id FROM tasks WHERE commission_id = ?) OR depends_on_task_id IN (SELECT id FROM tasks WHERE commission_id = ?)").run(commissionId, commissionId);
@@ -252,7 +253,6 @@ function clearCommissionRows(database: DatabaseSync, commissionId: string, notif
   database.prepare("UPDATE documents SET current_version_id = NULL WHERE commission_id = ?").run(commissionId);
   database.prepare("DELETE FROM document_versions WHERE document_id IN (SELECT id FROM documents WHERE commission_id = ?)").run(commissionId);
   database.prepare("DELETE FROM documents WHERE commission_id = ?").run(commissionId);
-  database.prepare("DELETE FROM attachments WHERE commission_id = ?").run(commissionId);
   database.prepare("DELETE FROM tasks WHERE commission_id = ?").run(commissionId);
   database.prepare("DELETE FROM requirement_messages WHERE commission_id = ?").run(commissionId);
   database.prepare("DELETE FROM requirement_versions WHERE commission_id = ?").run(commissionId);

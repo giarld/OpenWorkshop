@@ -7,6 +7,7 @@ type Command = { method: Method; path: (args: string[]) => string; args: number;
 
 const id = (resource: string, suffix = "") => (args: string[]) => `/api/${resource}/${encodeURIComponent(args[0]!)}${suffix}`;
 const nested = (resource: string, suffix: string) => (args: string[]) => `/api/${resource}/${encodeURIComponent(args[0]!)}/${suffix.replace(":id", encodeURIComponent(args[1]!))}`;
+const taskNumber = (args: string[]) => `/api/projects/${encodeURIComponent(args[0]!)}/tasks/by-number/${encodeURIComponent(args[1]!)}`;
 
 export const WORKFLOW_COMMANDS: Record<string, Command> = {
   "root list": { method: "GET", path: () => "/api/roots", args: 0 },
@@ -36,7 +37,9 @@ export const WORKFLOW_COMMANDS: Record<string, Command> = {
   "task list": { method: "GET", path: id("projects", "/tasks"), args: 1 },
   "task create": { method: "POST", path: id("commissions", "/tasks"), args: 1, body: true },
   "task get": { method: "GET", path: id("tasks"), args: 1 },
+  "task get-number": { method: "GET", path: taskNumber, args: 2 },
   "task update": { method: "PUT", path: id("tasks"), args: 1, body: true },
+  "task delete": { method: "DELETE", path: id("tasks"), args: 1, body: true },
   "task move": { method: "POST", path: id("tasks", "/move"), args: 1, body: true },
   "task reorder": { method: "POST", path: id("tasks", "/reorder"), args: 1, body: true },
   "task archive": { method: "POST", path: id("tasks", "/archive"), args: 1 },
@@ -85,6 +88,7 @@ export async function parseWorkflowCommand(argv: string[]): Promise<WorkflowRequ
       data: { type: "string" },
       "data-file": { type: "string" },
       query: { type: "string" },
+      "query-file": { type: "string" },
       file: { type: "string" },
       "content-type": { type: "string" },
       "server-url": { type: "string" },
@@ -92,20 +96,26 @@ export async function parseWorkflowCommand(argv: string[]): Promise<WorkflowRequ
     }
   });
   if (values.data && values["data-file"]) throw new Error("Use only one of --data or --data-file");
+  if (values.query && values["query-file"]) throw new Error("Use only one of --query or --query-file");
   const generic = positionals[0] === "api";
   const key = generic ? "api" : `${positionals[0] ?? ""} ${positionals[1] ?? ""}`;
   const command = generic ? genericCommand(positionals) : WORKFLOW_COMMANDS[key];
   if (!command) throw new Error(`Unsupported workflow command: ${key.trim()}`);
   const args = positionals.slice(generic ? 3 : 2);
   if (args.length !== command.args) throw new Error(`Usage error: ${key} expects ${command.args} positional argument(s)`);
-  const body = values.file ? new Uint8Array(await readFile(values.file)) : values["data-file"] ? await readFile(values["data-file"], "utf8") : values.data;
+  const body = values.file ? new Uint8Array(await readFile(values.file)) : values["data-file"] ? await readJsonFile(values["data-file"]) : values.data;
   if (command.body && body === undefined) throw new Error(`${key} requires --data or --data-file`);
   if (command.file && !values.file) throw new Error(`${key} requires --file`);
   if (typeof body === "string") JSON.parse(body);
-  const query = values.query ? JSON.parse(values.query) as Record<string, unknown> : {};
+  const queryJson = values["query-file"] ? await readJsonFile(values["query-file"]) : values.query;
+  const query = queryJson ? JSON.parse(queryJson) as Record<string, unknown> : {};
   if (!query || Array.isArray(query) || typeof query !== "object") throw new Error("--query must be a JSON object");
   if (!['pretty', 'json'].includes(values.output!)) throw new Error("--output must be pretty or json");
   return { method: command.method, path: command.path(args), query, ...(body === undefined ? {} : { body }), ...(body === undefined ? {} : { contentType: values["content-type"] ?? (values.file ? "application/octet-stream" : "application/json") }), ...(values.file ? { headers: { "X-File-Name": encodeURIComponent(basename(values.file)) } } : {}), ...(command.text ? { text: true } : {}), output: values.output!, ...(values["server-url"] ? { serverUrl: values["server-url"] } : {}) };
+}
+
+async function readJsonFile(path: string): Promise<string> {
+  return (await readFile(path, "utf8")).replace(/^\uFEFF/, "");
 }
 
 function genericCommand(positionals: string[]): Command {
@@ -118,7 +128,7 @@ function genericCommand(positionals: string[]): Command {
 
 export function workflowHelp(): string {
   const families = [...new Set(Object.keys(WORKFLOW_COMMANDS).map((key) => key.split(" ")[0]))];
-  return `Workflow commands:\n  ${families.join(", ")}\n\nUsage:\n  workshop <family> <action> [id ...] [--query '{...}'] [--data '{...}' | --data-file path] [--output json]\n  workshop commission attachment <id> --file path [--content-type type]\n  workshop api <GET|POST|PUT|DELETE> /api/path [--query '{...}'] [--data '{...}']\n\nRun "workshop <family> help" to list actions.`;
+  return `Workflow commands:\n  ${families.join(", ")}\n\nUsage:\n  workshop <family> <action> [id ...] [--query '{...}' | --query-file path] [--data '{...}' | --data-file path] [--output json]\n  workshop commission attachment <id> --file path [--content-type type]\n  workshop api <GET|POST|PUT|DELETE> /api/path [--query '{...}' | --query-file path] [--data '{...}' | --data-file path]\n\nRun "workshop <family> help" to list actions.`;
 }
 
 export function familyHelp(family: string): string {

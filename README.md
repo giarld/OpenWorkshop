@@ -1,85 +1,93 @@
 # OpenWorkshop
 
-> 面向本地软件项目的自主工程工作台：把一句委托推进为经过澄清、规划、执行、评审和人工验收的完整交付。
+**English** | [简体中文](README.zh-CN.md)
 
-OpenWorkshop 将现有本地代码库、固定角色 Codex Agent 和人工决策组织成一条可追踪的工程工作流。你负责提出目标、批准需求和验收结果；系统负责整理上下文、拆分任务、调度 Agent、记录执行过程并归档交付文档。
+> As the client, you only need to tell an AI Agent what you need; OpenWorkshop then works like a professional software company—clarifying requirements, breaking down tasks, building, reviewing, and delivering an acceptance-ready result.
 
-它同时提供 Web 工作台和结构化 CLI。人可以在浏览器中查看项目与介入执行，Codex 等 Agent App 也可以通过 CLI 控制同一套工作流。
+OpenWorkshop organizes existing local codebases, dedicated Codex Agent roles, and human decisions into a traceable engineering workflow. You set the objective, approve requirements, and accept the result; the system assembles context, breaks work into tasks, schedules Agents, records execution, and archives delivery documents.
 
-## 为什么使用 OpenWorkshop
+It provides both a web workbench and a structured CLI. People can inspect projects and intervene from the browser, while Codex and other Agent apps can control the same workflow through the CLI.
 
-- **本地优先**：代码、SQLite 数据库、附件和运行记录保存在自己的主机，不依赖外部项目管理服务。
-- **需求先行**：Agent 先澄清范围与验收标准；只有人工批准需求后，系统才会规划和执行开发任务。
-- **角色分工**：需求分析、任务规划、开发、测试/评审、项目协调和文档归档由固定角色分别承担。
-- **过程可见**：实时查看 Agent 消息、工具调用、命令、文件变化、审批请求和验收证据。
-- **人在回路**：高风险操作、需求版本和最终交付均保留明确的人工决策点。
-- **Agent 可调用**：CLI 提供稳定的 JSON 输入输出，可从 Codex 等 Agent App 编排完整工作流。
+## Why OpenWorkshop
 
-## 工作方式
+- **Data ownership**: Code, the SQLite database, attachments, and run records stay on your own machine, without an external project management service.
+- **Requirements first**: An Agent clarifies scope and acceptance criteria before planning or development begins, and execution starts only after human approval.
+- **Dedicated roles**: Requirements analysis, task planning, development, testing/review, project coordination, and document archiving are handled by separate roles.
+- **Visible execution**: Inspect Agent messages, tool calls, commands, file changes, approval requests, and acceptance evidence in real time.
+- **Human in the loop**: High-risk operations, requirement versions, and final delivery retain explicit human decision points.
+- **Agent-ready**: The CLI offers stable JSON input and output for orchestrating the full workflow from Codex and other Agent apps.
+
+## How It Works
 
 ```text
-关联本地项目
+Connect a local project
     ↓
-提交文本与附件委托
+Submit a request with text and attachments
     ↓
-需求 Agent 澄清并生成需求草案
+Requirements Agent clarifies it and drafts the requirement
     ↓
-人工批准需求
+Human approves the requirement
     ↓
-规划 Agent 生成任务树与依赖
+Planning Agent creates the task tree and dependencies
     ↓
-开发 Agent 执行，测试/评审 Agent 独立验证
+Development Agents implement; testing/review Agents verify independently
     ↓
-人工验收主任务
+Human accepts the main task
     ↓
-归档需求、计划、评审与交付文档
+Archive requirements, plans, reviews, and delivery documents
 ```
 
-系统会识别 Git、SVN 或无版本控制项目。Git 写任务可以使用独立 Worktree 隔离；SVN 和无版本控制项目采用串行写入，避免并发修改同一工作目录。
+OpenWorkshop recognizes Git, SVN, and projects without version control. Git write tasks can use isolated worktrees; SVN and unversioned projects serialize writes to avoid concurrent changes in the same working directory.
 
-## 产品能力
+## Features
 
-### 项目与委托
+### Projects and Requests
 
-- 配置允许访问的本地根目录，阻止路径和符号链接越界。
-- 关联已有项目并只读分析技术栈、版本控制、`AGENTS.md` 和常用检查命令。
-- 通过文本、图片、Markdown、TXT、PDF 或 DOCX 提交独立委托。
-- 在同一项目中保留多个委托及各自的需求、任务和交付记录。
+- Configure allowed local roots and prevent path or symbolic-link traversal.
+- Connect existing projects and analyze their stack, version control, `AGENTS.md`, and common verification commands without modifying the project.
+- Submit independent requests with text, images, Markdown, TXT, PDF, or DOCX attachments.
+- Keep multiple requests and their requirements, tasks, and delivery records in the same project.
 
-### 需求与计划
+### Requirements and Planning
 
-- 由需求 Agent 逐轮询问目标、范围、约束和缺失信息。
-- 生成版本化需求文档和验收标准，禁止静默覆盖已批准需求。
-- 需求获批后自动生成主任务、任意层级子任务和依赖图。
-- 支持优先级、负责人、标签、截止日期、只读任务和人工豁免。
+- Let the Requirements Agent ask about goals, scope, constraints, and missing information over multiple rounds.
+- Generate versioned requirement documents and acceptance criteria without silently overwriting approved requirements.
+- Create a main task, arbitrarily nested subtasks, and a dependency graph after approval.
+- Support priorities, assignees, labels, due dates, read-only tasks, and human waivers.
 
-### Agent 执行
+### Agent Execution
 
-- 通过本机 `codex app-server` 启动独立 Run，不保存 OpenAI API Key。
-- Scheduler 根据依赖、审批、并发额度和项目锁决定可运行任务。
-- 支持运行中介入、暂停、恢复、取消以及回答 Agent 提问。
-- 对命令、文件修改、权限和高风险操作建立审批记录。
-- 开发完成后由独立测试/评审 Agent 验证，失败时进入返工或阻塞。
+- Start independent Runs through the local `codex app-server` without storing an OpenAI API key.
+- Let the Scheduler select runnable tasks based on dependencies, approvals, concurrency limits, and project locks.
+- Steer, pause, resume, or cancel active Runs, and answer Agent questions.
+- Record approvals for commands, file changes, permissions, and high-risk operations.
+- Verify completed development with an independent testing/review Agent, returning failures for rework or blocking.
 
-### 验收与归档
+### Acceptance and Archiving
 
-- 汇总任务状态、Run、评审结果和证据，形成最终验收视图。
-- 人工批准后关闭主任务和委托；拒绝后重新进入返工流程。
-- 自动生成需求、计划、评审报告和交付文档，并保留历史版本。
-- Windows 后台服务直接投递系统通知，浏览器通知作为其他平台和投递失败时的补偿；同时提供数据库备份恢复和运行日志保留机制。
+- Combine task state, Runs, review results, and evidence into a final acceptance view.
+- Close the main task and request after human approval, or return rejected work for rework.
+- Generate requirements, plans, review reports, and delivery documents while retaining their history.
+- Deliver Windows system notifications directly from the background service, with browser notifications as a fallback on other platforms or after delivery failure; database backup/restore and log retention are also included.
 
-## 快速开始
+## Quick Start
 
-### 环境要求
+### Requirements
 
-- macOS 或 Windows
+- macOS or Windows
 - Node.js 24+
-- 已安装并登录的 Codex CLI
-- 可选：Git 或 SVN，用于识别和隔离对应项目
+- Codex CLI installed and signed in
+- Optional: Git or SVN for project detection and isolation
 
-### 安装与启动
+### Install and Start
 
-推荐直接从 npm 全局安装：
+Start and open the workbench in one command without a global install:
+
+```bash
+npx openworkshop gui
+```
+
+For a global installation from npm:
 
 ```bash
 npm install -g openworkshop
@@ -88,7 +96,7 @@ workshop start
 workshop gui
 ```
 
-也可以从源码安装并链接 CLI：
+To install from source and link the CLI:
 
 ```bash
 npm install
@@ -99,22 +107,22 @@ workshop start
 workshop gui
 ```
 
-`npm install -g openworkshop` 会全局安装 `workshop` 命令；从源码安装时，`npm link --workspace @workshop/server` 会将当前 Workspace 中的 CLI 链接为同名全局命令。`workshop skill install --agent codex` 将配套 Skill 安装到 Codex 的个人 Skill 目录 `$HOME/.agents/skills/workshop`；省略 `--agent` 时默认使用 `codex`，已有同名目录时不会覆盖，可增加 `--force` 更新。安装后可在 Codex 中显式调用 `$workshop`，匹配 Workshop 工作流的任务也可以自动触发它。`start` 默认在后台启动服务并监听 `http://127.0.0.1:8787`；`gui` 使用系统默认浏览器打开工作台。首次访问时按照页面提示设置 6 位 PIN，然后配置允许访问的项目根目录。
+`npm install -g openworkshop` installs the `workshop` command globally. Run `workshop update` later to execute `npm update --global openworkshop`. A source installation uses `npm link --workspace @workshop/server` to expose the workspace CLI under the same command. `workshop skill install --agent codex` installs the bundled Skill in Codex's personal `$HOME/.agents/skills/workshop` directory; `codex` is the default agent, an existing directory is preserved, and `--force` updates it. After installation, invoke `$workshop` explicitly in Codex or let matching Workshop workflow requests trigger it automatically. `start` launches the service in the background at `http://127.0.0.1:8787` by default. If the service is not running, `gui` starts it in the background before opening the workbench in the system browser. On first visit, follow the page prompt to set a six-digit PIN and configure allowed project roots.
 
-前台运行或允许局域网访问：
+Run in the foreground or allow LAN access:
 
 ```bash
 workshop start --foreground
 workshop restart --host 0.0.0.0 --port 8787
 ```
 
-PIN 是面向可信局域网的基础访问控制，不等同于互联网级身份认证。请勿直接将服务暴露到公网。
+The PIN provides basic access control for a trusted local network; it is not internet-grade authentication. Do not expose the service directly to the public internet.
 
-## 使用 CLI 驱动工作流
+## Drive Workflows from the CLI
 
-以下示例使用快速开始中安装到 `PATH` 的 `workshop` 命令；未链接时，可将 `workshop` 替换为 `node apps/server/dist/cli.js`。
+These examples use the `workshop` command installed on `PATH` in Quick Start. Without a link, replace it with `node apps/server/dist/cli.js`.
 
-先登录并确认运行环境：
+Sign in and verify the runtime first:
 
 ```bash
 workshop login
@@ -122,28 +130,30 @@ workshop status --output json
 workshop runtime codex-health --output json
 ```
 
-创建委托并推进需求：
+Create a request and advance its requirements:
 
 ```bash
 workshop project list --output json
 
 workshop commission create <project-id> \
-  --data '{"title":"实现导出功能","message":"支持将项目报告导出为 Markdown。"}' \
+  --data '{"title":"Add export","message":"Export the project report as Markdown."}' \
   --output json
 
 workshop commission analyze <commission-id> --output json
 workshop commission message <commission-id> \
-  --data '{"content":"只导出当前委托，保留任务和评审结果。"}' \
+  --data '{"content":"Export only the current request, including tasks and review results."}' \
   --output json
 workshop requirement approve <requirement-id> --output json
 ```
 
-触发执行并处理审批：
+Trigger execution and handle approvals:
 
 ```bash
 workshop task list <project-id> \
   --query '{"commissionId":"<commission-id>","view":"tree"}' \
   --output json
+workshop task get-number <project-id> <task-number> --output json
+workshop task delete <task-id> --data '{"reason":"Duplicate task"}' --output json
 
 workshop task trigger <task-id> --output json
 workshop task runs <task-id> --output json
@@ -157,7 +167,7 @@ workshop approval decide <approval-id> \
   --output json
 ```
 
-最终验收并读取交付文档：
+Accept the final result and read delivery documents:
 
 ```bash
 workshop task acceptance <main-task-id> --output json
@@ -168,7 +178,7 @@ workshop document list <project-id> \
   --output json
 ```
 
-Codex 等 Agent 也可以跳过 Workshop 的需求澄清和规划 Agent，直接导入已经由用户确认的需求与任务计划：
+Codex and other Agents can bypass Workshop's requirements clarification and Planning Agent by directly importing a requirement and task plan that the user has already approved:
 
 ```bash
 workshop requirement create-approved <commission-id> \
@@ -180,9 +190,9 @@ workshop task create <commission-id> \
   --output json
 ```
 
-该旁路要求 `requirement.json` 包含 `contentMarkdown` 和 `acceptanceCriteria`，`plan.json` 包含 `mainTask` 和 `tasks`。`create-approved` 会直接将需求记为已批准，仅应在用户明确要求跳过澄清并确认需求内容时使用；任务创建后不会自动触发执行。
+This path requires `requirement.json` to contain `contentMarkdown` and `acceptanceCriteria`, and `plan.json` to contain `mainTask` and `tasks`. `create-approved` immediately records the requirement as approved, so use it only when the user explicitly asks to skip clarification and has confirmed the requirement. Creating tasks does not trigger execution automatically.
 
-CLI 按资源分为 `root`、`project`、`commission`、`requirement`、`task`、`run`、`approval`、`document`、`notification` 和 `runtime`。查看可用动作：
+CLI resources are grouped into `root`, `project`, `commission`, `requirement`, `task`, `run`, `approval`, `document`, `notification`, and `runtime`. List available actions with:
 
 ```bash
 workshop --help
@@ -190,48 +200,56 @@ workshop task help
 workshop run help
 ```
 
-所有写操作通过 `--data` 或 `--data-file` 接收 JSON；Agent 应使用 `--output json`。尚未提供专用动作的 API 可通过通用入口调用：
+Writes accept JSON through `--data` or `--data-file`; queries accept `--query` or `--query-file`. Agents should use `--output json`. In PowerShell, prefer JSON files to avoid native command-line escaping differences:
+
+```powershell
+@{ commissionId = "<commission-id>"; view = "tree" } | ConvertTo-Json -Compress | Set-Content -Encoding utf8 query.json
+workshop task list <project-id> --query-file query.json --output json
+```
+
+Use the generic API entry point for operations without a dedicated command:
 
 ```bash
 workshop api GET /api/health --output json
 ```
 
-远程服务可使用 `--server-url` 或 `WORKSHOP_SERVER_URL` 指定，CLI 会将本地会话与服务 Origin 绑定。
+Set a remote service with `--server-url` or `WORKSHOP_SERVER_URL`. The CLI binds local sessions to the service origin.
 
-## 服务管理
+## Service Management
 
-| 命令 | 用途 |
+| Command | Purpose |
 | --- | --- |
-| `workshop start` | 后台启动服务 |
-| `workshop start --foreground` | 前台启动服务 |
-| `workshop status` | 查看进程和监听地址 |
-| `workshop gui` | 在默认浏览器打开工作台 |
-| `workshop log [-n 100]` | 输出最新服务日志的最后若干行 |
-| `workshop restart` | 优雅重启服务 |
-| `workshop stop` | 优雅停止服务 |
-| `workshop doctor` | 检查数据库、项目根目录、Git、Codex 和端口 |
-| `workshop backup [path]` | 备份 SQLite 数据库 |
-| `workshop restore <path>` | 恢复数据库，并先保存当前数据库 |
-| `workshop pin set` | 修改 PIN 并撤销已有会话 |
+| `workshop start` | Start the service in the background |
+| `workshop start --foreground` | Start the service in the foreground |
+| `workshop status` | Show the process and listening address |
+| `workshop gui` | Start the service in the background if needed, then open the workbench in the default browser |
+| `workshop log [-n 100]` | Print the latest lines from the service log |
+| `workshop restart` | Gracefully restart the service |
+| `workshop stop` | Gracefully stop the service |
+| `workshop doctor` | Check the database, project roots, Git, Codex, and port; missing Git is a warning, and the current OpenWorkshop listener is accepted |
+| `workshop backup [path]` | Back up the SQLite database |
+| `workshop restore <path>` | Restore the database after backing up the current database |
+| `workshop pin set` | Change the PIN and revoke active sessions |
+| `workshop update` | Run `npm update --global openworkshop` |
 
-通过 `WORKSHOP_HOME` 可覆盖应用数据目录。默认数据包括 SQLite 数据库、附件、日志、备份和运行状态；项目目录内的 `.openworkshop` 只保存 Run 的临时上下文。
+Override the application data directory with `WORKSHOP_HOME`. By default it contains the SQLite database, attachments, logs, backups, and runtime state. Each project's `.openworkshop` directory stores only temporary Run context.
 
-## 当前范围
+## Current Scope
 
-OpenWorkshop 目前处于 MVP 阶段，面向单个个人用户和可信本地网络：
+OpenWorkshop is currently an MVP for a single personal user on a trusted local network:
 
-- 仅支持 Codex CLI，不提供可配置的第三方 Agent Runtime。
-- 关联已有本地目录，不负责克隆远程仓库。
-- 不自动执行 Git Commit、Push、创建 Pull Request 或 SVN Commit。
-- Web 界面面向桌面浏览器，当前提供简体中文。
-- 服务、Runner、SQLite 和项目目录运行在同一台主机。
+- Only Codex CLI is supported; third-party Agent runtimes are not configurable.
+- Existing local directories are connected; OpenWorkshop does not clone remote repositories.
+- Git commits, pushes, pull requests, and SVN commits are never performed automatically.
+- The web UI targets desktop browsers and is currently available in Simplified Chinese.
+- The service, Runner, SQLite database, and project directories run on the same host.
 
-这些边界用于保持执行过程可控、可审计，并优先验证完整的软件交付闭环。
+These boundaries keep execution controllable and auditable while validating the complete software delivery loop first.
 
-## 技术架构
+## Architecture
 
 ```text
-Web 工作台 / Workshop CLI
+Web Workbench / Workshop CLI
              │
         Fastify Server
         ├── REST + SSE
@@ -243,15 +261,13 @@ Web 工作台 / Workshop CLI
                  │
           codex app-server
                  │
-          本地项目 / Git Worktree
+          Local Project / Git Worktree
 ```
 
-主要技术：Node.js、TypeScript、Fastify、Next.js、SQLite、Codex App Server。Server、Scheduler 和 Runner 保持为单体进程，避免为本地 MVP 引入消息队列、Redis、外部数据库或微服务运维。
+Core technologies: Node.js, TypeScript, Fastify, Next.js, SQLite, and Codex App Server. The Server, Scheduler, and Runner remain a single process, avoiding message queues, Redis, external databases, and microservice operations for a local MVP.
 
-## 开发验证
+## Development Validation
 
 ```bash
 npm test
 ```
-
-`task create/update/reorder/dependency/archive/unarchive` 等结构管理命令继续保留，但属于项目主管 Agent 级能力。CLI 命令直接执行，不额外启动 supervisor 调度；服务端会拒绝活动 Run 或待确认计划修订期间的结构修改，并递增任务树协调版本，使已经排队的 Coordinator 刷新上下文。Web 人工界面不直接提供任务结构编辑或删除；人工应在主任务评论中提出调整要求，由项目主管生成修订、经过 supervisor 审查并通过“计划修订待确认卡”确认后执行。修订中逻辑删除的任务可从任务看板筛选栏右侧的“历史任务”弹出页只读查看，不再参与调度、依赖、统计或验收。

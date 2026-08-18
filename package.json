@@ -1,7 +1,7 @@
 {
   "name": "openworkshop",
-  "version": "0.3.5",
-  "description": "A local-first autonomous software delivery workbench",
+  "version": "0.3.6",
+  "description": "A requirements-led, task-driven workbench for secure autonomous Agent delivery",
   "type": "module",
   "bin": {
     "workshop": "apps/server/dist/cli.js"
@@ -10,7 +10,8 @@
     "apps/server/dist",
     "apps/server/skills/workshop",
     "apps/web/out",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md"
   ],
   "workspaces": [
     "apps/*",
@@ -41,8 +42,7 @@
     "codex",
     "agent",
     "workflow",
-    "project-management",
-    "local-first"
+    "project-management"
   ],
   "publishConfig": {
     "access": "public"

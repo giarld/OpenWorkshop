@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { deflateSync, gzipSync, gunzipSync } from "node:zlib";
 import test from "node:test";
 import Fastify from "fastify";
+import { addTaskComment } from "./comments.ts";
 import { archiveCommission, reactivateCommission, recoverCommissionLifecycleOperations } from "./commission-archive.ts";
 import { MAX_COMMISSION_ATTACHMENT_BYTES, storeAttachment } from "./attachments.ts";
 import { extractAttachmentText, registerCommissionRoutes, type RequirementAnalyzer } from "./commissions.ts";
@@ -78,6 +79,7 @@ test("compresses a clarified commission and restores its documents, tasks, histo
     database.prepare(`INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json)
       VALUES (?, ?, ?, ?, 'developer', 'manual', 'running', 1, '{}', '{}')`)
       .run(runId, projectId, commissionId, taskId);
+    database.prepare("UPDATE attachments SET task_id = ?, comment_id = ?, run_id = ? WHERE id = ?").run(taskId, commentId, runId, attachment.id);
     database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'result', 'done', '{}', 0, ?)").run(runId, now);
     const documentId = randomUUID();
     const versionId = randomUUID();
@@ -188,6 +190,18 @@ test("approving a requirement automatically writes the planning Agent task tree"
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM documents WHERE commission_id = ? AND type = 'plan'").get(commissionId) as { count: number }).count, 1);
     assert.deepEqual(analyzedWith, { prompt: "", model: "supervisor-model", reasoningEffort: "high", customArgs: [], sandboxMode: "workspace-write", approvalPolicy: "on-request", networkAccess: true });
     assert.deepEqual(plannedWith, analyzedWith);
+
+    const mainTaskId = (database.prepare("SELECT main_task_id FROM commissions WHERE id = ?").get(commissionId) as { main_task_id: string }).main_task_id;
+    addTaskComment(database, { taskId: mainTaskId, authorType: "human", content: "合并测试任务并保留最终验收。" });
+    const replan = await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/replan` });
+    assert.equal(replan.statusCode, 200);
+    assert.equal(replan.json().status, "collecting");
+    assert.match((database.prepare("SELECT content FROM comments WHERE task_id = ? AND agent_role = 'supervisor' ORDER BY rowid DESC LIMIT 1").get(mainTaskId) as { content: string }).content, /合并测试任务/);
+    database.prepare("UPDATE plan_revisions SET status = 'awaiting_confirmation' WHERE id = ?").run(replan.json().id);
+    const repeatedReplan = await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/replan` });
+    assert.equal(repeatedReplan.statusCode, 200);
+    assert.equal(repeatedReplan.json().id, replan.json().id);
+    assert.equal(repeatedReplan.json().status, "awaiting_confirmation");
   } finally { await server.close(); database.close(); await rm(home, { recursive: true, force: true }); }
 });
 

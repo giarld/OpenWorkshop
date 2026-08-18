@@ -7,6 +7,7 @@ import { resolvedRoleConfig } from "./agent-settings.ts";
 import { archiveCommission, deleteClarifyingCommission, reactivateCommission } from "./commission-archive.ts";
 import type { CodexRoleConfig } from "./codex.ts";
 import type { TaskPlanner } from "./planner-agent.js";
+import { beginPlanRevision } from "./plan-revisions.ts";
 import type { RequirementTokenUsage } from "./requirement-token-usage.js";
 import { createTaskPlan } from "./tasks.ts";
 
@@ -250,9 +251,23 @@ export function registerCommissionRoutes(server: FastifyInstance, database: Data
   });
 
   server.post<{ Params: { id: string } }>("/api/commissions/:id/replan", async (request) => {
-    if (!plan) throw unavailable("Planning Agent is not configured");
     const commission = commissionById(database, request.params.id);
-    if (commission.main_task_id) throw conflict("Commission already has a task plan");
+    if (commission.main_task_id) {
+      if (!["planned", "backlog", "active", "paused", "blocked"].includes(commission.status)) throw conflict(`Commission cannot be replanned while ${commission.status}`);
+      if (database.prepare("SELECT 1 FROM runs WHERE commission_id = ? AND status IN ('queued', 'preparing', 'running', 'waiting_approval', 'waiting_input') LIMIT 1").get(commission.id)) throw conflict("Stop active Runs before replanning");
+      const latest = database.prepare("SELECT content FROM comments WHERE task_id = ? AND author_type = 'human' AND deleted_at IS NULL AND content <> '' ORDER BY created_at DESC, rowid DESC LIMIT 1").get(commission.main_task_id) as { content: string } | undefined;
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        const id = beginPlanRevision(database, commission.id, latest?.content ?? "用户请求重新规划现有任务。");
+        const { status } = database.prepare("SELECT status FROM plan_revisions WHERE id = ?").get(id) as { status: string };
+        database.exec("COMMIT");
+        return { id, commissionId: commission.id, mainTaskId: commission.main_task_id, status };
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    if (!plan) throw unavailable("Planning Agent is not configured");
     return planCommission(database, commission.id, plan);
   });
 

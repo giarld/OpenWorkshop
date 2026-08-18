@@ -3,10 +3,17 @@
 ## Common syntax
 
 ```text
-workshop <family> <action> [id ...] [--query '{...}'] [--data '{...}' | --data-file path] --output json
+workshop <family> <action> [id ...] [--query '{...}' | --query-file path] [--data '{...}' | --data-file path] --output json
 ```
 
 Use `--server-url URL` for a non-default server. Use `WORKSHOP_SERVER_URL` when every call targets the same server.
+
+PowerShell 中优先把 JSON 写入 UTF-8 文件，再使用 `--data-file` 或 `--query-file`，避免原生命令参数转义差异：
+
+```powershell
+@{ commissionId = "<commission-id>"; view = "tree" } | ConvertTo-Json -Compress | Set-Content -Encoding utf8 query.json
+workshop task list <project-id> --query-file query.json --output json
+```
 
 ## Service and authentication
 
@@ -59,6 +66,8 @@ workshop requirement reject <requirement-id> --data '{"reason":"Reason"}' --outp
 ```
 
 Commission creation is a terminal action for the current request unless the user explicitly asks to continue. Upload attachments explicitly supplied with the creation request, then report the new ID and say requirement clarification is next; do not call `commission analyze` automatically.
+
+`commission replan` 在尚无任务树时重新调用规划 Agent；已有任务树时进入现有的计划修订卡片、独立审查和最终人工确认事务。不要用多条 `task update` / `dependency-add` / `archive` / `reorder` 命令模拟一次计划修订。
 
 When the user asks to continue, run `commission get` before choosing the next action:
 
@@ -127,8 +136,10 @@ workshop task list <project-id> --query '{"commissionId":"<commission-id>","view
 ```bash
 workshop task list <project-id> --query '{"commissionId":"<commission-id>","view":"tree"}' --output json
 workshop task get <task-id> --output json
+workshop task get-number <project-id> <task-number> --output json
 workshop task create <commission-id> --data '{"title":"Task","description":"Scope","priority":"high","ownerType":"ai","acceptanceCriteria":["Expected result"],"labels":["cli"],"dependsOnTaskIds":[]}' --output json
 workshop task update <task-id> --data '{"priority":"urgent","labels":["cli","blocking"]}' --output json
+workshop task delete <task-id> --data '{"reason":"Duplicate task"}' --output json
 workshop task move <task-id> --data '{"status":"blocked","blockedReason":"Reason"}' --output json
 workshop task reorder <task-id> --data '{"position":0}' --output json
 workshop task archive <task-id> --output json
@@ -165,6 +176,7 @@ workshop task reject <main-task-id> --data '{"reason":"Required rework"}' --outp
 Before `task trigger`, inspect the task tree and dependencies and explain the scope: a main-task trigger authorizes the full commission tree; a child-task trigger authorizes that task and its unfinished dependency closure. Do not treat an ambiguous request to “start work” as a target selection.
 
 Task statuses: `backlog`, `todo`, `in_progress`, `done`, `blocked`, `archived`. Priorities: `none`, `low`, `medium`, `high`, `urgent`. Owners: `human`, `ai`.
+`task delete` performs an audited logical deletion, accepts active or archived child tasks, requires a reason, and preserves comments, Runs, evidence, and history. It rejects main tasks, active Runs, active children, active dependents, and concurrent plan revisions.
 
 ## Runs and approvals
 

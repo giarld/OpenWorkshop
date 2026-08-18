@@ -21,15 +21,19 @@ function dropCoordinationRevisionMigration(database: DatabaseSync): void {
   database.exec("DROP TRIGGER IF EXISTS task_dependencies_revision_delete; DROP TRIGGER IF EXISTS task_dependencies_revision_insert; DROP TRIGGER IF EXISTS tasks_structure_revision_update; DROP TRIGGER IF EXISTS tasks_structure_revision_insert; DROP INDEX plan_revision_cards_one_pending; DROP TABLE plan_revision_cards; ALTER TABLE tasks DROP COLUMN deleted_dependency_ids_json; ALTER TABLE tasks DROP COLUMN deleted_revision_id; ALTER TABLE tasks DROP COLUMN deleted_reason; ALTER TABLE tasks DROP COLUMN deleted_at; DROP INDEX plan_revisions_one_active; DROP TABLE plan_revisions; DROP TRIGGER tasks_revision_coordination; ALTER TABLE runs DROP COLUMN coordination_revision; ALTER TABLE commissions DROP COLUMN coordination_pending; ALTER TABLE commissions DROP COLUMN coordination_revision");
 }
 
+function dropProjectTaskSequence(database: DatabaseSync): void {
+  database.exec("DROP TABLE project_task_sequences");
+}
+
 test("migrates a temporary database and stores JSON settings", async () => {
   const home = await mkdtemp(join(tmpdir(), "project-workshop-db-"));
   try {
     const database = await openWorkshopDatabase(home);
-    assert.equal((database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 22);
+    assert.equal((database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 25);
     assert.equal((database.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number }).foreign_keys, 1);
     assert.equal((database.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode, "wal");
     const tables = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => (row as { name: string }).name);
-    assert.ok(["settings", "projects", "commissions", "tasks", "runs", "documents"].every((table) => tables.includes(table)));
+    assert.ok(["settings", "projects", "project_task_sequences", "commissions", "tasks", "runs", "documents"].every((table) => tables.includes(table)));
     assert.match((database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approvals'").get() as { sql: string }).sql, /mcp_tool_call/);
     const commissionColumns = database.prepare("PRAGMA table_info(commissions)").all().map((row) => (row as { name: string }).name);
     assert.ok(["clarification_token_input", "clarification_token_output", "clarification_token_cached", "archive_path", "archive_sha256", "archive_size_bytes", "lifecycle_operation", "lifecycle_token", "coordination_revision", "coordination_pending"].every((column) => commissionColumns.includes(column)));
@@ -47,6 +51,35 @@ test("migrates a temporary database and stores JSON settings", async () => {
     assert.equal(settings.delete("globalConcurrency"), true);
     database.close();
   } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("migration initializes immutable project task-number sequences", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-task-numbering-migration-"));
+  let database = await openWorkshopDatabase(home);
+  try {
+    const now = new Date().toISOString();
+    const root = randomUUID(), project = randomUUID(), commissionA = randomUUID(), commissionB = randomUUID(), requirementA = randomUUID(), requirementB = randomUUID(), taskA = randomUUID(), childA = randomUUID(), taskB = randomUUID();
+    database.prepare("INSERT INTO root_paths (id, path, real_path, enabled, created_at, updated_at) VALUES (?, 'root', ?, 1, ?, ?)").run(root, join(home, "project"), now, now);
+    database.prepare("INSERT INTO projects (id, name, path, real_path, root_path_id, vcs_type, created_at, updated_at) VALUES (?, 'Project', 'project', ?, ?, 'none', ?, ?)").run(project, join(home, "project"), root, now, now);
+    database.prepare("INSERT INTO commissions (id, project_id, title, status, created_at, updated_at) VALUES (?, ?, 'First', 'planned', ?, ?)").run(commissionA, project, now, now);
+    database.prepare("INSERT INTO commissions (id, project_id, title, status, created_at, updated_at) VALUES (?, ?, 'Second', 'planned', ?, ?)").run(commissionB, project, now, now);
+    database.prepare("INSERT INTO requirement_versions (id, commission_id, version_no, content_markdown, acceptance_json, status, created_by, created_at, approved_at) VALUES (?, ?, 1, 'Requirement', '[]', 'approved', 'human', ?, ?)").run(requirementA, commissionA, now, now);
+    database.prepare("INSERT INTO requirement_versions (id, commission_id, version_no, content_markdown, acceptance_json, status, created_by, created_at, approved_at) VALUES (?, ?, 1, 'Requirement', '[]', 'approved', 'human', ?, ?)").run(requirementB, commissionB, now, now);
+    database.prepare("UPDATE commissions SET active_requirement_version_id = CASE id WHEN ? THEN ? ELSE ? END WHERE id IN (?, ?)").run(commissionA, requirementA, requirementB, commissionA, commissionB);
+    const insert = database.prepare("INSERT INTO tasks (id, commission_id, parent_id, number_path, position, title, description, status, priority, owner_type, acceptance_json, review_round_limit, review_round_used, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, '', 'backlog', 'none', 'ai', '[]', 2, 0, ?, ?)");
+    insert.run(taskA, commissionA, null, "1", 0, "First", now, now);
+    insert.run(childA, commissionA, taskA, "1.1", 0, "Child", now, now);
+    insert.run(taskB, commissionB, null, "1", 0, "Second", now, now);
+    dropProjectTaskSequence(database);
+    database.exec("PRAGMA user_version = 23");
+    database.close();
+    database = await openWorkshopDatabase(home);
+    assert.deepEqual(database.prepare("SELECT number_path FROM tasks WHERE id IN (?, ?, ?) ORDER BY number_path").all(taskA, childA, taskB).map((row) => (row as { number_path: string }).number_path), ["1", "1.1", "2"]);
+    assert.equal((database.prepare("SELECT next_number FROM project_task_sequences WHERE project_id = ?").get(project) as { next_number: number }).next_number, 3);
+  } finally {
+    database.close();
     await rm(home, { recursive: true, force: true });
   }
 });
@@ -124,6 +157,7 @@ test("migration expires approvals left pending by terminal Runs", async () => {
     dropAttachmentLinkColumns(database);
     dropSystemNotificationColumn(database);
     dropCoordinationRevisionMigration(database);
+    dropProjectTaskSequence(database);
     database.exec("DROP TRIGGER approvals_resolve_notifications; DROP TRIGGER runs_expire_pending_approvals; ALTER TABLE comments DROP COLUMN deleted_at; DROP INDEX comments_run_created; DROP INDEX comments_task_parent_created; ALTER TABLE comments DROP COLUMN run_id; ALTER TABLE comments DROP COLUMN parent_id; ALTER TABLE tasks DROP COLUMN auto_approve_permissions; ALTER TABLE commissions DROP COLUMN archive_size_bytes; ALTER TABLE commissions DROP COLUMN archive_sha256; ALTER TABLE commissions DROP COLUMN archive_path; ALTER TABLE commissions DROP COLUMN clarification_token_cached; ALTER TABLE commissions DROP COLUMN clarification_token_output; ALTER TABLE commissions DROP COLUMN clarification_token_input; PRAGMA user_version = 7");
     database.close();
     database = await openWorkshopDatabase(home);
@@ -154,13 +188,14 @@ test("migration keeps only the newest pending requirement candidate", async () =
     dropAttachmentLinkColumns(database);
     dropSystemNotificationColumn(database);
     dropCoordinationRevisionMigration(database);
+    dropProjectTaskSequence(database);
     database.exec("DROP TRIGGER approvals_resolve_notifications; DROP TRIGGER runs_expire_pending_approvals; ALTER TABLE comments DROP COLUMN deleted_at; DROP INDEX comments_run_created; DROP INDEX comments_task_parent_created; ALTER TABLE comments DROP COLUMN run_id; ALTER TABLE comments DROP COLUMN parent_id; ALTER TABLE requirement_messages DROP COLUMN options_json; DROP INDEX runs_one_reserved_per_task; ALTER TABLE runs DROP COLUMN workspace_mode; ALTER TABLE runs DROP COLUMN workspace_path; ALTER TABLE runs DROP COLUMN retry_root_run_id; ALTER TABLE runs DROP COLUMN execution_grant_id; ALTER TABLE tasks DROP COLUMN auto_approve_permissions; ALTER TABLE tasks DROP COLUMN read_only; ALTER TABLE commissions DROP COLUMN archive_size_bytes; ALTER TABLE commissions DROP COLUMN archive_sha256; ALTER TABLE commissions DROP COLUMN archive_path; ALTER TABLE commissions DROP COLUMN clarification_token_cached; ALTER TABLE commissions DROP COLUMN clarification_token_output; ALTER TABLE commissions DROP COLUMN clarification_token_input; PRAGMA user_version = 2");
     database.close();
 
     const migrated = await openWorkshopDatabase(home);
     const versions = migrated.prepare("SELECT version_no, status FROM requirement_versions WHERE commission_id = ? ORDER BY version_no").all(commissionId) as Array<{ version_no: number; status: string }>;
     assert.deepEqual(versions.map((version) => [version.version_no, version.status]), [[1, "rejected"], [2, "awaiting_approval"]]);
-    assert.equal((migrated.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 22);
+    assert.equal((migrated.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 25);
     migrated.close();
   } finally {
     await rm(home, { recursive: true, force: true });
@@ -175,6 +210,7 @@ test("v2 migration restores a historical pending candidate for approval", async 
   dropAttachmentLinkColumns(database);
   dropSystemNotificationColumn(database);
   dropCoordinationRevisionMigration(database);
+  dropProjectTaskSequence(database);
   database.exec("DROP TRIGGER approvals_resolve_notifications; DROP TRIGGER runs_expire_pending_approvals; ALTER TABLE comments DROP COLUMN deleted_at; DROP INDEX comments_run_created; DROP INDEX comments_task_parent_created; ALTER TABLE comments DROP COLUMN run_id; ALTER TABLE comments DROP COLUMN parent_id; ALTER TABLE requirement_messages DROP COLUMN options_json; DROP INDEX requirement_versions_one_pending; DROP INDEX runs_one_reserved_per_task; ALTER TABLE runs DROP COLUMN workspace_mode; ALTER TABLE runs DROP COLUMN workspace_path; ALTER TABLE runs DROP COLUMN retry_root_run_id; ALTER TABLE runs DROP COLUMN execution_grant_id; ALTER TABLE tasks DROP COLUMN auto_approve_permissions; ALTER TABLE tasks DROP COLUMN read_only; ALTER TABLE commissions DROP COLUMN archive_size_bytes; ALTER TABLE commissions DROP COLUMN archive_sha256; ALTER TABLE commissions DROP COLUMN archive_path; ALTER TABLE commissions DROP COLUMN clarification_token_cached; ALTER TABLE commissions DROP COLUMN clarification_token_output; ALTER TABLE commissions DROP COLUMN clarification_token_input; PRAGMA user_version = 2");
   database.close();
 
@@ -182,7 +218,7 @@ test("v2 migration restores a historical pending candidate for approval", async 
   try {
     database = await openWorkshopDatabase(home);
     registerCommissionRoutes(server, database, join(home, "attachments"));
-    assert.equal((database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 22);
+    assert.equal((database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 25);
     assert.equal((database.prepare("SELECT status FROM commissions WHERE id = ?").get(commissionId) as { status: string }).status, "awaiting_requirement_approval");
     assert.equal((await server.inject({ method: "POST", url: `/api/requirements/${requirementId}/approve` })).statusCode, 200);
   } finally {
@@ -200,6 +236,7 @@ test("v3 migration restores a historical pending candidate for rejection", async
   dropAttachmentLinkColumns(database);
   dropSystemNotificationColumn(database);
   dropCoordinationRevisionMigration(database);
+  dropProjectTaskSequence(database);
   database.exec("DROP TRIGGER approvals_resolve_notifications; DROP TRIGGER runs_expire_pending_approvals; ALTER TABLE comments DROP COLUMN deleted_at; DROP INDEX comments_run_created; DROP INDEX comments_task_parent_created; ALTER TABLE comments DROP COLUMN run_id; ALTER TABLE comments DROP COLUMN parent_id; ALTER TABLE requirement_messages DROP COLUMN options_json; DROP INDEX runs_one_reserved_per_task; ALTER TABLE runs DROP COLUMN workspace_mode; ALTER TABLE runs DROP COLUMN workspace_path; ALTER TABLE runs DROP COLUMN retry_root_run_id; ALTER TABLE runs DROP COLUMN execution_grant_id; ALTER TABLE tasks DROP COLUMN auto_approve_permissions; ALTER TABLE tasks DROP COLUMN read_only; ALTER TABLE commissions DROP COLUMN archive_size_bytes; ALTER TABLE commissions DROP COLUMN archive_sha256; ALTER TABLE commissions DROP COLUMN archive_path; ALTER TABLE commissions DROP COLUMN clarification_token_cached; ALTER TABLE commissions DROP COLUMN clarification_token_output; ALTER TABLE commissions DROP COLUMN clarification_token_input; PRAGMA user_version = 3");
   database.close();
 
@@ -207,7 +244,7 @@ test("v3 migration restores a historical pending candidate for rejection", async
   try {
     database = await openWorkshopDatabase(home);
     registerCommissionRoutes(server, database, join(home, "attachments"));
-    assert.equal((database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 22);
+    assert.equal((database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 25);
     assert.equal((database.prepare("SELECT status FROM commissions WHERE id = ?").get(commissionId) as { status: string }).status, "awaiting_requirement_approval");
     assert.equal((await server.inject({ method: "POST", url: `/api/requirements/${requirementId}/reject`, payload: { reason: "Not ready" } })).statusCode, 200);
   } finally {

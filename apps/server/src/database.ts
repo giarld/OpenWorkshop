@@ -609,6 +609,107 @@ const MIGRATIONS = [
     deleted_dependency_ids_json IS NULL
     OR (json_valid(deleted_dependency_ids_json) AND json_type(deleted_dependency_ids_json) = 'array')
   );
+  `,
+  `
+  WITH RECURSIVE numbered(id, number_path) AS (
+    SELECT task.id, CAST(1 + (
+      SELECT COUNT(*) FROM tasks AS prior
+      JOIN commissions AS prior_commission ON prior_commission.id = prior.commission_id
+      WHERE prior_commission.project_id = commission.project_id AND prior.parent_id IS NULL AND prior.archived_at IS NULL
+        AND (prior.position < task.position OR (prior.position = task.position AND prior.created_at < task.created_at) OR (prior.position = task.position AND prior.created_at = task.created_at AND prior.rowid < task.rowid))
+    ) AS TEXT)
+    FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id
+    WHERE task.parent_id IS NULL AND task.archived_at IS NULL
+    UNION ALL
+    SELECT child.id, numbered.number_path || '.' || (1 + (
+      SELECT COUNT(*) FROM tasks AS prior
+      WHERE prior.parent_id = child.parent_id AND prior.archived_at IS NULL
+        AND (prior.position < child.position OR (prior.position = child.position AND prior.created_at < child.created_at) OR (prior.position = child.position AND prior.created_at = child.created_at AND prior.rowid < child.rowid))
+    ))
+    FROM tasks AS child JOIN numbered ON child.parent_id = numbered.id
+    WHERE child.archived_at IS NULL
+  )
+  UPDATE tasks SET number_path = (SELECT numbered.number_path FROM numbered WHERE numbered.id = tasks.id)
+  WHERE id IN (SELECT id FROM numbered);
+  `,
+  `
+  CREATE TABLE project_task_sequences (
+    project_id TEXT PRIMARY KEY REFERENCES projects(id),
+    next_number INTEGER NOT NULL CHECK (next_number >= 1)
+  ) STRICT;
+
+  WITH RECURSIVE numbered(id, number_path) AS (
+    SELECT task.id, CAST(1 + (
+      SELECT COUNT(*) FROM tasks AS prior
+      JOIN commissions AS prior_commission ON prior_commission.id = prior.commission_id
+      WHERE prior_commission.project_id = commission.project_id AND prior.parent_id IS NULL
+        AND (prior.created_at < task.created_at OR (prior.created_at = task.created_at AND prior.rowid < task.rowid))
+    ) AS TEXT)
+    FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id
+    WHERE task.parent_id IS NULL
+    UNION ALL
+    SELECT child.id, numbered.number_path || '.' || (1 + (
+      SELECT COUNT(*) FROM tasks AS prior
+      WHERE prior.parent_id = child.parent_id
+        AND (prior.position < child.position OR (prior.position = child.position AND prior.created_at < child.created_at) OR (prior.position = child.position AND prior.created_at = child.created_at AND prior.rowid < child.rowid))
+    ))
+    FROM tasks AS child JOIN numbered ON child.parent_id = numbered.id
+  )
+  UPDATE tasks SET number_path = (SELECT numbered.number_path FROM numbered WHERE numbered.id = tasks.id)
+  WHERE id IN (SELECT id FROM numbered);
+
+  INSERT INTO project_task_sequences (project_id, next_number)
+  SELECT project.id, COALESCE(MAX(CAST(task.number_path AS INTEGER)), 0) + 1
+  FROM projects AS project
+  LEFT JOIN commissions AS commission ON commission.project_id = project.id
+  LEFT JOIN tasks AS task ON task.commission_id = commission.id AND task.parent_id IS NULL
+  GROUP BY project.id;
+  `,
+  `
+  DROP TRIGGER tasks_structure_revision_insert;
+  DROP TRIGGER tasks_structure_revision_update;
+  DROP TRIGGER task_dependencies_revision_insert;
+  DROP TRIGGER task_dependencies_revision_delete;
+
+  CREATE TRIGGER tasks_structure_revision_insert
+  AFTER INSERT ON tasks
+  WHEN NOT EXISTS (SELECT 1 FROM commissions WHERE id = NEW.commission_id AND lifecycle_operation IS NOT NULL)
+  BEGIN
+    UPDATE commissions SET coordination_revision = coordination_revision + 1, updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = NEW.commission_id;
+    UPDATE tasks SET updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = (SELECT main_task_id FROM commissions WHERE id = NEW.commission_id) AND id <> NEW.id;
+    UPDATE runs SET coordination_revision = (SELECT coordination_revision FROM commissions WHERE id = NEW.commission_id), context_snapshot_json = '{}'
+      WHERE commission_id = NEW.commission_id AND trigger_type = 'coordinate' AND status = 'queued';
+  END;
+
+  CREATE TRIGGER tasks_structure_revision_update
+  AFTER UPDATE OF parent_id, position, title, description, priority, due_date, owner_type, acceptance_json, read_only, archived_at, deleted_at ON tasks
+  WHEN NOT EXISTS (SELECT 1 FROM commissions WHERE id = NEW.commission_id AND lifecycle_operation IS NOT NULL)
+  BEGIN
+    UPDATE commissions SET coordination_revision = coordination_revision + 1, updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = NEW.commission_id;
+    UPDATE tasks SET updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = (SELECT main_task_id FROM commissions WHERE id = NEW.commission_id) AND id <> NEW.id;
+    UPDATE runs SET coordination_revision = (SELECT coordination_revision FROM commissions WHERE id = NEW.commission_id), context_snapshot_json = '{}'
+      WHERE commission_id = NEW.commission_id AND trigger_type = 'coordinate' AND status = 'queued';
+  END;
+
+  CREATE TRIGGER task_dependencies_revision_insert
+  AFTER INSERT ON task_dependencies
+  WHEN NOT EXISTS (SELECT 1 FROM commissions JOIN tasks ON tasks.commission_id = commissions.id WHERE tasks.id = NEW.task_id AND commissions.lifecycle_operation IS NOT NULL)
+  BEGIN
+    UPDATE commissions SET coordination_revision = coordination_revision + 1, updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = (SELECT commission_id FROM tasks WHERE id = NEW.task_id);
+    UPDATE tasks SET updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = (SELECT commission.main_task_id FROM commissions AS commission JOIN tasks AS task ON task.commission_id = commission.id WHERE task.id = NEW.task_id);
+    UPDATE runs SET coordination_revision = (SELECT coordination_revision FROM commissions WHERE id = runs.commission_id), context_snapshot_json = '{}'
+      WHERE commission_id = (SELECT commission_id FROM tasks WHERE id = NEW.task_id) AND trigger_type = 'coordinate' AND status = 'queued';
+  END;
+
+  CREATE TRIGGER task_dependencies_revision_delete
+  AFTER DELETE ON task_dependencies
+  WHEN NOT EXISTS (SELECT 1 FROM commissions JOIN tasks ON tasks.commission_id = commissions.id WHERE tasks.id = OLD.task_id AND commissions.lifecycle_operation IS NOT NULL)
+  BEGIN
+    UPDATE commissions SET coordination_revision = coordination_revision + 1, updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = (SELECT commission_id FROM tasks WHERE id = OLD.task_id);
+    UPDATE tasks SET updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = (SELECT commission.main_task_id FROM commissions AS commission JOIN tasks AS task ON task.commission_id = commission.id WHERE task.id = OLD.task_id);
+    UPDATE runs SET coordination_revision = (SELECT coordination_revision FROM commissions WHERE id = runs.commission_id), context_snapshot_json = '{}'
+      WHERE commission_id = (SELECT commission_id FROM tasks WHERE id = OLD.task_id) AND trigger_type = 'coordinate' AND status = 'queued';
+  END;
   `
 ];
 

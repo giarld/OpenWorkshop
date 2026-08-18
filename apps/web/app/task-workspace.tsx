@@ -789,7 +789,6 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsB
       <div className="task-run-summary"><span>{latest ? `Run #${latest.attempt_no} · ${latest.role} · ${latest.status}` : "尚未运行"}</span>{latest && active && <RunElapsedTimer run={latest} />}</div>
       <TaskTokenSummary runs={tokenRuns} tree={!task.parent_id} />
       {lifecycleAction && <div className="task-run-actions"><button className="secondary" disabled={busy} onClick={() => void onLifecycle(task)}>{lifecycleAction === "archive" ? task.parent_id ? "归档任务" : "归档任务组" : task.parent_id ? "解除归档" : "解除任务组归档"}</button></div>}
-      <TaskReadonlyProperties task={task} tasks={tasks} />
       <div className="task-run-actions">
         {!active && canResumeTaskRun(task.status, latest) && <button disabled={busy} onClick={() => void onAction("resume", "任务已恢复执行。")}>恢复执行</button>}
         {!active && canTrigger && <button disabled={busy} onClick={() => void onAction("trigger", task.parent_id ? "任务已启动。" : "已触发当前可运行的子任务。")}>{task.status === "blocked" ? "重新执行" : !task.parent_id && task.status === "in_progress" ? "继续执行" : "启动执行"}</button>}
@@ -797,6 +796,7 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsB
         {active && <button className="secondary" disabled={busy} onClick={() => void onAction("cancel", "当前 Run 已取消。")}>取消 Run</button>}
         {latest?.status === "waiting_approval" && <button onClick={onApprovals}>前往处理审批</button>}
       </div>
+      <TaskReadonlyProperties task={task} tasks={tasks} />
       {latest?.status === "waiting_input" && requestId && questions.length > 0 && <form className="run-input-form" onSubmit={(event) => void onAnswer(event, requestId, questions)}><h3>Agent 等待你的输入</h3>{questions.map((question) => <fieldset key={question.id}><legend>{question.header || question.question}</legend>{question.options.length ? question.options.map((option) => <label key={option.label}><input type="radio" name={question.id} value={option.label} required disabled={busy} /><span><strong>{option.label}</strong>{option.description && <small>{option.description}</small>}</span></label>) : <label>{question.question}<input name={question.id} required disabled={busy} /></label>}</fieldset>)}<button disabled={busy}>提交并继续</button></form>}
       {latest?.failure_summary && <p className="workspace-message" role="alert">失败原因：{latest.failure_summary}</p>}
       {message && <p className="workspace-message" role="status">{message}</p>}

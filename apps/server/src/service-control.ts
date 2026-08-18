@@ -2,6 +2,10 @@ import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { instanceLockIsActive, readRuntimeState, type RuntimeState } from "./platform.ts";
 
+export async function ensureBackgroundService(root: string, cliPath: string | undefined, host: string, port: number): Promise<RuntimeState> {
+  return await readRuntimeState(root) ?? startBackgroundService(root, cliPath, host, port);
+}
+
 export async function startBackgroundService(root: string, cliPath: string | undefined, host: string, port: number, timeoutMs = 10_000): Promise<RuntimeState> {
   const current = await readRuntimeState(root);
   if (current) throw new Error(`OpenWorkshop is already running (pid ${current.pid})`);

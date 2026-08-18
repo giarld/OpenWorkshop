@@ -55,6 +55,7 @@ test("collects all card forms and applies a reviewed task revision without expos
     database.prepare("UPDATE commissions SET status = 'active' WHERE id = ?").run(commission);
 
     const revisionId = beginPlanRevision(database, commission, "需要调整任务方向");
+    const baseRevision = (database.prepare("SELECT base_coordination_revision FROM plan_revisions WHERE id = ?").get(revisionId) as { base_coordination_revision: number }).base_coordination_revision;
     const textCard = database.prepare("SELECT comment_id FROM plan_revision_cards WHERE plan_revision_id = ? AND status = 'pending'").get(revisionId) as { comment_id: string };
     assert.equal(answerRevisionCard(database, mainTaskId, textCard.comment_id, "删除无效任务并补充替代任务").finalAccepted, false);
 
@@ -108,6 +109,7 @@ test("collects all card forms and applies a reviewed task revision without expos
     const accepted = await server.inject({ method: "POST", url: `/api/tasks/${mainTaskId}/comments/${finalCard.comment_id}/respond`, payload: { answer: "接受" } });
     assert.equal(accepted.statusCode, 201);
     assert.equal(accepted.json().agentMention.action, "unavailable");
+    assert.equal((database.prepare("SELECT coordination_revision FROM commissions WHERE id = ?").get(commission) as { coordination_revision: number }).coordination_revision, baseRevision + 1);
 
     const deleted = database.prepare("SELECT status, deleted_at, deleted_reason FROM tasks WHERE id = ?").get(deletedTaskId) as { status: string; deleted_at: string | null; deleted_reason: string | null };
     assert.equal(deleted.status, "archived");

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { addTaskComment } from "./comments.ts";
+import { renumberTaskTree } from "./task-numbering.ts";
 
 export const REVISION_INTERACTIONS = ["boolean", "single_choice", "multiple_choice", "text"] as const;
 export type RevisionInteraction = typeof REVISION_INTERACTIONS[number];
@@ -14,6 +15,7 @@ type TaskPlacement = { taskId: string; parentId: string | null; position?: numbe
 
 type RevisionRow = { id: string; commission_id: string; base_coordination_revision: number; status: string; proposal_json: string | null };
 type CardRow = { comment_id: string; plan_revision_id: string; interaction_type: RevisionInteraction; purpose: "question" | "final_confirmation"; options_json: string; status: string };
+type TaskDeletion = { taskId: string; commissionId: string; mainTaskId: string; reason: string; revisionId?: string | null; deletingTaskIds?: ReadonlySet<string>; dependencyIds?: readonly string[]; now?: string; allowArchived?: boolean };
 
 export function beginPlanRevision(database: DatabaseSync, commissionId: string, summary: string): string {
   const existing = database.prepare("SELECT id FROM plan_revisions WHERE commission_id = ? AND status IN ('collecting', 'reviewing', 'awaiting_confirmation')").get(commissionId) as { id: string } | undefined;
@@ -108,7 +110,9 @@ function applyPlanRevisionUnsafe(database: DatabaseSync, revisionId: string): st
   applyChanges(database, revision, proposal);
   const now = new Date().toISOString();
   database.prepare("UPDATE plan_revisions SET status = 'applied', applied_at = ?, updated_at = ? WHERE id = ?").run(now, now, revision.id);
-  database.prepare("UPDATE commissions SET coordination_pending = 1, status = 'active', updated_at = ? WHERE id = ?").run(now, revision.commission_id);
+  database.prepare("UPDATE commissions SET coordination_revision = ?, coordination_pending = 1, status = 'active', updated_at = ? WHERE id = ?").run(revision.base_coordination_revision + 1, now, revision.commission_id);
+  database.prepare("UPDATE runs SET coordination_revision = ?, context_snapshot_json = '{}' WHERE commission_id = ? AND trigger_type = 'coordinate' AND status = 'queued'")
+    .run(revision.base_coordination_revision + 1, revision.commission_id);
   const document = database.prepare("SELECT id FROM documents WHERE commission_id = ? AND type = 'plan' ORDER BY rowid LIMIT 1").get(revision.commission_id) as { id: string } | undefined;
   if (document) {
     const version = (database.prepare("SELECT COALESCE(MAX(version_no), 0) + 1 AS version FROM document_versions WHERE document_id = ?").get(document.id) as { version: number }).version;
@@ -173,23 +177,32 @@ function applyChanges(database: DatabaseSync, revision: RevisionRow & { main_tas
   const deleting = new Set(proposal.changes.flatMap((change) => change.action === "delete" ? [change.taskId] : []));
   const dependencySnapshots = new Map([...deleting].map((taskId) => [taskId, (database.prepare("SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at, depends_on_task_id").all(taskId) as Array<{ depends_on_task_id: string }>).map((row) => row.depends_on_task_id)]));
   for (const change of proposal.changes) if (change.action === "delete") {
-    const task = assertActiveTask(database, change.taskId, revision.commission_id);
-    if (task.id === revision.main_task_id) throw conflict("Main task cannot be deleted");
-    if (hasActiveRun(database, task.id)) throw conflict(`Task has an active Run: ${task.id}`);
-    const child = database.prepare("SELECT id FROM tasks WHERE parent_id = ? AND archived_at IS NULL LIMIT 1").get(task.id) as { id: string } | undefined;
-    if (child && !deleting.has(child.id)) throw conflict(`Delete or move child task first: ${child.id}`);
-    const dependents = database.prepare(`SELECT task.id, task.number_path, task.title FROM task_dependencies AS dependency
-      JOIN tasks AS task ON task.id = dependency.task_id
-      WHERE dependency.depends_on_task_id = ? AND task.archived_at IS NULL`).all(task.id) as Array<{ id: string; number_path: string; title: string }>;
-    const dependent = dependents.find((candidate) => !deleting.has(candidate.id));
-    if (dependent) throw conflict(`Task is still required by active task ${dependent.number_path} ${dependent.title}`);
-    database.prepare("DELETE FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?").run(task.id, task.id);
-    database.prepare("UPDATE tasks SET status = 'archived', archived_at = ?, deleted_at = ?, deleted_reason = ?, deleted_revision_id = ?, deleted_dependency_ids_json = ?, updated_at = ? WHERE id = ?")
-      .run(now, now, change.reason, revision.id, JSON.stringify(dependencySnapshots.get(task.id) ?? []), now, task.id);
+    const dependencyIds = dependencySnapshots.get(change.taskId);
+    deleteTaskRecord(database, { taskId: change.taskId, commissionId: revision.commission_id, mainTaskId: revision.main_task_id, reason: change.reason, revisionId: revision.id, deletingTaskIds: deleting, ...(dependencyIds ? { dependencyIds } : {}), now });
   }
   applyPlacements(database, revision.commission_id, placements);
   validateGraphs(database, revision.commission_id, revision.main_task_id);
-  renumber(database, revision.commission_id);
+  renumberTaskTree(database, revision.commission_id);
+}
+
+export function deleteTaskRecord(database: DatabaseSync, input: TaskDeletion): void {
+  const task = database.prepare("SELECT id, archived_at, deleted_at FROM tasks WHERE id = ? AND commission_id = ?").get(input.taskId, input.commissionId) as { id: string; archived_at: string | null; deleted_at: string | null } | undefined;
+  if (!task || task.deleted_at || (!input.allowArchived && task.archived_at)) throw conflict(`Active task not found: ${input.taskId}`);
+  if (task.id === input.mainTaskId) throw conflict("Main task cannot be deleted");
+  if (hasActiveRun(database, task.id)) throw conflict(`Task has an active Run: ${task.id}`);
+  const deleting = input.deletingTaskIds ?? new Set([task.id]);
+  const child = database.prepare("SELECT id FROM tasks WHERE parent_id = ? AND archived_at IS NULL AND deleted_at IS NULL LIMIT 1").get(task.id) as { id: string } | undefined;
+  if (child && !deleting.has(child.id)) throw conflict(`Delete or move child task first: ${child.id}`);
+  const dependents = database.prepare(`SELECT task.id, task.number_path, task.title FROM task_dependencies AS dependency
+    JOIN tasks AS task ON task.id = dependency.task_id
+    WHERE dependency.depends_on_task_id = ? AND task.archived_at IS NULL AND task.deleted_at IS NULL`).all(task.id) as Array<{ id: string; number_path: string; title: string }>;
+  const dependent = dependents.find((candidate) => !deleting.has(candidate.id));
+  if (dependent) throw conflict(`Task is still required by active task ${dependent.number_path} ${dependent.title}`);
+  const dependencyIds = input.dependencyIds ?? (database.prepare("SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at, depends_on_task_id").all(task.id) as Array<{ depends_on_task_id: string }>).map((row) => row.depends_on_task_id);
+  const now = input.now ?? new Date().toISOString();
+  database.prepare("DELETE FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?").run(task.id, task.id);
+  database.prepare("UPDATE tasks SET status = 'archived', archived_at = COALESCE(archived_at, ?), deleted_at = ?, deleted_reason = ?, deleted_revision_id = ?, deleted_dependency_ids_json = ?, updated_at = ? WHERE id = ?")
+    .run(now, now, input.reason, input.revisionId ?? null, JSON.stringify(dependencyIds), now, task.id);
 }
 
 function applyPlacements(database: DatabaseSync, commissionId: string, placements: TaskPlacement[]): void {
@@ -234,14 +247,6 @@ function validateGraphs(database: DatabaseSync, commissionId: string, mainTaskId
   const graph = new Map<string, string[]>(); for (const edge of edges) graph.set(edge.task_id, [...(graph.get(edge.task_id) ?? []), edge.depends_on_task_id]);
   const visit = (id: string, active = new Set<string>(), done = new Set<string>()): void => { if (active.has(id)) throw conflict("Task dependency cycle"); if (done.has(id)) return; active.add(id); for (const next of graph.get(id) ?? []) visit(next, active, done); active.delete(id); done.add(id); };
   const done = new Set<string>(); for (const id of graph.keys()) visit(id, new Set(), done);
-}
-
-function renumber(database: DatabaseSync, commissionId: string): void {
-  const rows = database.prepare("SELECT id, parent_id FROM tasks WHERE commission_id = ? AND archived_at IS NULL ORDER BY position, created_at, rowid").all(commissionId) as Array<{ id: string; parent_id: string | null }>;
-  const children = new Map<string | null, typeof rows>(); for (const row of rows) children.set(row.parent_id, [...(children.get(row.parent_id) ?? []), row]);
-  const update = database.prepare("UPDATE tasks SET number_path = ?, position = ? WHERE id = ?");
-  const visit = (parent: string | null, prefix: string) => (children.get(parent) ?? []).forEach((task, index) => { const path = prefix ? `${prefix}.${index + 1}` : `${index + 1}`; update.run(path, index, task.id); visit(task.id, path); });
-  visit(null, "");
 }
 
 function parseChange(value: unknown): RevisionChange {

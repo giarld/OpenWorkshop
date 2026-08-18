@@ -2,7 +2,6 @@
 import { execFile } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { access, readFile, rm, writeFile } from "node:fs/promises";
-import { createServer as createTcpServer } from "node:net";
 import { parseArgs } from "node:util";
 import { promisify } from "node:util";
 import { join, resolve } from "node:path";
@@ -11,11 +10,13 @@ import { createServer } from "./app.js";
 import { setPin } from "./auth.js";
 import { checkCodexHealth } from "./codex.js";
 import { backupDatabase, openWorkshopDatabase, restoreDatabase, SettingsStore } from "./database.js";
+import { checkPort, doctorFailed, doctorLabel, type DoctorResult } from "./doctor.js";
 import { pruneRawRunEvents } from "./runs.js";
 import { startSystemNotificationWorker } from "./notifications.js";
 import { acquireInstanceLock, clearRuntimeState, consumeRuntimeStop, prepareWorkshopHome, pruneLogFiles, readLatestLog, readRuntimeState, requestRuntimeStop, writeRuntimeState, type RuntimeState } from "./platform.js";
-import { browserCommand, startBackgroundService, waitForServiceStop } from "./service-control.js";
+import { browserCommand, ensureBackgroundService, startBackgroundService, waitForServiceStop } from "./service-control.js";
 import { installWorkshopSkill } from "./skill-installer.js";
+import { updateOpenWorkshop } from "./update-command.js";
 import { isVersionCommand, WORKSHOP_VERSION } from "./version.js";
 import { familyHelp, parseWorkflowCommand, WORKFLOW_COMMANDS, workflowHelp, type WorkflowRequest } from "./workflow-cli.js";
 
@@ -33,6 +34,12 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   }
   if (isVersionCommand(command)) {
     console.log(WORKSHOP_VERSION);
+    return;
+  }
+  if (command === "update") {
+    const { stdout, stderr } = await updateOpenWorkshop();
+    process.stdout.write(stdout);
+    process.stderr.write(stderr);
     return;
   }
   if (command === "skill") {
@@ -78,8 +85,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (command === "gui") {
-    const state = await readRuntimeState(home);
-    if (!state) throw new Error("OpenWorkshop is not running; run workshop start first");
+    const state = await ensureBackgroundService(home, process.argv[1], values.host, Number(values.port));
     const url = serviceUrl(state);
     const [executable, args] = browserCommand(url);
     await runFile(executable, args, { windowsHide: true });
@@ -97,8 +103,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   if (command === "doctor") {
     const results = await doctor(home, values.host, Number(values.port));
     if (values.output === "json") printResult(results, "json");
-    else for (const result of results) console.log(`${result.ok ? "OK" : "FAIL"} ${result.name}${result.detail ? `: ${result.detail}` : ""}`);
-    if (results.some((result) => !result.ok)) process.exitCode = 1;
+    else for (const result of results) console.log(`${doctorLabel(result)} ${result.name}${result.detail ? `: ${result.detail}` : ""}`);
+    if (doctorFailed(results)) process.exitCode = 1;
     return;
   }
   if (command === "backup") {
@@ -288,7 +294,10 @@ async function apiRequest(home: string, request: WorkflowRequest, authenticated 
   let data: unknown = text;
   if (response.headers.get("content-type")?.includes("application/json") && text) data = JSON.parse(text);
   if (!response.ok) {
-    const message = data && typeof data === "object" && "error" in data ? String(data.error) : text || response.statusText;
+    if (request.output === "json" && data && typeof data === "object") throw new Error(JSON.stringify(data));
+    const message = data && typeof data === "object" && "message" in data ? String(data.message)
+      : data && typeof data === "object" && "error" in data ? String(data.error)
+      : text || response.statusText;
     throw new Error(`HTTP ${response.status}: ${message}`);
   }
   return { data: response.status === 204 ? { ok: true } : data, response };
@@ -317,10 +326,8 @@ function printResult(data: unknown, output: string, text = false): void {
 }
 
 function help(): string {
-  return `OpenWorkshop ${WORKSHOP_VERSION}\n\nService commands:\n  start [--foreground] [--host HOST] [--port PORT]\n  stop, restart, status, gui, log [-n LINES], doctor, backup, restore, pin, version\n\nAgent integration:\n  skill install [--agent codex] [--force]\n\nAuthentication:\n  auth status|initialize|login|logout\n  login (alias for auth login)\n\n${workflowHelp()}\n\nEnvironment:\n  WORKSHOP_HOME, WORKSHOP_SERVER_URL`;
+  return `OpenWorkshop ${WORKSHOP_VERSION}\n\nService commands:\n  start [--foreground] [--host HOST] [--port PORT]\n  stop, restart, status, gui, log [-n LINES], doctor, backup, restore, pin, update, version\n\nAgent integration:\n  skill install [--agent codex] [--force]\n\nAuthentication:\n  auth status|initialize|login|logout\n  login (alias for auth login)\n\n${workflowHelp()}\n\nEnvironment:\n  WORKSHOP_HOME, WORKSHOP_SERVER_URL`;
 }
-
-type DoctorResult = { name: string; ok: boolean; detail?: string };
 
 async function doctor(home: string, host: string, port: number): Promise<DoctorResult[]> {
   const results: DoctorResult[] = [];
@@ -338,29 +345,20 @@ async function doctor(home: string, host: string, port: number): Promise<DoctorR
   } finally {
     database?.close();
   }
-  results.push(await check("git", async () => void await runFile("git", ["--version"], { windowsHide: true })));
+  results.push(await check("git", async () => void await runFile("git", ["--version"], { windowsHide: true }), true));
   const codex = await checkCodexHealth();
   results.push({ name: "codex app-server", ok: codex.ok, ...(codex.version ?? codex.error ? { detail: codex.version ?? codex.error } : {}) });
-  results.push(await check(`port ${host}:${port}`, () => checkPort(host, port)));
+  results.push(await check(`port ${host}:${port}`, async () => checkPort(host, port, await readRuntimeState(home))));
   return results;
 }
 
-async function check(name: string, action: () => Promise<unknown>): Promise<DoctorResult> {
+async function check(name: string, action: () => Promise<unknown>, warning = false): Promise<DoctorResult> {
   try {
     await action();
     return { name, ok: true };
   } catch (error) {
-    return { name, ok: false, detail: error instanceof Error ? error.message : String(error) };
+    return { name, ok: false, detail: error instanceof Error ? error.message : String(error), ...(warning ? { warning: true } : {}) };
   }
-}
-
-async function checkPort(host: string, port: number): Promise<void> {
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`Invalid port: ${port}`);
-  await new Promise<void>((resolve, reject) => {
-    const server = createTcpServer();
-    server.once("error", reject);
-    server.listen({ host, port }, () => server.close((error) => error ? reject(error) : resolve()));
-  });
 }
 
 async function readSecret(prompt: string): Promise<string> {

@@ -37,6 +37,11 @@ test("creates, queries, reorders, moves, labels, and archives a task tree", asyn
     assert.equal(extra.parent_id, plan.mainTask.id);
     assert.equal(extra.status, "backlog");
     assert.equal(extra.number_path, "1.2");
+    fixture.database.prepare("UPDATE commissions SET updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(fixture.commissionA);
+    fixture.database.prepare("UPDATE tasks SET updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(plan.mainTask.id);
+    assert.equal((await fixture.server.inject({ method: "PUT", url: `/api/tasks/${extra.id}`, payload: { description: "Updated" } })).statusCode, 200);
+    assert.notEqual((fixture.database.prepare("SELECT updated_at FROM commissions WHERE id = ?").get(fixture.commissionA) as { updated_at: string }).updated_at, "2000-01-01T00:00:00.000Z");
+    assert.notEqual((fixture.database.prepare("SELECT updated_at FROM tasks WHERE id = ?").get(plan.mainTask.id) as { updated_at: string }).updated_at, "2000-01-01T00:00:00.000Z");
 
     const permissions = await fixture.server.inject({ method: "PUT", url: `/api/tasks/${extra.id}`, payload: { autoApprovePermissions: true } });
     assert.equal(permissions.statusCode, 200);
@@ -85,6 +90,58 @@ test("creates, queries, reorders, moves, labels, and archives a task tree", asyn
     assert.equal(archived.json().status, "archived");
     assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM tasks WHERE id = ?").get(extra.id) as { count: number }).count, 1);
     assert.equal((await fixture.server.inject({ method: "GET", url: `/api/projects/${fixture.projectId}/tasks` })).json().some((task: { id: string }) => task.id === extra.id), false);
+    assert.equal((await fixture.server.inject({ method: "GET", url: `/api/tasks/${plan.mainTask.id}` })).json().children.some((task: { id: string }) => task.id === extra.id), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("keeps project task numbers after archive and resolves them within the project", async () => {
+  const fixture = await taskFixture();
+  try {
+    const first = (await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: { title: "First" } })).json() as { id: string; number_path: string };
+    assert.equal(first.number_path, "1");
+    fixture.database.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(first.id);
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${first.id}/archive` })).statusCode, 200);
+
+    const second = (await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionB}/tasks`, payload: { title: "Second" } })).json() as { id: string; number_path: string };
+    assert.equal(second.number_path, "2");
+    const archivedLookup = await fixture.server.inject({ method: "GET", url: `/api/projects/${fixture.projectId}/tasks/by-number/1` });
+    assert.equal(archivedLookup.statusCode, 200);
+    assert.equal(archivedLookup.json().id, first.id);
+    assert.equal((await fixture.server.inject({ method: "GET", url: `/api/projects/${fixture.projectId}/tasks/by-number/2` })).json().id, second.id);
+
+    const otherRoot = randomUUID(), otherProject = randomUUID();
+    const otherCommission = seedApprovedCommission(fixture.database, otherRoot, otherProject);
+    const other = (await fixture.server.inject({ method: "POST", url: `/api/commissions/${otherCommission}/tasks`, payload: { title: "Other" } })).json() as { number_path: string };
+    assert.equal(other.number_path, "1");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("logically deletes an obsolete task through the dedicated endpoint", async () => {
+  const fixture = await taskFixture();
+  try {
+    const plan = (await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: {
+      mainTask: { title: "Main", acceptanceCriteria: [] },
+      tasks: [{ clientId: "old", title: "Old task", acceptanceCriteria: [], dependsOn: [] }]
+    } })).json() as { mainTask: { id: string }; tasks: Array<{ id: string }> };
+    const taskId = plan.tasks[0]!.id;
+
+    assert.equal((await fixture.server.inject({ method: "DELETE", url: `/api/tasks/${taskId}`, payload: {} })).statusCode, 400);
+    assert.equal((await fixture.server.inject({ method: "DELETE", url: `/api/tasks/${plan.mainTask.id}`, payload: { reason: "Invalid" } })).statusCode, 409);
+    assert.equal((await fixture.server.inject({ method: "POST", url: `/api/tasks/${taskId}/archive` })).statusCode, 200);
+
+    const deleted = await fixture.server.inject({ method: "DELETE", url: `/api/tasks/${taskId}`, payload: { reason: "Duplicate task" } });
+    assert.equal(deleted.statusCode, 200);
+    assert.equal(deleted.json().status, "archived");
+    assert.equal(deleted.json().deleted_reason, "Duplicate task");
+    assert.ok(deleted.json().deleted_at);
+    assert.equal(deleted.json().deleted_revision_id, null);
+    assert.equal((await fixture.server.inject({ method: "GET", url: `/api/projects/${fixture.projectId}/tasks?includeArchived=true` })).json().some((task: { id: string }) => task.id === taskId), false);
+    assert.equal((await fixture.server.inject({ method: "GET", url: `/api/projects/${fixture.projectId}/task-history` })).json().some((task: { id: string }) => task.id === taskId), true);
+    assert.equal((await fixture.server.inject({ method: "DELETE", url: `/api/tasks/${taskId}`, payload: { reason: "Again" } })).statusCode, 409);
   } finally {
     await fixture.close();
   }
@@ -276,7 +333,9 @@ test("allows cross-commission dependencies and rolls back cycles with their path
   const fixture = await taskFixture();
   try {
     const first = (await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionA}/tasks`, payload: { title: "First" } })).json() as { id: string };
-    const second = (await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionB}/tasks`, payload: { title: "Second" } })).json() as { id: string };
+    const second = (await fixture.server.inject({ method: "POST", url: `/api/commissions/${fixture.commissionB}/tasks`, payload: { title: "Second" } })).json() as { id: string; number_path: string };
+    assert.equal((await fixture.server.inject({ method: "GET", url: `/api/tasks/${first.id}` })).json().number_path, "1");
+    assert.equal(second.number_path, "2");
     const crossCommission = await fixture.server.inject({ method: "POST", url: `/api/tasks/${first.id}/dependencies`, payload: { dependsOnTaskIds: [second.id] } });
     assert.equal(crossCommission.statusCode, 200);
     assert.deepEqual(crossCommission.json().dependencyIds, [second.id]);

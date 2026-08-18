@@ -5,7 +5,8 @@ import { attachmentData, registerAttachmentParsers, removePendingAttachment, sel
 import { addMainTaskComment, addTaskComment, mentionsAgent, type AgentMentionHandler } from "./comments.ts";
 import { generateAcceptanceDocuments } from "./documents.ts";
 import { notify } from "./notifications.ts";
-import { answerRevisionCard, pendingTextRevisionCard, respondRevisionCard } from "./plan-revisions.ts";
+import { answerRevisionCard, deleteTaskRecord, pendingTextRevisionCard, respondRevisionCard } from "./plan-revisions.ts";
+import { allocateProjectTaskNumber, renumberTaskTree } from "./task-numbering.ts";
 
 const STATUSES = ["backlog", "todo", "in_progress", "done", "blocked", "archived"] as const;
 const PRIORITIES = ["none", "low", "medium", "high", "urgent"] as const;
@@ -64,6 +65,16 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
     return tasks;
   });
 
+  server.get<{ Params: { id: string; numberPath: string } }>("/api/projects/:id/tasks/by-number/:numberPath", async (request) => {
+    projectExists(database, request.params.id);
+    if (!/^[1-9]\d*(?:\.[1-9]\d*)*$/.test(request.params.numberPath)) throw badRequest("Invalid task number");
+    const task = database.prepare(`SELECT task.id FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id
+      WHERE commission.project_id = ? AND task.number_path = ? AND task.deleted_at IS NULL
+      ORDER BY task.archived_at IS NULL DESC, task.updated_at DESC, task.rowid DESC LIMIT 1`).get(request.params.id, request.params.numberPath) as { id: string } | undefined;
+    if (!task) throw notFound("Task not found");
+    return taskView(database, task.id, true);
+  });
+
   server.post<{ Params: { id: string }; Body: Record<string, unknown> }>("/api/commissions/:id/tasks", async (request, reply) => {
     const body = request.body ?? {};
     try {
@@ -83,6 +94,20 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
 
   server.put<{ Params: { id: string }; Body: Record<string, unknown> }>("/api/tasks/:id", async (request) => {
     transaction(database, () => updateTask(database, request.params.id, request.body ?? {}));
+    return taskView(database, request.params.id, true);
+  });
+
+  server.delete<{ Params: { id: string }; Body: Record<string, unknown> }>("/api/tasks/:id", async (request) => {
+    const reason = requiredString(request.body?.reason, "reason");
+    transaction(database, () => {
+      const task = taskById(database, request.params.id);
+      if (task.deleted_at) throw conflict("Task is already deleted");
+      assertTaskPlanMutable(database, task.commission_id);
+      const commission = database.prepare("SELECT main_task_id FROM commissions WHERE id = ?").get(task.commission_id) as { main_task_id: string | null } | undefined;
+      if (!commission?.main_task_id) throw conflict("Commission has no main task");
+      deleteTaskRecord(database, { taskId: task.id, commissionId: task.commission_id, mainTaskId: commission.main_task_id, reason, allowArchived: true });
+      renumberTaskTree(database, task.commission_id);
+    });
     return taskView(database, request.params.id, true);
   });
 
@@ -172,7 +197,7 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
         database.prepare("UPDATE tasks SET status = 'archived', archived_at = ?, updated_at = ? WHERE id = ?").run(now, now, task.id);
       }
       compactSiblings(database, task.commission_id, task.parent_id);
-      renumberCommission(database, task.commission_id);
+      renumberTaskTree(database, task.commission_id);
     });
     return taskView(database, request.params.id, true);
   });
@@ -201,7 +226,7 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
         if (archivedAncestor) throw conflict("Unarchive parent tasks before unarchiving their children");
         database.prepare("UPDATE tasks SET status = 'done', archived_at = NULL, updated_at = ? WHERE id = ?").run(now, task.id);
       }
-      renumberCommission(database, task.commission_id);
+      renumberTaskTree(database, task.commission_id);
     });
     return taskView(database, request.params.id, true);
   });
@@ -380,7 +405,7 @@ function createSingleTask(database: DatabaseSync, commissionId: string, body: Re
   setTaskLabels(database, id, commission.project_id, body.labels);
   const dependencyIds = body.dependsOnTaskIds ?? body.depends_on_task_ids;
   if (dependencyIds !== undefined) replaceDependencies(database, id, stringArray(dependencyIds, "dependsOnTaskIds"), "human");
-  renumberCommission(database, commission.id);
+  renumberTaskTree(database, commission.id);
   return id;
 }
 
@@ -425,7 +450,7 @@ export function createTaskPlan(database: DatabaseSync, commissionId: string, bod
       if (!progressed) throw badRequest("Task parent graph is invalid");
     }
     for (const [clientId, task] of byClientId) replaceDependencies(database, ids.get(clientId)!, stringArray(task.dependsOn ?? [], "dependsOn").map((dependency) => ids.get(dependency)!), "planner_agent");
-    renumberCommission(database, commission.id);
+    renumberTaskTree(database, commission.id);
     addTaskComment(database, { taskId: mainId, authorType: "agent", agentRole: "supervisor", content: plannerTaskComment(database, mainId) });
     for (const id of ids.values()) addTaskComment(database, { taskId: id, authorType: "agent", agentRole: "supervisor", content: plannerTaskComment(database, id) });
     const documentId = randomUUID();
@@ -495,14 +520,15 @@ function insertTask(database: DatabaseSync, commission: CommissionRow, parentId:
   const id = randomUUID();
   const now = new Date().toISOString();
   const position = nextPosition(database, commission.id, parentId);
+  const numberPath = parentId ? "" : allocateProjectTaskNumber(database, commission.project_id);
   const priority = enumValue(body.priority ?? "none", PRIORITIES, "priority");
   const owner = enumValue(body.ownerType ?? body.owner_type ?? "ai", OWNERS, "ownerType");
   const acceptance = array(body.acceptanceCriteria ?? body.acceptance_json ?? [], "acceptanceCriteria");
   const dueDate = dueDateValue(body.dueDate ?? body.due_date);
   database.prepare(`
     INSERT INTO tasks (id, commission_id, parent_id, number_path, position, title, description, status, priority, due_date, owner_type, acceptance_json, review_round_limit, review_round_used, created_at, updated_at, read_only)
-    VALUES (?, ?, ?, '', ?, ?, ?, 'backlog', ?, ?, ?, ?, ?, 0, ?, ?, ?)
-  `).run(id, commission.id, parentId, position, requiredString(body.title, "title"), optionalString(body.description, "description") ?? "", priority, dueDate, owner, JSON.stringify(acceptance), nonNegativeInteger(body.reviewRoundLimit ?? body.review_round_limit ?? 2, "reviewRoundLimit"), now, now, booleanInteger(body.readOnly ?? body.read_only, "readOnly"));
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'backlog', ?, ?, ?, ?, ?, 0, ?, ?, ?)
+  `).run(id, commission.id, parentId, numberPath, position, requiredString(body.title, "title"), optionalString(body.description, "description") ?? "", priority, dueDate, owner, JSON.stringify(acceptance), nonNegativeInteger(body.reviewRoundLimit ?? body.review_round_limit ?? 2, "reviewRoundLimit"), now, now, booleanInteger(body.readOnly ?? body.read_only, "readOnly"));
   return id;
 }
 
@@ -565,7 +591,7 @@ function moveTask(database: DatabaseSync, id: string, body: Record<string, unkno
     database.prepare("UPDATE tasks SET parent_id = ?, position = ?, updated_at = ? WHERE id = ?").run(plan.parent.id, nextPosition(database, task.commission_id, plan.parent.id), new Date().toISOString(), task.id);
     compactSiblings(database, task.commission_id, oldParent);
     compactSiblings(database, task.commission_id, plan.parent.id);
-    renumberCommission(database, task.commission_id);
+    renumberTaskTree(database, task.commission_id);
   }
 }
 
@@ -585,7 +611,7 @@ function reorderTask(database: DatabaseSync, id: string, body: Record<string, un
   const update = database.prepare("UPDATE tasks SET position = ?, updated_at = ? WHERE id = ?");
   const now = new Date().toISOString();
   ids.forEach((taskId, position) => update.run(position, now, taskId));
-  renumberCommission(database, task.commission_id);
+  renumberTaskTree(database, task.commission_id);
 }
 
 function setDependencies(database: DatabaseSync, taskId: string, body: Record<string, unknown>): void {
@@ -660,7 +686,7 @@ function taskTree(tasks: TaskView[]): TaskView[] {
 function taskView(database: DatabaseSync, id: string, includeChildren = false): TaskView {
   const task = taskById(database, id);
   const view = decorateTask(database, task);
-  if (includeChildren) view.children = (database.prepare("SELECT * FROM tasks WHERE parent_id = ? ORDER BY position, created_at, rowid").all(id) as TaskRow[]).map((child) => decorateTask(database, child));
+  if (includeChildren) view.children = (database.prepare("SELECT * FROM tasks WHERE parent_id = ? AND archived_at IS NULL ORDER BY position, created_at, rowid").all(id) as TaskRow[]).map((child) => decorateTask(database, child));
   return view;
 }
 
@@ -710,20 +736,6 @@ function dependencyCycle(database: DatabaseSync, projectId: string): string[] | 
   };
   for (const id of graph.keys()) { const cycle = visit(id); if (cycle) return cycle; }
   return null;
-}
-
-function renumberCommission(database: DatabaseSync, commissionId: string): void {
-  const rows = database.prepare("SELECT id, parent_id, position FROM tasks WHERE commission_id = ? AND archived_at IS NULL ORDER BY position, created_at, rowid").all(commissionId) as Array<{ id: string; parent_id: string | null; position: number }>;
-  const children = new Map<string | null, typeof rows>();
-  for (const row of rows) children.set(row.parent_id, [...(children.get(row.parent_id) ?? []), row]);
-  const update = database.prepare("UPDATE tasks SET number_path = ? WHERE id = ?");
-  const visit = (parentId: string | null, prefix: string) => (children.get(parentId) ?? []).forEach((task, index) => {
-    const number = prefix ? `${prefix}.${index + 1}` : `${index + 1}`;
-    if (task.position !== index) database.prepare("UPDATE tasks SET position = ? WHERE id = ?").run(index, task.id);
-    update.run(number, task.id);
-    visit(task.id, number);
-  });
-  visit(null, "");
 }
 
 function compactSiblings(database: DatabaseSync, commissionId: string, parentId: string | null): void {
