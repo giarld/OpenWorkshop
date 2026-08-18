@@ -1,6 +1,6 @@
 {
   "name": "openworkshop",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "A requirements-led, task-driven workbench for secure autonomous Agent delivery",
   "type": "module",
   "bin": {

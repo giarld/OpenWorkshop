@@ -8,6 +8,8 @@ import { watchSystemColorTheme } from "./theme-settings";
 type Screen = "loading" | "initialize" | "login" | "settings";
 type AgentHealth = { ok: boolean; version?: string; error?: string };
 type RunStatus = { queued: number; active: number; waiting: number; tasks: Array<{ taskId: string; status: string; numberPath: string; title: string; description: string; projectName: string }> };
+type AgentPresetSummary = { id: string; name: string };
+type AgentPresetResponse = { activePresetId: string; presets: AgentPresetSummary[] };
 
 export default function Home() {
   const [screen, setScreen] = useState<Screen>("loading");
@@ -49,6 +51,7 @@ export default function Home() {
     <TaskWorkspace
       header={<header className="app-header">
         <div className="app-title"><div><p className="eyebrow">项目概览</p><h1>项目工作台</h1><p>管理需求、任务执行与最终交付。</p></div><AgentIndicators /></div>
+        <AgentPresetSwitcher />
       </header>}
       settings={<SettingsWorkspace onLogout={logout} onPinChanged={() => { setMessage("PIN 已修改，所有旧会话均已撤销，请重新登录。"); setScreen("login"); }} />}
     />
@@ -107,4 +110,42 @@ function AgentIndicators() {
     <span className={`agent-indicator ${healthState}`} title={health?.version ?? health?.error}><i />{healthLabel}</span>
     <div className="agent-run-indicator" tabIndex={0} aria-describedby="agent-run-summary"><span className={`agent-indicator ${run.state}`}><i />{run.label}</span><div className="agent-run-popover" id="agent-run-summary" role="tooltip"><strong>Agent 任务</strong>{runs?.tasks.length ? <ul>{runs.tasks.map((task) => <li key={task.taskId}><span><b>{task.projectName} · {task.numberPath} {task.title}</b><small>{task.status === "queued" ? "排队" : task.status === "preparing" ? "准备中" : task.status === "running" ? "运行中" : task.status === "waiting_approval" ? "等待审批" : "等待输入"}</small></span><p>{task.description || "暂无任务简介"}</p></li>)}</ul> : <p>当前没有运行、排队或等待处理的任务。</p>}</div></div>
   </div>;
+}
+
+function AgentPresetSwitcher() {
+  const [settings, setSettings] = useState<AgentPresetResponse | null>(null);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    void fetch("/api/settings/agents").then(async (response) => {
+      if (!response.ok) throw new Error("加载预设失败");
+      const result = await response.json() as AgentPresetResponse;
+      if (mounted) setSettings(result);
+    }).catch((error: Error) => mounted && setMessage(error.message));
+    return () => { mounted = false; };
+  }, []);
+
+  async function selectPreset(presetId: string) {
+    if (!settings || busy || presetId === settings.activePresetId) return;
+    setMessage("");
+    setBusy(true);
+    try {
+      const response = await fetch("/api/settings/agents/active", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ presetId }) });
+      if (!response.ok) {
+        const result = await response.json() as { error?: string };
+        setMessage(result.error ?? "切换预设失败");
+        return;
+      }
+      setSettings((current) => current ? { ...current, activePresetId: presetId } : current);
+      window.dispatchEvent(new CustomEvent("agent-preset-changed"));
+    } catch {
+      setMessage("切换预设失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <label className="agent-preset-switcher" title={message || "只影响之后创建的 Run"}>Agent 预设<select aria-label="切换 Agent 预设" disabled={!settings || busy} value={settings?.activePresetId ?? ""} onChange={(event) => void selectPreset(event.target.value)}><option value="" disabled>{message || "加载中…"}</option>{settings?.presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></label>;
 }

@@ -9,6 +9,7 @@ import { storeAttachment } from "./attachments.ts";
 import { registerAuthentication } from "./auth.ts";
 import { addTaskComment } from "./comments.ts";
 import type { CodexAppServerOptions, CodexRunHandle, CodexRunOptions, NormalizedCodexEvent } from "./codex.ts";
+import { registerAgentSettingsRoutes } from "./agent-settings.ts";
 import { openWorkshopDatabase, SettingsStore } from "./database.ts";
 import { answerRevisionCard, beginPlanRevision, saveRevisionProposal } from "./plan-revisions.ts";
 import { appendRunEvent, approvalKind, codexTokenUsage, CodexRunController, EventHub, pruneRawRunEvents, registerProductionRunRoutes, registerRunRoutes, type RunClientLauncher, type RunController } from "./runs.ts";
@@ -72,6 +73,7 @@ test("production assembly wires Codex controls, approvals, and live events", asy
     const previousRunId = seedRun(database, taskId, 1);
     database.prepare("UPDATE runs SET status = 'interrupted', finished_at = ? WHERE id = ?").run(new Date().toISOString(), previousRunId);
     registerAuthentication(server, database);
+    registerAgentSettingsRoutes(server, database);
     await registerProductionRunRoutes(server, database, fakeRunClientLauncher(database, calls));
     const address = await server.listen({ host: "127.0.0.1", port: 0 });
     const initialized = await fetch(`${address}/api/auth/initialize`, {
@@ -111,7 +113,7 @@ test("production assembly wires Codex controls, approvals, and live events", asy
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE entity_type = 'approval' AND entity_id IN (SELECT id FROM approvals WHERE run_id = ?)").get(autoRunId) as { count: number }).count, 0);
     assert.equal((await api(address, cookie, `/api/tasks/${autoTaskId}/cancel`)).body.status, "cancelled");
 
-    new SettingsStore(database).set("codexRuntime", { sandboxMode: "read-only", approvalPolicy: "never", networkAccess: false });
+    assert.equal((await fetch(address + "/api/settings/agents/runtime", { method: "PUT", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify({ sandboxMode: "read-only", approvalPolicy: "never", networkAccess: false }) })).status, 200);
     const configuredTaskId = seedTask(database, home).taskId;
     database.prepare("UPDATE tasks SET status = 'backlog' WHERE id = ?").run(configuredTaskId);
     const configuredRunId = String(((await api(address, cookie, `/api/tasks/${configuredTaskId}/trigger`)).body.runIds as string[])[0]);

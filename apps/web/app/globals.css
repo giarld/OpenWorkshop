@@ -69,6 +69,8 @@ aside { padding: .8rem 1rem; border-left: .25rem solid #c47a2c; background: #fff
 .app-header h1 { margin: .12rem 0 .08rem; font-size: 1.45rem; font-weight: 720; letter-spacing: -.025em; }
 .app-header .app-title > div > p:last-child { font-size: .74rem; }
 .app-title { display: flex; align-items: center; gap: 1.2rem; min-width: 0; }
+.agent-preset-switcher { min-width: min(18rem, 32vw); display: grid; gap: .3rem; color: var(--muted); font-size: .68rem; font-weight: 800; }
+.agent-preset-switcher select { min-width: 12rem; }
 .agent-indicators { display: flex; flex-wrap: wrap; gap: .4rem; padding-bottom: .2rem; }
 .agent-indicator { display: inline-flex; align-items: center; gap: .35rem; padding: .28rem .48rem; border: 1px solid var(--line); border-radius: 999px; background: var(--surface-muted); color: var(--muted); white-space: nowrap; font-size: .66rem; font-weight: 800; }
 .agent-indicator i { width: .5rem; height: .5rem; border-radius: 50%; background: #8b857a; }
@@ -198,6 +200,15 @@ aside { padding: .8rem 1rem; border-left: .25rem solid #c47a2c; background: #fff
 .avatar-file input { padding: .35rem; }
 .pin-form { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .agent-settings-editor { display: grid; align-content: start; gap: .8rem; }
+.agent-preset-manager { display: grid; gap: .8rem; padding: .8rem; border: 1px solid #d9d2c1; border-radius: .35rem; background: #f7f3ea; }
+.preset-toolbar { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
+.preset-toolbar select { flex: 1 1 16rem; }
+.preset-toolbar .danger { border: 1px solid #a52d2d; background: #a52d2d; color: #fff; }
+.preset-toolbar .danger:hover { background: #852323; }
+.preset-toolbar .danger:disabled { border-color: #d8aab2; background: #f1dfe2; color: #7a1f2d; opacity: 1; }
+:root[data-theme="dark"] .preset-toolbar .danger { border-color: #f08a8a; background: #8f2d2d; color: #fff; }
+:root[data-theme="dark"] .preset-toolbar .danger:hover { background: #aa3a3a; }
+:root[data-theme="dark"] .preset-toolbar .danger:disabled { border-color: #8f4d58; background: #4a222b; color: #f08a8a; }
 .agent-settings-editor > label { max-width: 20rem; }
 .agent-managed-settings { display: grid; gap: .7rem; padding: .8rem; border: 1px solid #d9d2c1; border-radius: .35rem; background: #f7f3ea; }
 .agent-managed-settings > header { display: grid; gap: .15rem; }
@@ -664,6 +675,7 @@ aside { padding: .8rem 1rem; border-left: .25rem solid #c47a2c; background: #fff
 .workspace-main .usage-range-switch,
 .workspace-main .usage-chart-switch,
 .workspace-main .avatar-setting,
+.workspace-main .agent-preset-manager,
 .workspace-main .agent-managed-settings,
 .workspace-main .agent-network-setting,
 .workspace-main .acceptance-summary div,
@@ -885,7 +897,9 @@ aside { padding: .8rem 1rem; border-left: .25rem solid #c47a2c; background: #fff
 
 @media (max-width: 700px) {
   .workspace-main { padding: 0; }
-  .app-header { align-items: flex-start; padding: 1rem; }
+  .app-header { align-items: flex-start; flex-direction: column; padding: 1rem; }
+  .agent-preset-switcher { width: 100%; min-width: 0; }
+  .agent-preset-switcher select { min-width: 0; }
   .app-header h1 { font-size: 1.55rem; }
   .app-title { align-items: flex-start; flex-direction: column; gap: .45rem; }
   .agent-indicators { padding-bottom: 0; }
