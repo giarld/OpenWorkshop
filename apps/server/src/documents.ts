@@ -62,8 +62,9 @@ export function generateAcceptanceDocuments(database: DatabaseSync, commissionId
   const reviews = evidence.filter((item) => item.type === "review");
   const rejection = database.prepare("SELECT content FROM comments WHERE task_id = ? AND kind = 'rejection' ORDER BY created_at DESC, rowid DESC LIMIT 1").get(commission.main_task_id) as { content: string } | undefined;
   const acceptanceResult = commission.status === "done" ? "- 已批准。" : commission.status === "awaiting_acceptance" ? "- 等待人工验收。" : rejection ? `- 已拒绝：${rejection.content}` : "- 尚未进入人工验收。";
+  const delivery = database.prepare("SELECT method, status, result_json FROM deliveries WHERE commission_id = ?").get(commissionId) as { method: string; status: string; result_json: string } | undefined;
   upsertGeneratedDocument(database, commission, "review", `${commission.title} review report`, reviewMarkdown(reviews), source);
-  upsertGeneratedDocument(database, commission, "delivery", `${commission.title} delivery`, deliveryMarkdown(commission.main_task_title, tasks, evidence, runs, acceptanceResult), source);
+  upsertGeneratedDocument(database, commission, "delivery", `${commission.title} delivery`, deliveryMarkdown(commission.main_task_title, tasks, evidence, runs, acceptanceResult, delivery), source);
 }
 
 function upsertGeneratedDocument(database: DatabaseSync, commission: { id: string; project_id: string }, type: string, title: string, content: string, source: unknown): void {
@@ -108,7 +109,7 @@ function reviewMarkdown(reviews: Array<Record<string, unknown>>): string {
   return ["## 检查结果", "", ...(reviews.length ? reviews.map((review) => `- ${review.status}: ${review.summary}`) : ["- 暂无独立评审证据。"]), "", "## 证据", "", `共 ${reviews.length} 条评审记录。`].join("\n");
 }
 
-function deliveryMarkdown(title: string, tasks: Array<Record<string, unknown>>, evidence: Array<Record<string, unknown>>, runs: Array<Record<string, unknown>>, acceptanceResult: string): string {
+function deliveryMarkdown(title: string, tasks: Array<Record<string, unknown>>, evidence: Array<Record<string, unknown>>, runs: Array<Record<string, unknown>>, acceptanceResult: string, delivery?: { method: string; status: string; result_json: string }): string {
   const changedFiles = new Set<string>();
   for (const item of evidence) {
     try {
@@ -118,11 +119,18 @@ function deliveryMarkdown(title: string, tasks: Array<Record<string, unknown>>, 
   }
   const risks = evidence.filter((item) => item.status === "failed").map((item) => String(item.summary));
   const unfinished = tasks.filter((task) => task.status !== "done");
+  let deliveryResult: string[] = ["- 尚未执行交付。"];
+  if (delivery) {
+    try {
+      const result = JSON.parse(delivery.result_json) as Record<string, unknown>;
+      deliveryResult = [`- 方式：${delivery.method}`, `- 状态：${delivery.status}`, ...(["commitHash", "svnRevision", "prUrl", "sourceBranch", "targetBranch"] as const).filter((key) => result[key] !== undefined).map((key) => `- ${key}：${String(result[key])}`)];
+    } catch { deliveryResult = [`- 方式：${delivery.method}`, `- 状态：${delivery.status}`]; }
+  }
   return [
     `## ${title}`, "", "## 需求覆盖", "", ...tasks.map((task) => `- ${task.number_path} ${task.title}: ${task.status}`), "",
     "## 变更摘要", "", `${tasks.filter((task) => task.status === "done").length} 个任务已完成。`, "", "## 文件清单", "", ...(changedFiles.size ? [...changedFiles].map((file) => `- ${file}`) : ["- 结构化证据中未记录文件清单。"]), "",
     "## 测试与评审", "", ...evidence.map((item) => `- ${item.type}/${item.status}: ${item.summary}`), "", "## 已知风险", "", ...(risks.length ? risks.map((risk) => `- ${risk}`) : ["- 无已知阻塞风险。"]), "",
-    "## 未完成项", "", ...(unfinished.length ? unfinished.map((task) => `- ${task.number_path} ${task.title}`) : ["- 无。"]), "", "## 人工操作", "", "- 在验收页批准或拒绝最终交付。", "", "## 人工验收结果", "", acceptanceResult, "",
+    "## 未完成项", "", ...(unfinished.length ? unfinished.map((task) => `- ${task.number_path} ${task.title}`) : ["- 无。"]), "", "## 人工操作", "", "- 在验收页选择交付方式，生成预览后确认交付；也可拒绝并返工。", "", "## 人工验收结果", "", acceptanceResult, "", "## 交付结果", "", ...deliveryResult, "",
     `Run 数量：${runs.length}`
   ].join("\n");
 }

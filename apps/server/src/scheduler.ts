@@ -11,37 +11,41 @@ import { notify } from "./notifications.ts";
 import { REVISION_INTERACTIONS, beginPlanRevision, createRevisionCard, parseRevisionProposal, publishRevisionConfirmation, revisionForRun, saveRevisionProposal, type RevisionProposal, type RevisionQuestion } from "./plan-revisions.ts";
 import type { CommandRunner, VcsInfo } from "./projects.ts";
 import { updateCommissionAcceptance } from "./tasks.ts";
+import { captureWorkspaceSnapshot, diffWorkspaceSnapshots, latestCommissionHashes, type WorkspaceSnapshot } from "./workspace-changes.ts";
 
 const runFile = promisify(execFile);
 const ACTIVE_RUN_STATUSES = ["preparing", "running", "waiting_approval", "waiting_input"] as const;
 const RESERVED_RUN_STATUSES = ["queued", ...ACTIVE_RUN_STATUSES] as const;
 const MAX_CONSECUTIVE_FAILED_REVIEWS = 3;
 type GrantScope = "commission_tree" | "target_closure";
-type LockMode = "read" | "worktree" | "exclusive";
+export type ProjectLockMode = "read" | "worktree" | "exclusive";
+type LockMode = ProjectLockMode;
 
 type GrantRow = { id: string; commission_id: string; root_task_id: string; scope: GrantScope; status: "active" | "exhausted" | "revoked" };
 type RunRow = {
   id: string; project_id: string; commission_id: string; task_id: string; role: string; trigger_type: string; trigger_ref_id: string | null;
   execution_grant_id: string | null; retry_root_run_id: string | null; status: string; attempt_no: number; config_snapshot_json: string;
   context_snapshot_json: string; workspace_path: string | null; workspace_mode: LockMode | null; coordination_revision: number | null;
+  workspace_baseline_json: string | null;
 };
 export type RunnableTask = { id: string; projectId: string; commissionId: string; readOnly: boolean };
 export type WorkspacePlan = { cwd: string; lock: LockMode; worktree: boolean };
 export type RunStarter = { start(runId: string, cwd: string): Promise<void> };
 
 export class Scheduler {
-  private readonly locks = new ProjectLockManager();
-  private readonly workspaces = new Map<string, { plan: WorkspacePlan; projectRoot: string; release: () => void }>();
+  private readonly workspaces = new Map<string, { plan: WorkspacePlan; projectRoot: string; vcs: VcsInfo["type"]; release: () => void }>();
   private drain: Promise<void> | null = null;
   private drainRequested = false;
   private readonly database: DatabaseSync;
   private readonly starter: RunStarter;
   private readonly runner: CommandRunner;
+  private readonly locks: ProjectLockManager;
 
-  constructor(database: DatabaseSync, starter: RunStarter, runner: CommandRunner = execute) {
+  constructor(database: DatabaseSync, starter: RunStarter, runner: CommandRunner = execute, locks = new ProjectLockManager()) {
     this.database = database;
     this.starter = starter;
     this.runner = runner;
+    this.locks = locks;
   }
 
   async trigger(taskId: string, beforeStart?: (runIds: readonly string[]) => void) {
@@ -143,7 +147,7 @@ export class Scheduler {
 
   async recover(): Promise<string[]> {
     const blocked: string[] = [];
-    const retries = recoverInterruptedRuns(this.database, blocked);
+    const retries = await recoverInterruptedRuns(this.database, blocked, this.runner);
     const commissions = this.database.prepare("SELECT id FROM commissions WHERE status IN ('active', 'blocked') AND archived_at IS NULL AND NOT EXISTS (SELECT 1 FROM plan_revisions WHERE plan_revisions.commission_id = commissions.id AND plan_revisions.status IN ('collecting', 'reviewing', 'awaiting_confirmation'))").all() as Array<{ id: string }>;
     for (const { id } of commissions) {
       if (!blocked.includes(id)) await this.coordinateFinal(id);
@@ -169,7 +173,11 @@ export class Scheduler {
   }
 
   async terminal(runId: string): Promise<void> {
-    const run = runById(this.database, runId);
+    let run = runById(this.database, runId);
+    if (!await this.recordDiffEvidence(run) && run.status === "succeeded") {
+      this.database.prepare("UPDATE runs SET status = 'failed', failure_code = 'workspace_unavailable' WHERE id = ?").run(run.id);
+      run = { ...run, status: "failed" };
+    }
     if (run.trigger_type === "coordinate") {
       const coordination = this.database.prepare("SELECT coordination_revision FROM commissions WHERE id = ?").get(run.commission_id) as { coordination_revision: number };
       if (run.coordination_revision !== coordination.coordination_revision) {
@@ -294,7 +302,29 @@ export class Scheduler {
       return;
     }
     if (run.status === "succeeded" && run.role === "developer" && run.execution_grant_id) {
-      const result = runAgentOutput(this.database, run.id).trim();
+      let result = runAgentOutput(this.database, run.id).trim();
+      if (isReworkRun(this.database, run.id)) {
+        let rework: ReworkResult;
+        try { rework = parseReworkResult(result); }
+        catch (error) {
+          rework = { resolved: false, summary: error instanceof Error ? error.message : "返工 Agent 未能确认问题已封闭", selfReviewRounds: 3, remainingFindings: ["返工自复查结果无效"] };
+        }
+        result = rework.summary;
+        if (!rework.resolved) {
+          const reason = `返工连续 ${rework.selfReviewRounds} 轮自复查仍未封闭：${rework.summary}`;
+          transaction(this.database, () => {
+            const now = new Date().toISOString();
+            this.database.prepare("UPDATE tasks SET status = 'blocked', blocked_reason = ?, updated_at = ? WHERE id = ?").run(reason, now, run.task_id);
+            const task = this.database.prepare("SELECT title FROM tasks WHERE id = ?").get(run.task_id) as { title: string };
+            addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "agent", agentRole: "developer", content: `## 返工自复查未通过\n\n${rework.summary}\n\n### 未封闭问题\n\n${rework.remainingFindings.map((finding) => `- ${finding}`).join("\n")}` });
+            addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "system", kind: "blocker", content: `${reason}\n\n已停止自动返工，请人工处理后重新执行。` });
+            addMainTaskComment(this.database, { sourceTaskId: run.task_id, runId: run.id, kind: "blocker", content: `子任务返工连续自复查仍未封闭，已停止自动推进。\n\n${rework.summary}` });
+            notify(this.database, "blocked", `任务阻塞：${task.title}`, reason, "task", run.task_id);
+          });
+          await this.cleanup(run.id, false);
+          return;
+        }
+      }
       transaction(this.database, () => {
         if (result) addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "agent", agentRole: "developer", content: result.slice(0, 12000) });
         addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "system", content: "开发执行已完成，已触发独立代码审查。" });
@@ -319,8 +349,20 @@ export class Scheduler {
       const now = new Date().toISOString();
       const task = this.database.prepare("SELECT review_round_limit, review_round_used FROM tasks WHERE id = ?").get(run.task_id) as { review_round_limit: number; review_round_used: number };
       const successful = task.review_round_used + (review.passed ? 1 : 0);
-      const complete = review.passed && successful >= task.review_round_limit;
-      if (complete) await this.deliver(run.id);
+      let complete = review.passed && successful >= task.review_round_limit;
+      if (complete) {
+        try { await this.deliver(run.id); }
+        catch (error) {
+          const message = error instanceof Error ? error.message : "Worktree delivery failed";
+          review = {
+            passed: false,
+            summary: `Reviewer 通过，但 Worktree 变更未能安全应用：${message}`,
+            checks: review.checks,
+            findings: [{ severity: "blocking", file: null, line: null, message }]
+          };
+          complete = false;
+        }
+      }
       const outcome = transaction(this.database, () => {
         this.database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'review', ?, ?, ?, ?)")
           .run(randomUUID(), run.task_id, run.id, review.passed ? "passed" : "failed", review.summary, JSON.stringify(review), now);
@@ -413,9 +455,12 @@ export class Scheduler {
         await mkdir(join(project.real_path, ".openworkshop", "worktrees"), { recursive: true });
         await this.runner("git", ["worktree", "add", "--detach", plan.cwd, "HEAD"], project.real_path);
       }
-      this.workspaces.set(run.id, { plan, projectRoot: project.real_path, release });
+      const workspace = { plan, projectRoot: project.real_path, vcs: project.vcs_type, release };
+      await this.saveWorkspaceBaseline(run, workspace);
+      this.workspaces.set(run.id, workspace);
       return { plan };
     } catch (error) {
+      if (plan.worktree) await this.runner("git", ["worktree", "remove", "--force", plan.cwd], project.real_path).catch(() => undefined);
       release();
       throw error;
     }
@@ -427,6 +472,7 @@ export class Scheduler {
     for (const sourceId of [...new Set([run.trigger_ref_id, latest].filter((id): id is string => Boolean(id)))]) {
       const active = this.workspaces.get(sourceId);
       if (active) {
+        await this.saveWorkspaceBaseline(run, active);
         this.workspaces.delete(sourceId);
         this.workspaces.set(run.id, active);
         return active;
@@ -435,7 +481,8 @@ export class Scheduler {
       if (previous?.workspace_mode !== "worktree" || !previous.workspace_path || !await access(previous.workspace_path).then(() => true, () => false)) continue;
       const release = this.locks.tryAcquire(run.project_id, "worktree");
       if (!release) return undefined;
-      const workspace = { plan: { cwd: previous.workspace_path, lock: "worktree" as const, worktree: true }, projectRoot, release };
+      const workspace = { plan: { cwd: previous.workspace_path, lock: "worktree" as const, worktree: true }, projectRoot, vcs: "git" as const, release };
+      try { await this.saveWorkspaceBaseline(run, workspace); } catch (error) { release(); throw error; }
       this.workspaces.set(run.id, workspace);
       return workspace;
     }
@@ -445,9 +492,17 @@ export class Scheduler {
   private async deliver(runId: string): Promise<void> {
     const workspace = this.workspaces.get(runId);
     if (!workspace?.plan.worktree) return;
+    const worktreeSnapshot = await captureWorkspaceSnapshot(workspace.plan.cwd, "git", this.runner);
+    const paths = worktreeSnapshot.changes.map(({ path }) => path);
     await this.runner("git", ["add", "-N", "."], workspace.plan.cwd);
     const patch = await this.runner("git", ["diff", "--binary", "HEAD"], workspace.plan.cwd);
     if (!patch.trim()) return;
+    const owned = latestCommissionHashes(this.database, runById(this.database, runId).commission_id);
+    const unsafeWorktreePaths = worktreeSnapshot.changes.filter((change) => owned.get(change.path) !== change.hash).map(({ path }) => path);
+    if (unsafeWorktreePaths.length) throw new Error(`Worktree paths are not safely attributable: ${unsafeWorktreePaths.join(", ")}`);
+    const rootChanges = new Map((await captureWorkspaceSnapshot(workspace.projectRoot, "git", this.runner, paths)).changes.map((change) => [change.path, change]));
+    const unsafePaths = paths.filter((path) => rootChanges.get(path)?.changeType !== "clean" && owned.get(path) !== rootChanges.get(path)?.hash);
+    if (unsafePaths.length) throw new Error(`Project paths changed while Worktree was running: ${unsafePaths.join(", ")}`);
     const directory = join(workspace.projectRoot, ".openworkshop", "patches");
     const path = join(directory, `${runId}.patch`);
     await mkdir(directory, { recursive: true });
@@ -459,7 +514,25 @@ export class Scheduler {
       } catch (error) {
         await this.runner("git", ["apply", "--reverse", "--check", path], workspace.projectRoot).catch(() => { throw error; });
       }
+      const applied = new Map((await captureWorkspaceSnapshot(workspace.projectRoot, "git", this.runner, paths)).changes.map((change) => [change.path, change]));
+      const appliedChanges = worktreeSnapshot.changes.map((change) => ({ ...change, worktreeHash: change.hash, hash: applied.get(change.path)?.hash ?? null, safe: true }));
+      const row = this.database.prepare("SELECT payload_json FROM evidence WHERE run_id = ? AND type = 'diff'").get(runId) as { payload_json: string };
+      this.database.prepare("UPDATE evidence SET payload_json = ?, summary = ? WHERE run_id = ? AND type = 'diff'")
+        .run(JSON.stringify({ ...JSON.parse(row.payload_json), appliedChanges }), `Applied ${appliedChanges.length} attributable path changes`, runId);
     } finally { await rm(path, { force: true }); }
+  }
+
+  private async saveWorkspaceBaseline(run: RunRow, workspace: { plan: WorkspacePlan; vcs: VcsInfo["type"] }): Promise<void> {
+    if (workspace.plan.lock === "read") return;
+    const snapshot = await captureWorkspaceSnapshot(workspace.plan.cwd, workspace.vcs, this.runner);
+    const owned = Object.fromEntries(latestCommissionHashes(this.database, run.commission_id));
+    this.database.prepare("UPDATE runs SET workspace_baseline_json = ? WHERE id = ?").run(JSON.stringify({ snapshot, owned }), run.id);
+  }
+
+  private async recordDiffEvidence(run: RunRow): Promise<boolean> {
+    const workspace = this.workspaces.get(run.id);
+    if (!workspace) return true;
+    return recordRunDiffEvidenceOrUnavailable(this.database, this.runner, run, workspace.plan.cwd, workspace.vcs, workspace.plan.lock);
   }
 
   private async cleanup(runId: string, removeWorktree = true): Promise<void> {
@@ -576,15 +649,26 @@ export class ProjectLockManager {
   }
 }
 
+function parseWorkspaceBaseline(value: string | null): { snapshot: WorkspaceSnapshot; owned: Record<string, string | null> } | undefined {
+  if (!value) return undefined;
+  const parsed = JSON.parse(value) as { snapshot?: WorkspaceSnapshot; owned?: Record<string, string | null> };
+  return parsed.snapshot && parsed.owned ? { snapshot: parsed.snapshot, owned: parsed.owned } : undefined;
+}
+
 export function workspacePlan(projectRoot: string, vcs: VcsInfo["type"], readOnly: boolean, gitClean: boolean, runId: string): WorkspacePlan {
   if (readOnly) return { cwd: projectRoot, lock: "read", worktree: false };
   if (vcs === "git" && gitClean) return { cwd: join(projectRoot, ".openworkshop", "worktrees", runId), lock: "worktree", worktree: true };
   return { cwd: projectRoot, lock: "exclusive", worktree: false };
 }
 
-export function recoverInterruptedRuns(database: DatabaseSync, blockedCommissions: string[] = []): string[] {
+export async function recoverInterruptedRuns(database: DatabaseSync, blockedCommissions: string[] = [], runner: CommandRunner = execute): Promise<string[]> {
+  const interrupted = database.prepare(`SELECT * FROM runs WHERE status IN (${ACTIVE_RUN_STATUSES.map(() => "?").join(", ")})`).all(...ACTIVE_RUN_STATUSES) as RunRow[];
+  for (const run of interrupted) {
+    if (!run.workspace_path || !run.workspace_mode || run.workspace_mode === "read") continue;
+    const project = database.prepare("SELECT vcs_type FROM projects WHERE id = ?").get(run.project_id) as { vcs_type: VcsInfo["type"] };
+    await recordRunDiffEvidenceOrUnavailable(database, runner, run, run.workspace_path, project.vcs_type, run.workspace_mode);
+  }
   return transaction(database, () => {
-    const interrupted = database.prepare(`SELECT * FROM runs WHERE status IN (${ACTIVE_RUN_STATUSES.map(() => "?").join(", ")})`).all(...ACTIVE_RUN_STATUSES) as RunRow[];
     const now = new Date().toISOString(); const retries: string[] = [];
     for (const run of interrupted) {
       database.prepare("UPDATE runs SET status = 'interrupted', finished_at = ?, failure_code = 'server_restart' WHERE id = ?").run(now, run.id);
@@ -615,6 +699,34 @@ export function recoverInterruptedRuns(database: DatabaseSync, blockedCommission
     }
     return retries;
   });
+}
+
+async function recordRunDiffEvidence(database: DatabaseSync, runner: CommandRunner, run: RunRow, cwd: string, vcs: VcsInfo["type"], workspaceMode: LockMode): Promise<void> {
+  if (workspaceMode === "read" || database.prepare("SELECT 1 FROM evidence WHERE run_id = ? AND type = 'diff'").get(run.id)) return;
+  const baseline = parseWorkspaceBaseline(run.workspace_baseline_json);
+  const after = await captureWorkspaceSnapshot(cwd, vcs, runner, baseline?.snapshot.changes.map(({ path }) => path));
+  const diff = baseline ? diffWorkspaceSnapshots(baseline.snapshot, after, new Map(Object.entries(baseline.owned))) : {
+    changes: after.changes.map((change) => ({ ...change, baselineHash: null, safe: false, reason: "preexisting_change" as const })),
+    unownedPaths: after.changes.map(({ path }) => path)
+  };
+  const safe = Boolean(baseline) && diff.unownedPaths.length === 0 && diff.changes.every((change) => change.safe);
+  const payload = { version: 1, commissionId: run.commission_id, sourceRunId: run.id, workspaceMode, vcs, changes: diff.changes, unownedPaths: diff.unownedPaths, ...(!baseline && { baselineMissing: true }) };
+  database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'diff', ?, ?, ?, ?)")
+    .run(randomUUID(), run.task_id, run.id, safe ? "passed" : "failed", safe ? `Recorded ${diff.changes.length} attributable path changes` : baseline ? "Workspace contains changes that cannot be safely attributed" : "Workspace baseline is unavailable; current changes cannot be safely attributed", JSON.stringify(payload), new Date().toISOString());
+}
+
+async function recordRunDiffEvidenceOrUnavailable(database: DatabaseSync, runner: CommandRunner, run: RunRow, cwd: string, vcs: VcsInfo["type"], workspaceMode: LockMode): Promise<boolean> {
+  try { await recordRunDiffEvidence(database, runner, run, cwd, vcs, workspaceMode); return true; }
+  catch { recordUnavailableWorkspaceEvidence(database, run, workspaceMode, vcs); return false; }
+}
+
+function recordUnavailableWorkspaceEvidence(database: DatabaseSync, run: RunRow, workspaceMode: LockMode, vcs: VcsInfo["type"]): void {
+  if (database.prepare("SELECT 1 FROM evidence WHERE run_id = ? AND type = 'diff'").get(run.id)) return;
+  const baseline = parseWorkspaceBaseline(run.workspace_baseline_json);
+  const unownedPaths = baseline?.snapshot.changes.map(({ path }) => path) ?? [];
+  const payload = { version: 1, commissionId: run.commission_id, sourceRunId: run.id, workspaceMode, vcs, changes: [], unownedPaths, failureCode: "workspace_unavailable" };
+  database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'diff', 'failed', ?, ?, ?)")
+    .run(randomUUID(), run.task_id, run.id, "Workspace is unavailable; current changes cannot be safely attributed", JSON.stringify(payload), new Date().toISOString());
 }
 
 function reserveRoutedRun(database: DatabaseSync, grantId: string, taskId: string): string {
@@ -817,6 +929,24 @@ function finalCoordinationMainTask(database: DatabaseSync, commissionId: string)
 }
 
 export type ReviewResult = { passed: boolean; summary: string; checks: unknown[]; findings: unknown[] };
+export type ReworkResult = { resolved: boolean; summary: string; selfReviewRounds: number; remainingFindings: string[] };
+
+export function isReworkRun(database: DatabaseSync, runId: string): boolean {
+  return Boolean(database.prepare(`WITH RECURSIVE lineage(id, trigger_type, trigger_ref_id) AS (
+    SELECT id, trigger_type, trigger_ref_id FROM runs WHERE id = ?
+    UNION ALL
+    SELECT parent.id, parent.trigger_type, parent.trigger_ref_id FROM runs AS parent JOIN lineage ON parent.id = lineage.trigger_ref_id
+  ) SELECT 1 FROM lineage WHERE trigger_type = 'rework' LIMIT 1`).get(runId));
+}
+
+export function parseReworkResult(output: string): ReworkResult {
+  const value = parseJsonObject(output, "Rework developer");
+  if (typeof value.resolved !== "boolean" || typeof value.summary !== "string" || !value.summary.trim() || !Number.isInteger(value.selfReviewRounds) || Number(value.selfReviewRounds) < 1 || Number(value.selfReviewRounds) > 3 || !Array.isArray(value.remainingFindings) || value.remainingFindings.some((finding) => typeof finding !== "string" || !finding.trim())) throw new Error("Rework developer returned an invalid self-review result");
+  const remainingFindings = value.remainingFindings.map(String);
+  if (value.resolved && remainingFindings.length) throw new Error("Resolved rework cannot contain remaining findings");
+  if (!value.resolved && (Number(value.selfReviewRounds) < 3 || !remainingFindings.length)) throw new Error("Unresolved rework requires three self-review rounds and remaining findings");
+  return { resolved: value.resolved, summary: value.summary.trim(), selfReviewRounds: Number(value.selfReviewRounds), remainingFindings };
+}
 
 export function parseReviewResult(output: string): ReviewResult {
   const json = /```(?:json)?\s*([\s\S]*?)```/i.exec(output)?.[1] ?? output.slice(output.indexOf("{"), output.lastIndexOf("}") + 1);

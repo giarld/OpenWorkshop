@@ -710,6 +710,93 @@ const MIGRATIONS = [
     UPDATE runs SET coordination_revision = (SELECT coordination_revision FROM commissions WHERE id = runs.commission_id), context_snapshot_json = '{}'
       WHERE commission_id = (SELECT commission_id FROM tasks WHERE id = OLD.task_id) AND trigger_type = 'coordinate' AND status = 'queued';
   END;
+  `,
+  `
+  ALTER TABLE runs ADD COLUMN workspace_baseline_json TEXT
+    CHECK (workspace_baseline_json IS NULL OR (json_valid(workspace_baseline_json) AND json_type(workspace_baseline_json) = 'object'));
+
+  CREATE TABLE deliveries (
+    id TEXT PRIMARY KEY,
+    commission_id TEXT NOT NULL UNIQUE REFERENCES commissions(id),
+    main_task_id TEXT NOT NULL REFERENCES tasks(id),
+    method TEXT NOT NULL CHECK (method IN ('document', 'vcs_commit', 'github_pr')),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'preparing', 'running', 'waiting_human', 'failed', 'cancelled', 'succeeded')),
+    request_json TEXT NOT NULL CHECK (json_valid(request_json) AND json_type(request_json) = 'object'),
+    preview_json TEXT NOT NULL CHECK (json_valid(preview_json) AND json_type(preview_json) = 'object'),
+    progress_json TEXT NOT NULL CHECK (json_valid(progress_json) AND json_type(progress_json) = 'object'),
+    result_json TEXT NOT NULL CHECK (json_valid(result_json) AND json_type(result_json) = 'object'),
+    external_effect_started INTEGER NOT NULL CHECK (external_effect_started IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+  ) STRICT;
+
+  CREATE TABLE delivery_attempts (
+    id TEXT PRIMARY KEY,
+    delivery_id TEXT NOT NULL REFERENCES deliveries(id),
+    attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'preparing', 'running', 'waiting_human', 'failed', 'cancelled', 'succeeded')),
+    request_json TEXT NOT NULL CHECK (json_valid(request_json) AND json_type(request_json) = 'object'),
+    preview_json TEXT NOT NULL CHECK (json_valid(preview_json) AND json_type(preview_json) = 'object'),
+    progress_json TEXT NOT NULL CHECK (json_valid(progress_json) AND json_type(progress_json) = 'object'),
+    result_json TEXT NOT NULL CHECK (json_valid(result_json) AND json_type(result_json) = 'object'),
+    failure_code TEXT,
+    failure_summary TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (delivery_id, attempt_no)
+  ) STRICT;
+  CREATE UNIQUE INDEX deliveries_one_active_attempt ON delivery_attempts(delivery_id)
+    WHERE status IN ('queued', 'preparing', 'running');
+  CREATE INDEX delivery_attempts_delivery_created ON delivery_attempts(delivery_id, created_at);
+  DROP TRIGGER evidence_lifecycle_delete;
+  DELETE FROM evidence
+    WHERE type = 'diff' AND run_id IS NOT NULL AND rowid NOT IN (
+      SELECT MAX(rowid) FROM evidence WHERE type = 'diff' AND run_id IS NOT NULL GROUP BY run_id
+    );
+  ${mutationGuardTriggers("evidence", (row) => `SELECT 1 FROM commissions WHERE id = (SELECT commission_id FROM tasks WHERE id = ${row}.task_id) AND lifecycle_operation IS NOT NULL`)[2]}
+  CREATE UNIQUE INDEX evidence_one_diff_per_run ON evidence(run_id) WHERE type = 'diff' AND run_id IS NOT NULL;
+  ${mutationGuardTriggers("deliveries", (row) => `SELECT 1 FROM commissions WHERE id = ${row}.commission_id AND lifecycle_operation IS NOT NULL`).join("\n")}
+  ${mutationGuardTriggers("delivery_attempts", (row) => `SELECT 1 FROM commissions WHERE id = (SELECT commission_id FROM deliveries WHERE id = ${row}.delivery_id) AND lifecycle_operation IS NOT NULL`).join("\n")}
+  `,
+  `
+  DROP INDEX deliveries_one_active_attempt;
+  DROP TRIGGER delivery_attempts_lifecycle_update;
+  WITH ranked AS (
+    SELECT id, status, ROW_NUMBER() OVER (
+      PARTITION BY delivery_id
+      ORDER BY CASE WHEN status = 'waiting_human' THEN 0 ELSE 1 END, attempt_no DESC
+    ) AS active_rank
+    FROM delivery_attempts
+    WHERE status IN ('queued', 'preparing', 'running', 'waiting_human')
+  )
+  UPDATE delivery_attempts
+  SET status = CASE WHEN status IN ('queued', 'preparing') THEN 'cancelled' ELSE 'failed' END,
+      failure_code = COALESCE(failure_code, 'migration_active_attempt_conflict'),
+      failure_summary = COALESCE(failure_summary, 'Conflicting active attempt stopped during schema migration'),
+      finished_at = COALESCE(finished_at, STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  WHERE id IN (SELECT id FROM ranked WHERE active_rank > 1);
+  ${mutationGuardTriggers("delivery_attempts", (row) => `SELECT 1 FROM commissions WHERE id = (SELECT commission_id FROM deliveries WHERE id = ${row}.delivery_id) AND lifecycle_operation IS NOT NULL`)[1]}
+  CREATE UNIQUE INDEX deliveries_one_active_attempt ON delivery_attempts(delivery_id)
+    WHERE status IN ('queued', 'preparing', 'running', 'waiting_human');
+  CREATE TRIGGER delivery_attempts_audit_snapshot_immutable
+  BEFORE UPDATE OF id, delivery_id, attempt_no, request_json, preview_json, created_at ON delivery_attempts
+  BEGIN SELECT RAISE(ABORT, 'Delivery attempt audit snapshot is immutable'); END;
+  `,
+  `
+  DROP TRIGGER IF EXISTS notifications_lifecycle_insert;
+  DROP TRIGGER IF EXISTS notifications_lifecycle_update;
+  DROP TRIGGER IF EXISTS notifications_lifecycle_delete;
+  ${mutationGuardTriggers("notifications", (row) => `SELECT 1 FROM commissions WHERE lifecycle_operation IS NOT NULL AND id IN (
+    SELECT ${row}.entity_id WHERE ${row}.entity_type = 'commission'
+    UNION SELECT commission_id FROM tasks WHERE id = ${row}.entity_id AND ${row}.entity_type = 'task'
+    UNION SELECT commission_id FROM runs WHERE id = ${row}.entity_id AND ${row}.entity_type = 'run'
+    UNION SELECT run.commission_id FROM approvals AS approval JOIN runs AS run ON run.id = approval.run_id WHERE approval.id = ${row}.entity_id AND ${row}.entity_type = 'approval'
+    UNION SELECT commission_id FROM documents WHERE id = ${row}.entity_id AND ${row}.entity_type = 'document'
+    UNION SELECT commission_id FROM requirement_versions WHERE id = ${row}.entity_id AND ${row}.entity_type = 'requirement'
+    UNION SELECT commission_id FROM deliveries WHERE id = ${row}.entity_id AND ${row}.entity_type = 'delivery'
+  )`).join("\n")}
   `
 ];
 

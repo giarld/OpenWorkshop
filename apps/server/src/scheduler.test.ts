@@ -9,7 +9,7 @@ import test from "node:test";
 import Fastify from "fastify";
 import { openWorkshopDatabase } from "./database.ts";
 import { answerRevisionCard, beginPlanRevision, saveRevisionProposal } from "./plan-revisions.ts";
-import { coveredTaskIds, createExecutionGrant, parseReviewResult, parseSupervisorDecision, ProjectLockManager, registerSchedulerRoutes, runnableTasks, Scheduler, workspacePlan } from "./scheduler.ts";
+import { coveredTaskIds, createExecutionGrant, parseReviewResult, parseReworkResult, parseSupervisorDecision, ProjectLockManager, registerSchedulerRoutes, runnableTasks, Scheduler, workspacePlan } from "./scheduler.ts";
 import { registerTaskRoutes } from "./tasks.ts";
 
 const runFile = promisify(execFile);
@@ -297,9 +297,28 @@ test("production Scheduler starts and cleans an isolated Git Worktree", async ()
     assert.equal(starts.length, 1);
     assert.match(starts[0]!.cwd, /\.openworkshop[\\/]worktrees/);
     await scheduler.terminal(result.runIds[0]!);
-    assert.deepEqual(commands.map(([command]) => command), ["status", "worktree"]);
+    assert.deepEqual(commands.slice(0, 2).map(([command]) => command), ["status", "worktree"]);
+    assert.ok(commands.filter(([command]) => command === "status").length >= 4);
     assert.equal((fixture.database.prepare("SELECT role FROM runs ORDER BY rowid DESC LIMIT 1").get() as { role: string }).role, "reviewer");
     assert.match((fixture.database.prepare("SELECT content FROM comments WHERE task_id = ? AND author_type = 'system' ORDER BY rowid DESC LIMIT 1").get(task) as { content: string }).content, /触发独立代码审查/);
+  } finally { await fixture.close(); }
+});
+
+test("Scheduler honors an injected project lock shared with delivery work", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    fixture.database.prepare("UPDATE projects SET vcs_type = 'none' WHERE id = ?").run(fixture.project);
+    fixture.done(fixture.main);
+    const task = fixture.task("shared-lock", fixture.main, "backlog");
+    const locks = new ProjectLockManager();
+    const release = locks.tryAcquire(fixture.project, "exclusive")!;
+    const starts: string[] = [];
+    const scheduler = new Scheduler(fixture.database, { start: async (runId) => { starts.push(runId); } }, undefined, locks);
+    const triggered = await scheduler.trigger(task);
+    assert.deepEqual(starts, []);
+    release();
+    await scheduler.wake(triggered.grant.id);
+    assert.deepEqual(starts, triggered.runIds);
   } finally { await fixture.close(); }
 });
 
@@ -393,6 +412,114 @@ test("restart consumes one persisted automatic retry without extending its linea
     assert.deepEqual(await new Scheduler(fixture.database, starter, async () => "dirty").recover(), []);
     assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE trigger_type = 'auto_retry' AND trigger_ref_id = ?").get(run) as { count: number }).count, 1);
     assert.equal((fixture.database.prepare("SELECT MAX(attempt_no) AS attempt FROM runs WHERE task_id = ?").get(task) as { attempt: number }).attempt, 2);
+  } finally { await fixture.close(); }
+});
+
+test("restart records diff Evidence for an interrupted write Run", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    await writeFile(join(fixture.projectPath, "base.txt"), "base\n");
+    await git(fixture.projectPath, "init");
+    await git(fixture.projectPath, "config", "user.email", "test@example.com");
+    await git(fixture.projectPath, "config", "user.name", "Test");
+    await git(fixture.projectPath, "add", ".");
+    await git(fixture.projectPath, "commit", "-m", "base");
+    await writeFile(join(fixture.projectPath, "user.txt"), "pre-existing\n");
+    fixture.done(fixture.main);
+    const task = fixture.task("restart-evidence", fixture.main, "backlog");
+    let interrupted = "";
+    const first = new Scheduler(fixture.database, { start: async (runId, cwd) => {
+      interrupted = runId;
+      await writeFile(join(cwd, "feature.txt"), "written before restart\n");
+      fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId);
+    } });
+    await first.trigger(task);
+
+    await new Scheduler(fixture.database, { start: async (runId) => { fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } }).recover();
+
+    const evidence = fixture.database.prepare("SELECT payload_json FROM evidence WHERE run_id = ? AND type = 'diff'").get(interrupted) as { payload_json: string };
+    const payload = JSON.parse(evidence.payload_json) as { sourceRunId: string; changes: Array<{ path: string; hash: string | null; safe: boolean }> };
+    assert.equal(payload.sourceRunId, interrupted);
+    assert.deepEqual(payload.changes.map(({ path, safe }) => [path, safe]), [["feature.txt", true]]);
+    assert.match(payload.changes[0]!.hash!, /^[a-f0-9]{64}$/);
+  } finally { await fixture.close(); }
+});
+
+test("restart conservatively recovers a legacy write Run without a workspace baseline", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    await git(fixture.projectPath, "init");
+    await writeFile(join(fixture.projectPath, "legacy.txt"), "unknown owner\n");
+    const task = fixture.task("legacy-restart", fixture.main, "in_progress");
+    const grant = createExecutionGrant(fixture.database, task);
+    const interrupted = fixture.run(task, "running", grant.id);
+    fixture.database.prepare("UPDATE runs SET workspace_path = ?, workspace_mode = 'exclusive' WHERE id = ?").run(fixture.projectPath, interrupted);
+
+    await new Scheduler(fixture.database, { start: async (runId) => { fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } }).recover();
+
+    const evidence = fixture.database.prepare("SELECT status, payload_json FROM evidence WHERE run_id = ? AND type = 'diff'").get(interrupted) as { status: string; payload_json: string };
+    const payload = JSON.parse(evidence.payload_json) as { baselineMissing: boolean; unownedPaths: string[]; changes: Array<{ safe: boolean }> };
+    assert.equal(evidence.status, "failed");
+    assert.equal(payload.baselineMissing, true);
+    assert.deepEqual(payload.unownedPaths, ["legacy.txt"]);
+    assert.equal(payload.changes[0]!.safe, false);
+  } finally { await fixture.close(); }
+});
+
+test("restart records failed Evidence and continues when a write workspace is unavailable", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    await writeFile(join(fixture.projectPath, "base.txt"), "base\n");
+    await git(fixture.projectPath, "init");
+    await git(fixture.projectPath, "config", "user.email", "test@example.com");
+    await git(fixture.projectPath, "config", "user.name", "Test");
+    await git(fixture.projectPath, "add", ".");
+    await git(fixture.projectPath, "commit", "-m", "base");
+    fixture.done(fixture.main);
+    const task = fixture.task("missing-workspace", fixture.main, "in_progress");
+    const grant = createExecutionGrant(fixture.database, task);
+    const interrupted = fixture.run(task, "running", grant.id);
+    fixture.database.prepare("UPDATE runs SET workspace_path = ?, workspace_mode = 'exclusive' WHERE id = ?").run(join(fixture.projectPath, "missing-workspace"), interrupted);
+
+    const retries = await new Scheduler(fixture.database, { start: async (runId) => { fixture.database.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId); } }).recover();
+
+    assert.equal(retries.length, 1);
+    const evidence = fixture.database.prepare("SELECT status, payload_json FROM evidence WHERE run_id = ? AND type = 'diff'").get(interrupted) as { status: string; payload_json: string };
+    assert.equal(evidence.status, "failed");
+    assert.equal((JSON.parse(evidence.payload_json) as { failureCode: string }).failureCode, "workspace_unavailable");
+    assert.equal((fixture.database.prepare("SELECT status FROM runs WHERE id = ?").get(interrupted) as { status: string }).status, "interrupted");
+  } finally { await fixture.close(); }
+});
+
+test("terminal records failed Evidence and releases the lock when a write workspace is unavailable", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    await writeFile(join(fixture.projectPath, "base.txt"), "base\n");
+    await git(fixture.projectPath, "init");
+    await git(fixture.projectPath, "config", "user.email", "test@example.com");
+    await git(fixture.projectPath, "config", "user.name", "Test");
+    await git(fixture.projectPath, "add", ".");
+    await git(fixture.projectPath, "commit", "-m", "base");
+    fixture.done(fixture.main);
+    const task = fixture.task("missing-terminal-workspace", fixture.main, "backlog");
+    const locks = new ProjectLockManager();
+    let cwd = "";
+    const scheduler = new Scheduler(fixture.database, { start: async (runId, workspace) => {
+      cwd = workspace;
+      fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(runId);
+    } }, undefined, locks);
+    const run = (await scheduler.trigger(task)).runIds[0]!;
+    await git(fixture.projectPath, "worktree", "remove", "--force", cwd);
+
+    await scheduler.terminal(run);
+
+    const evidence = fixture.database.prepare("SELECT status, payload_json FROM evidence WHERE run_id = ? AND type = 'diff'").get(run) as { status: string; payload_json: string };
+    assert.equal(evidence.status, "failed");
+    assert.equal((JSON.parse(evidence.payload_json) as { failureCode: string }).failureCode, "workspace_unavailable");
+    assert.deepEqual({ ...fixture.database.prepare("SELECT status, failure_code FROM runs WHERE id = ?").get(run) }, { status: "failed", failure_code: "workspace_unavailable" });
+    const release = locks.tryAcquire(fixture.project, "exclusive");
+    assert.ok(release);
+    release();
   } finally { await fixture.close(); }
 });
 
@@ -706,6 +833,11 @@ test("parses the supervisor reconciliation contract", () => {
   assert.throws(() => parseSupervisorDecision('{"action":"developer","summary":"wrong"}'), /invalid decision/);
 });
 
+test("parses the bounded rework self-review contract", () => {
+  assert.deepEqual(parseReworkResult('{"resolved":true,"summary":"closed","selfReviewRounds":2,"remainingFindings":[]}'), { resolved: true, summary: "closed", selfReviewRounds: 2, remainingFindings: [] });
+  assert.throws(() => parseReworkResult('{"resolved":false,"summary":"still broken","selfReviewRounds":2,"remainingFindings":["bug"]}'), /requires three self-review rounds/);
+});
+
 test("failed reviews trigger rework without consuming required successful rounds", async () => {
   const fixture = await schedulerFixture();
   try {
@@ -719,6 +851,7 @@ test("failed reviews trigger rework without consuming required successful rounds
     await scheduler.trigger(task);
     for (let round = 0; round < 2; round += 1) {
       const developer = starts.at(-1)!;
+      if ((fixture.database.prepare("SELECT trigger_type FROM runs WHERE id = ?").get(developer) as { trigger_type: string }).trigger_type === "rework") fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'self-review', ?, 0, ?)").run(developer, JSON.stringify({ delta: '{"resolved":true,"summary":"fixed","selfReviewRounds":1,"remainingFindings":[]}' }), new Date().toISOString());
       fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(developer);
       await scheduler.terminal(developer);
       const reviewer = starts.at(-1)!;
@@ -756,6 +889,7 @@ test("three consecutive failed reviews block the task instead of scheduling endl
 
     for (let round = 1; round <= 3; round += 1) {
       const developer = starts.at(-1)!;
+      if ((fixture.database.prepare("SELECT trigger_type FROM runs WHERE id = ?").get(developer) as { trigger_type: string }).trigger_type === "rework") fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'self-review', ?, 0, ?)").run(developer, JSON.stringify({ delta: '{"resolved":true,"summary":"fixed","selfReviewRounds":1,"remainingFindings":[]}' }), new Date().toISOString());
       fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(developer);
       await scheduler.terminal(developer);
       const reviewer = starts.at(-1)!;
@@ -774,6 +908,29 @@ test("three consecutive failed reviews block the task instead of scheduling endl
     assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM evidence WHERE task_id = ? AND type = 'review' AND status = 'failed'").get(task) as { count: number }).count, 3);
     assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE entity_type = 'task' AND entity_id = ? AND kind = 'blocked'").get(task) as { count: number }).count, 1);
     assert.match((fixture.database.prepare("SELECT content FROM comments WHERE task_id = ? AND kind = 'blocker' ORDER BY rowid DESC LIMIT 1").get(task) as { content: string }).content, /已停止自动返工/);
+  } finally { await fixture.close(); }
+});
+
+test("rework blocks without another review after three failed self-review rounds", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    fixture.done(fixture.main);
+    const task = fixture.task("self-review-loop", fixture.main, "in_progress");
+    const grant = createExecutionGrant(fixture.database, task);
+    const failedReview = fixture.run(task, "succeeded", grant.id, "reviewer");
+    const interruptedRework = fixture.run(task, "interrupted", grant.id, "developer");
+    fixture.database.prepare("UPDATE runs SET trigger_type = 'rework', trigger_ref_id = ? WHERE id = ?").run(failedReview, interruptedRework);
+    const rework = fixture.run(task, "succeeded", grant.id, "developer");
+    fixture.database.prepare("UPDATE runs SET trigger_type = 'resume', trigger_ref_id = ? WHERE id = ?").run(interruptedRework, rework);
+    fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'self-review', ?, 0, ?)").run(rework, JSON.stringify({ delta: '{"resolved":false,"summary":"parser still accepts invalid input","selfReviewRounds":3,"remainingFindings":["invalid input remains accepted"]}' }), new Date().toISOString());
+    const scheduler = new Scheduler(fixture.database, { start: async () => undefined }, async () => "dirty");
+
+    await scheduler.terminal(rework);
+
+    const state = fixture.database.prepare("SELECT status, blocked_reason FROM tasks WHERE id = ?").get(task) as { status: string; blocked_reason: string };
+    assert.equal(state.status, "blocked");
+    assert.match(state.blocked_reason, /连续 3 轮自复查仍未封闭/);
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE trigger_ref_id = ? AND role = 'reviewer'").get(rework) as { count: number }).count, 0);
   } finally { await fixture.close(); }
 });
 
@@ -804,16 +961,99 @@ test("Git development changes reach reviewer and project root before worktree cl
     } });
     const triggered = await scheduler.trigger(task);
     await scheduler.terminal(triggered.runIds[0]!);
+    const developerDiff = fixture.database.prepare("SELECT payload_json FROM evidence WHERE run_id = ? AND type = 'diff'").get(triggered.runIds[0]!) as { payload_json: string };
+    const developerPayload = JSON.parse(developerDiff.payload_json) as { sourceRunId: string; commissionId: string; changes: Array<{ path: string; baselineHash: string | null; hash: string | null; safe: boolean }> };
+    assert.equal(developerPayload.sourceRunId, triggered.runIds[0]);
+    assert.equal(developerPayload.commissionId, (fixture.database.prepare("SELECT commission_id FROM tasks WHERE id = ?").get(task) as { commission_id: string }).commission_id);
+    assert.deepEqual(developerPayload.changes.map(({ path, baselineHash, safe }) => [path, baselineHash, safe]), [["feature.txt", null, true]]);
+    assert.match(developerPayload.changes[0]!.hash!, /^[a-f0-9]{64}$/);
     assert.equal(reviewerSawChange, true);
     assert.equal(starts[0]!.cwd, starts[1]!.cwd);
     await scheduler.terminal(starts[1]!.id);
     assert.equal(await access(starts[0]!.cwd).then(() => true, () => false), true);
     assert.equal(starts[2]!.role, "reviewer");
     await scheduler.terminal(starts[2]!.id);
+    const appliedDiff = fixture.database.prepare("SELECT payload_json FROM evidence WHERE run_id = ? AND type = 'diff'").get(starts[2]!.id) as { payload_json: string };
+    const appliedPayload = JSON.parse(appliedDiff.payload_json) as { appliedChanges: Array<{ path: string; hash: string | null; safe: boolean }> };
+    assert.deepEqual(appliedPayload.appliedChanges.map(({ path }) => path), ["feature.txt"]);
+    assert.match(appliedPayload.appliedChanges[0]!.hash!, /^[a-f0-9]{64}$/);
+    assert.equal(appliedPayload.appliedChanges[0]!.safe, true);
     assert.deepEqual([starts[3]!.role, starts[3]!.trigger], ["supervisor", "coordinate"]);
     assert.equal((await readFile(join(fixture.projectPath, "feature.txt"), "utf8")).trim(), "reviewed change");
     assert.equal(await access(starts[0]!.cwd).then(() => true, () => false), false);
     assert.match((fixture.database.prepare("SELECT content FROM comments WHERE task_id = ? ORDER BY rowid DESC LIMIT 1").get(fixture.main) as { content: string }).content, /@任务1[\s\S]*已完成/);
+  } finally { await fixture.close(); }
+});
+
+test("Worktree delivery refuses a same-path user edit without applying or attributing it", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    const file = join(fixture.projectPath, "shared.txt");
+    await writeFile(file, "base agent\nbase user\n");
+    await git(fixture.projectPath, "init");
+    await git(fixture.projectPath, "config", "user.email", "test@example.com");
+    await git(fixture.projectPath, "config", "user.name", "Test");
+    await git(fixture.projectPath, "add", ".");
+    await git(fixture.projectPath, "commit", "-m", "base");
+    fixture.database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(fixture.main);
+    const task = fixture.task("git-user-drift", fixture.main, "backlog");
+    const starts: Array<{ id: string; role: string; cwd: string }> = [];
+    const scheduler = new Scheduler(fixture.database, { start: async (runId, cwd) => {
+      const role = (fixture.database.prepare("SELECT role FROM runs WHERE id = ?").get(runId) as { role: string }).role;
+      starts.push({ id: runId, role, cwd });
+      if (role === "developer") await writeFile(join(cwd, "shared.txt"), "agent edit\nbase user\n");
+      else fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'review', ?, 0, ?)")
+        .run(runId, JSON.stringify({ delta: '{"passed":true,"summary":"ok","checks":[],"findings":[]}' }), new Date().toISOString());
+      fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(runId);
+    } });
+
+    const developer = (await scheduler.trigger(task)).runIds[0]!;
+    await scheduler.terminal(developer);
+    await writeFile(file, "base agent\nuser edit\n");
+    await scheduler.terminal(starts[1]!.id);
+    await scheduler.terminal(starts[2]!.id);
+
+    assert.equal(await readFile(file, "utf8"), "base agent\nuser edit\n");
+    const payload = JSON.parse((fixture.database.prepare("SELECT payload_json FROM evidence WHERE run_id = ? AND type = 'diff'").get(starts[2]!.id) as { payload_json: string }).payload_json) as { appliedChanges?: unknown };
+    assert.equal(payload.appliedChanges, undefined);
+    assert.equal((fixture.database.prepare("SELECT status FROM evidence WHERE run_id = ? AND type = 'review'").get(starts[2]!.id) as { status: string }).status, "failed");
+    assert.equal((fixture.database.prepare("SELECT status FROM tasks WHERE id = ?").get(task) as { status: string }).status, "in_progress");
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE task_id = ? AND trigger_type = 'rework'").get(task) as { count: number }).count, 1);
+  } finally { await fixture.close(); }
+});
+
+test("Worktree delivery refuses changes without matching safe commission Evidence", async () => {
+  const fixture = await schedulerFixture();
+  try {
+    await writeFile(join(fixture.projectPath, "base.txt"), "base\n");
+    await git(fixture.projectPath, "init");
+    await git(fixture.projectPath, "config", "user.email", "test@example.com");
+    await git(fixture.projectPath, "config", "user.name", "Test");
+    await git(fixture.projectPath, "add", ".");
+    await git(fixture.projectPath, "commit", "-m", "base");
+    fixture.database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(fixture.main);
+    const task = fixture.task("git-unsafe-evidence", fixture.main, "backlog");
+    const starts: Array<{ id: string; role: string }> = [];
+    const scheduler = new Scheduler(fixture.database, { start: async (runId, cwd) => {
+      const role = (fixture.database.prepare("SELECT role FROM runs WHERE id = ?").get(runId) as { role: string }).role;
+      starts.push({ id: runId, role });
+      if (role === "developer") await writeFile(join(cwd, "unsafe.txt"), "unknown owner\n");
+      else fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'review', ?, 0, ?)")
+        .run(runId, JSON.stringify({ delta: '{"passed":true,"summary":"ok","checks":[],"findings":[]}' }), new Date().toISOString());
+      fixture.database.prepare("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(runId);
+    } });
+
+    const developer = (await scheduler.trigger(task)).runIds[0]!;
+    fixture.database.prepare("UPDATE runs SET workspace_baseline_json = NULL WHERE id = ?").run(developer);
+    await scheduler.terminal(developer);
+    await scheduler.terminal(starts[1]!.id);
+    await scheduler.terminal(starts[2]!.id);
+
+    await assert.rejects(() => access(join(fixture.projectPath, "unsafe.txt")));
+    const payload = JSON.parse((fixture.database.prepare("SELECT payload_json FROM evidence WHERE run_id = ? AND type = 'diff'").get(starts[2]!.id) as { payload_json: string }).payload_json) as { appliedChanges?: unknown };
+    assert.equal(payload.appliedChanges, undefined);
+    assert.equal((fixture.database.prepare("SELECT status FROM evidence WHERE run_id = ? AND type = 'review'").get(starts[2]!.id) as { status: string }).status, "failed");
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM runs WHERE task_id = ? AND trigger_type = 'rework'").get(task) as { count: number }).count, 1);
   } finally { await fixture.close(); }
 });
 

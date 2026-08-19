@@ -40,6 +40,10 @@ export function taskLifecycleAction(taskStatus: string, deleted = false): "archi
   return taskStatus === "done" ? "archive" : taskStatus === "archived" ? "unarchive" : null;
 }
 
+export function canOpenTaskDelivery(task: { parent_id: string | null; archived_at: string | null }): boolean {
+  return !task.parent_id && !task.archived_at;
+}
+
 const TOKEN_PRICES: Record<string, { input: number; cached: number; output: number }> = {
   "deepseek-v4-flash": { input: 0.14, cached: 0.0028, output: 0.28 },
   "deepseek-v4-pro": { input: 0.435, cached: 0.003625, output: 0.87 },
@@ -144,15 +148,17 @@ export function runCodeChanges(events: RunEvent[]): CodeChange[] {
   for (const event of events) {
     if (!event.event_type.includes("file_change")) continue;
     const item = objectValue(event.payload.item);
+    const itemId = String(item?.id ?? event.id);
     const entries = Array.isArray(item?.changes) ? item.changes : [];
     for (const entry of entries) {
       const change = objectValue(entry);
       const path = typeof change?.path === "string" ? change.path : "";
       if (!path || hiddenWorkshopPath(path)) continue;
       const kind = objectValue(change?.kind);
-      changes.delete(path);
-      changes.set(path, {
-        id: `${String(item?.id ?? event.id)}:${path}`,
+      const id = `${itemId}:${path}`;
+      changes.delete(id);
+      changes.set(id, {
+        id,
         path,
         kind: typeof kind?.type === "string" ? kind.type : typeof change?.kind === "string" ? change.kind : "update",
         movePath: typeof kind?.move_path === "string" ? kind.move_path : null,
@@ -175,6 +181,11 @@ export function diffLines(diff: string): DiffLine[] {
     text,
     kind: text.startsWith("@@") ? "hunk" : text.startsWith("+") && !text.startsWith("+++") ? "add" : text.startsWith("-") && !text.startsWith("---") ? "remove" : "context"
   }));
+}
+
+export function formatJson(value: string): string {
+  try { return JSON.stringify(JSON.parse(value), null, 2); }
+  catch { return value; }
 }
 
 export function commentThreadRows<T extends ThreadedComment>(comments: T[]): Array<{ comment: T; depth: number }> {

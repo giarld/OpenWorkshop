@@ -58,6 +58,7 @@ Read [references/cli.md](references/cli.md) for the relevant command family, pay
 8. Before triggering, inspect the target and explain its execution scope. Triggering the main task authorizes the whole commission tree; triggering a child authorizes that task plus its unfinished dependency closure. Resolve an ambiguous “start work” request before triggering.
 9. Poll Run events incrementally with the last event ID. Surface pending approvals and Agent questions unless the user already authorized that exact decision.
 10. Inspect acceptance evidence before asking for or applying final acceptance. Final acceptance is always an explicit human decision.
+11. Final delivery must use an explicit preview and method; use `task delivery-preview` followed by `task deliver`, then `delivery get`/`retry`/`reconcile`/`cancel` as needed. Do not use the removed parameterless `task accept` path.
 
 After commission creation, use an outcome equivalent to:
 

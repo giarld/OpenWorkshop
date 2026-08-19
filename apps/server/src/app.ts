@@ -10,6 +10,7 @@ import { CodexAppServer, registerCodexRoutes } from "./codex.js";
 import { registerCommissionRoutes, type RequirementAnalyzer } from "./commissions.js";
 import { recoverCommissionLifecycleOperations } from "./commission-archive.js";
 import { registerDocumentRoutes } from "./documents.ts";
+import { registerDeliveryRoutes } from "./deliveries.js";
 import { registerNotificationRoutes } from "./notifications.ts";
 import { registerProjectRoutes } from "./projects.js";
 import { analyzeRequirementWithCodex } from "./requirement-agent.js";
@@ -17,6 +18,7 @@ import { planTasksWithCodex, type TaskPlanner } from "./planner-agent.js";
 import { registerProductionRunRoutes, type RunClientLauncher } from "./runs.js";
 import { registerTaskRoutes } from "./tasks.js";
 import { registerUsageStatisticsRoutes } from "./usage-statistics.js";
+import { ProjectLockManager } from "./scheduler.js";
 
 const DEFAULT_WEB_ROOT = fileURLToPath(new URL("../../web/out/", import.meta.url));
 
@@ -35,8 +37,11 @@ export async function createServer(database: DatabaseSync, webRoot = DEFAULT_WEB
   registerDocumentRoutes(server, database);
   registerNotificationRoutes(server, database);
   registerUsageStatisticsRoutes(server, database);
-  const mentionAgent = await registerProductionRunRoutes(server, database, launchRunClient ?? ((options) => CodexAppServer.launch(options)), attachmentsRoot);
-  registerTaskRoutes(server, database, mentionAgent, attachmentsRoot);
+  const projectLocks = new ProjectLockManager();
+  const mentionAgent = await registerProductionRunRoutes(server, database, launchRunClient ?? ((options) => CodexAppServer.launch(options)), attachmentsRoot, projectLocks);
+  const deliveryWorker = registerDeliveryRoutes(server, database, projectLocks);
+  registerTaskRoutes(server, database, mentionAgent, attachmentsRoot, deliveryWorker.acceptanceDetails);
+  deliveryWorker.start();
   server.get("/api/health", async () => ({ status: "ok" }));
   await server.register(fastifyStatic, { root: webRoot, wildcard: false });
   server.setNotFoundHandler((request, reply) => {

@@ -119,12 +119,14 @@ function AgentPresetSwitcher() {
 
   useEffect(() => {
     let mounted = true;
-    void fetch("/api/settings/agents").then(async (response) => {
+    const refresh = () => void fetch("/api/settings/agents").then(async (response) => {
       if (!response.ok) throw new Error("加载预设失败");
       const result = await response.json() as AgentPresetResponse;
       if (mounted) setSettings(result);
     }).catch((error: Error) => mounted && setMessage(error.message));
-    return () => { mounted = false; };
+    refresh();
+    window.addEventListener("agent-preset-changed", refresh);
+    return () => { mounted = false; window.removeEventListener("agent-preset-changed", refresh); };
   }, []);
 
   async function selectPreset(presetId: string) {

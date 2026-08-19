@@ -415,12 +415,8 @@ test("human waiver requests final coordination before main-task acceptance", asy
     await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.tasks[0]!.id}/waive`, payload: { reason: "返工已复核" } });
     assert.equal(updateCommissionAcceptance(fixture.database, fixture.commissionA), true);
     const accepted = await fixture.server.inject({ method: "POST", url: `/api/tasks/${plan.mainTask.id}/accept` });
-    assert.equal(accepted.statusCode, 200);
-    assert.equal(accepted.json().status, "done");
-    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE id = ?").get(fixture.commissionA) as { status: string }).status, "done");
-    const delivery = currentDelivery(fixture.database, fixture.commissionA);
-    assert.ok(delivery.version_no > 1);
-    assert.match(delivery.content_markdown, /## 人工验收结果\n\n- 已批准。/);
+    assert.equal(accepted.statusCode, 409);
+    assert.equal((fixture.database.prepare("SELECT status FROM commissions WHERE id = ?").get(fixture.commissionA) as { status: string }).status, "awaiting_acceptance");
   } finally { await fixture.close(); }
 });
 

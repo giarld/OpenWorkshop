@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, taskLifecycleAction, taskMentionParts, tokenPrice, tokenUsageTotals, upsertComment } from "./task-run.ts";
+import { canOpenTaskDelivery, canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatJson, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, taskLifecycleAction, taskMentionParts, tokenPrice, tokenUsageTotals, upsertComment } from "./task-run.ts";
 
 test("recognizes supported clipboard images and generates readable screenshot names", () => {
   assert.equal(clipboardImageExtension("image/png"), "png");
@@ -31,6 +31,12 @@ test("offers task lifecycle actions only for Done and Archived tasks", () => {
   assert.equal(taskLifecycleAction("archived"), "unarchive");
   assert.equal(taskLifecycleAction("archived", true), null);
   assert.equal(taskLifecycleAction("in_progress"), null);
+});
+
+test("offers the delivery entry only for active main tasks", () => {
+  assert.equal(canOpenTaskDelivery({ parent_id: null, archived_at: null }), true);
+  assert.equal(canOpenTaskDelivery({ parent_id: "main", archived_at: null }), false);
+  assert.equal(canOpenTaskDelivery({ parent_id: null, archived_at: "2026-08-19T00:00:00.000Z" }), false);
 });
 
 test("formats Agent Run elapsed time", () => {
@@ -85,21 +91,30 @@ test("reads runnable Agent input questions and ignores malformed entries", () =>
   }), [{ id: "scope", header: "范围", question: "选择范围", options: [{ label: "完整", description: "执行全部" }] }]);
 });
 
-test("keeps the latest diff for each changed file", () => {
+test("keeps each file-change item while replacing its lifecycle update", () => {
   const started = { id: 1, event_type: "file_change.started", summary: "fileChange started", created_at: "2026-08-07T00:00:00.000Z", payload: { item: { id: "change-1", changes: [{ path: "src/app.ts", kind: { type: "update", move_path: null }, diff: "@@ -1 +1 @@\n-old\n+draft" }] } } };
-  const completed = { ...started, id: 2, event_type: "file_change.completed", summary: "fileChange completed", payload: { item: { id: "change-2", changes: [{ path: "src/app.ts", kind: { type: "update", move_path: null }, diff: "@@ -1 +1 @@\n-old\n+final" }] } } };
-  const workshop = { ...started, id: 3, payload: { item: { id: "change-3", changes: [
+  const completed = { ...started, id: 2, event_type: "file_change.completed", summary: "fileChange completed", payload: { item: { id: "change-1", changes: [{ path: "src/app.ts", kind: { type: "update", move_path: null }, diff: "@@ -1 +1 @@\n-old\n+first" }] } } };
+  const followup = { ...completed, id: 3, payload: { item: { id: "change-2", changes: [{ path: "src/app.ts", kind: { type: "update", move_path: null }, diff: "@@ -1 +1 @@\n-first\n+final" }] } } };
+  const workshop = { ...started, id: 4, payload: { item: { id: "change-3", changes: [
     { path: ".openworkshop/runs/run-1/task.md", kind: "update", diff: "internal" },
     { path: "C:\\repo\\.openworkshop\\patches\\run-1.patch", kind: "update", diff: "internal" },
     { path: "/repo/.openworkshop/worktrees/run-1/src/feature.ts", kind: "update", diff: "worktree" },
     { path: ".openworkshop\\worktrees\\run-2\\src\\windows.ts", kind: "update", diff: "worktree" }
   ] } } };
-  const changes = runCodeChanges([started, completed, workshop]);
-  assert.equal(changes.length, 3);
-  const source = changes.find((change) => change.path === "src/app.ts")!;
-  assert.deepEqual({ path: source.path, kind: source.kind, diff: source.diff, eventId: source.event.id }, { path: "src/app.ts", kind: "update", diff: "@@ -1 +1 @@\n-old\n+final", eventId: 2 });
+  const changes = runCodeChanges([started, completed, followup, workshop]);
+  assert.equal(changes.length, 4);
+  const source = changes.filter((change) => change.path === "src/app.ts");
+  assert.deepEqual(source.map((change) => ({ diff: change.diff, eventId: change.event.id })), [
+    { diff: "@@ -1 +1 @@\n-first\n+final", eventId: 3 },
+    { diff: "@@ -1 +1 @@\n-old\n+first", eventId: 2 }
+  ]);
   assert.deepEqual(new Set(changes.map((change) => change.path)), new Set(["src/app.ts", "/repo/.openworkshop/worktrees/run-1/src/feature.ts", ".openworkshop\\worktrees\\run-2\\src\\windows.ts"]));
-  assert.deepEqual(diffLines(source.diff).map(({ kind }) => kind), ["hunk", "remove", "add"]);
+  assert.deepEqual(diffLines(source[0]!.diff).map(({ kind }) => kind), ["hunk", "remove", "add"]);
+});
+
+test("formats evidence JSON with readable line breaks", () => {
+  assert.equal(formatJson('{"status":"passed","details":{"count":2}}'), '{\n  "status": "passed",\n  "details": {\n    "count": 2\n  }\n}');
+  assert.equal(formatJson("not-json"), "not-json");
 });
 
 test("orders issue comments with their replies", () => {

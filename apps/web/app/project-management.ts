@@ -31,11 +31,14 @@ export function initialWorkspaceView(storedValue: string | null, hash: string): 
   if (WORKSPACE_VIEW_IDS.includes(storedValue as WorkspaceView)) return storedValue as WorkspaceView;
   if (hash.startsWith("#task-")) return "board";
   if (hash.startsWith("#approval-")) return "notifications";
+  if (hash.startsWith("#delivery-")) return "delivery";
   return "commissions";
 }
 
 export function isStaleWorkspaceHash(storedValue: string | null, hash: string): boolean {
-  return WORKSPACE_VIEW_IDS.includes(storedValue as WorkspaceView) && (hash.startsWith("#task-") || hash.startsWith("#approval-"));
+  if (!WORKSPACE_VIEW_IDS.includes(storedValue as WorkspaceView)) return false;
+  const hashView = hash.startsWith("#task-") ? "board" : hash.startsWith("#approval-") ? "notifications" : hash.startsWith("#delivery-") ? "delivery" : null;
+  return hashView !== null && hashView !== storedValue;
 }
 
 export type WorkspaceContentState = "settings" | "loading" | "ready";

@@ -169,9 +169,16 @@ workshop task cancel <task-id> --output json
 workshop task resume <task-id> --output json
 workshop task waive <task-id> --data '{"reason":"Reason"}' --output json
 workshop task acceptance <main-task-id> --output json
-workshop task accept <main-task-id> --output json
+workshop task delivery-preview <main-task-id> --data-file preview.json --output json
+workshop task deliver <main-task-id> --data-file delivery.json --output json
+workshop delivery get <delivery-id> --output json
+workshop delivery retry <delivery-id> --output json
+workshop delivery reconcile <delivery-id> --data-file reconcile.json --output json
+workshop delivery cancel <delivery-id> --output json
 workshop task reject <main-task-id> --data '{"reason":"Required rework"}' --output json
 ```
+
+`preview.json` contains the selected method, for example `{"method":"document"}`; use `vcs_commit` or `github_pr` with the method-specific commit, remote, branch, or PR fields. Run `task delivery-preview` first, copy its top-level `fingerprint` into `delivery.json` as `previewFingerprint` alongside the same request, then run `task deliver`. Delivery creation is asynchronous: `task deliver` returns the Delivery ID and current status without waiting; use `delivery get` to poll, and `delivery retry` or `delivery cancel` only when the server state permits it. The removed parameterless `task accept` path must not be used.
 
 Before `task trigger`, inspect the task tree and dependencies and explain the scope: a main-task trigger authorizes the full commission tree; a child-task trigger authorizes that task and its unfinished dependency closure. Do not treat an ambiguous request to “start work” as a target selection.
 

@@ -18,12 +18,12 @@ import { Children, useEffect, useMemo, useRef, useState, type FormEvent, type Re
 import ReactMarkdown from "react-markdown";
 import webPackage from "../package.json";
 import { AVATAR_SETTINGS_EVENT, DEFAULT_AVATARS, avatarSettings, isImageAvatar, type AvatarSettings } from "./avatar-settings";
-import { browserNotificationRuntime, notificationHashTarget, notificationNavigation, pushBrowserNotifications, type AppNotification } from "./browser-notifications";
+import { browserNotificationRuntime, notificationHashTarget, notificationNavigation, pushBrowserNotifications, type AppNotification, type NotificationTarget } from "./browser-notifications";
 import { DeliveryWorkspace } from "./delivery-workspace";
 import { CommissionWorkspace } from "./commission-workspace";
 import { UsageStatisticsWorkspace } from "./usage-statistics-workspace";
 import { PROJECT_NAME_MAX_LENGTH, activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, initialWorkspaceView, isStaleWorkspaceHash, projectIdAfterArchive, projectNameError, projectRunLabels, workspaceContentState, type ManagedProject, type WorkspaceView } from "./project-management";
-import { canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, taskLifecycleAction, tokenPrice, tokenUsageTotals, upsertComment, type CodeChange, type MentionTrigger, type ReviewFinding, type RunEvent, type RunQuestion } from "./task-run";
+import { canOpenTaskDelivery, canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatJson, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, taskLifecycleAction, tokenPrice, tokenUsageTotals, upsertComment, type CodeChange, type MentionTrigger, type ReviewFinding, type RunEvent, type RunQuestion } from "./task-run";
 import {
   TASK_STATUSES,
   boardCollisionDetection,
@@ -108,7 +108,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
   const [taskEvidence, setTaskEvidence] = useState<TaskEvidence[]>([]);
   const [taskRunEvents, setTaskRunEvents] = useState<Record<string, RunEvent[]>>({});
   const [taskBusy, setTaskBusy] = useState(false);
-  const [notificationTarget, setNotificationTarget] = useState<{ entityType: "task" | "approval"; entityId: string; projectId: string | null } | null>(null);
+  const [notificationTarget, setNotificationTarget] = useState<NotificationTarget | null>(null);
   const taskDialog = useRef<HTMLDialogElement>(null);
   const historyDialog = useRef<HTMLDialogElement>(null);
   const projectManagementDialog = useRef<HTMLDialogElement>(null);
@@ -126,10 +126,12 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     setViewLoaded(true);
     void api<Project[]>("/api/projects").then((items) => {
       const active = activeProjects(items);
-      const notificationProjectId = notificationHashTarget(location.hash)?.projectId;
+      const initialTarget = notificationHashTarget(location.hash);
+      const notificationProjectId = initialTarget?.projectId;
       const preferredId = notificationProjectId && active.some((project) => project.id === notificationProjectId) ? notificationProjectId : preferredProjectId(active, localStorage.getItem(SELECTED_PROJECT_KEY));
       setProjects(active);
       setProjectId(preferredId);
+      setNotificationTarget(initialTarget && (!initialTarget.projectId || active.some((project) => project.id === initialTarget.projectId)) && (initialTarget.entityType === "task" || initialTarget.entityType === "delivery") ? initialTarget : null);
       if (!preferredId) setLoading(false);
     }).catch((error: Error) => { setMessage(error.message); setLoading(false); });
   }, []);
@@ -196,10 +198,13 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     if (notificationTarget) setNotificationTarget(null);
   }, [loading, notificationTarget, projectId, tasks, view]);
 
-  function navigateNotificationTarget(target: { entityType: "task" | "approval"; entityId: string; projectId: string | null }) {
-    if (target.projectId && target.projectId !== projectIdRef.current) selectProject(target.projectId);
-    setView(target.entityType === "task" ? "board" : "notifications");
-    setNotificationTarget(target.entityType === "task" ? target : null);
+  function navigateNotificationTarget(target: NotificationTarget) {
+    if (target.projectId && target.projectId !== projectIdRef.current) {
+      if (!projects.some((project) => project.id === target.projectId)) return;
+      selectProject(target.projectId);
+    }
+    setView(target.entityType === "task" ? "board" : target.entityType === "delivery" ? "delivery" : "notifications");
+    setNotificationTarget(target.entityType === "task" || target.entityType === "delivery" ? target : null);
   }
 
   function navigateNotification(item: AppNotification) {
@@ -509,7 +514,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
         {showOverview && <WorkspaceOverview total={overview.total} completed={overview.completed} running={overview.running} attention={overview.attention} completion={overview.completion} />}
         {view === "projects" && <ProjectManagementPage projects={projects} projectId={projectId} associate={associate} onSelect={selectProject} onManage={openProjectManagement} />}
         <CommissionWorkspace projectId={projectId} section={view === "requirements" ? "requirements" : "commissions"} hidden={!(["commissions", "requirements"] as View[]).includes(view)} onChanged={() => void refreshProject()} onStageChange={(stage) => setView(stage)} />
-        <DeliveryWorkspace projectId={projectId} tasks={tasks} section={view === "notifications" ? "notifications" : "delivery"} hidden={!(["delivery", "notifications"] as View[]).includes(view)} onChanged={() => { void loadCurrentProjectTasks(); void refreshNotificationCount(); }} onNavigateNotification={navigateNotification} />
+        <DeliveryWorkspace projectId={projectId} tasks={tasks} section={view === "notifications" ? "notifications" : "delivery"} hidden={!(["delivery", "notifications"] as View[]).includes(view)} onChanged={() => { void loadCurrentProjectTasks(); void refreshNotificationCount(); }} onNavigateNotification={navigateNotification} notificationTargetId={notificationTarget?.entityType === "delivery" ? notificationTarget.entityId : null} onNotificationTargetHandled={() => setNotificationTarget(null)} />
         {view === "usage" && <UsageStatisticsWorkspace />}
         {view === "board" && <><div className="filters">
           <div className="view-switch" aria-label="看板显示方式"><button className={boardView === "board" ? "active" : ""} onClick={() => setBoardView("board")}>看板</button><button className={boardView === "list" ? "active" : ""} onClick={() => setBoardView("list")}>列表</button></div>
@@ -527,7 +532,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
         </>}
       </section>
     </div>
-    <TaskRunDialog dialog={taskDialog} task={taskDialogTask} tasks={[...tasks, ...historyTasks]} runs={taskRuns} tokenRuns={taskTokenRuns} evidence={taskEvidence} eventsByRun={taskRunEvents} busy={taskBusy} message={message} onClose={() => setTaskDialogTask(null)} onOpenTask={openTask} onAction={taskAction} onLifecycle={taskLifecycle} onAnswer={answerRunInput} onApprovals={() => { setTaskDialogTask(null); setView("notifications"); }} />
+    <TaskRunDialog dialog={taskDialog} task={taskDialogTask} tasks={[...tasks, ...historyTasks]} runs={taskRuns} tokenRuns={taskTokenRuns} evidence={taskEvidence} eventsByRun={taskRunEvents} busy={taskBusy} message={message} onClose={() => setTaskDialogTask(null)} onOpenTask={openTask} onAction={taskAction} onLifecycle={taskLifecycle} onAnswer={answerRunInput} onApprovals={() => { setTaskDialogTask(null); setView("notifications"); }} onDelivery={() => { setTaskDialogTask(null); setView("delivery"); }} />
     <HistoryTasksDialog dialog={historyDialog} tasks={historyTasks} commissions={commissionTitles} loading={historyLoading} onOpen={openTask} />
     <ProjectManagementDialog dialog={projectManagementDialog} project={managedProject} busy={projectManagementBusy} error={projectManagementError} onClose={() => setManagedProject(null)} onSubmit={saveManagedProject} onArchive={archiveManagedProject} />
   </section>;
@@ -712,7 +717,7 @@ function TaskRow({ task, tasks, depth, collapsed, onToggle, onOpen }: { task: Ta
   </>;
 }
 
-function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsByRun, busy, message, onClose, onOpenTask, onAction, onLifecycle, onAnswer, onApprovals }: { dialog: React.RefObject<HTMLDialogElement | null>; task: Task | null; tasks: Task[]; runs: Run[]; tokenRuns: Run[]; evidence: TaskEvidence[]; eventsByRun: Record<string, RunEvent[]>; busy: boolean; message: string; onClose(): void; onOpenTask(task: Task): Promise<void>; onAction(path: "trigger" | "pause" | "resume" | "cancel", success: string): Promise<void>; onLifecycle(task: Task): Promise<void>; onAnswer(event: FormEvent<HTMLFormElement>, requestId: string, questions: RunQuestion[]): Promise<void>; onApprovals(): void }) {
+function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsByRun, busy, message, onClose, onOpenTask, onAction, onLifecycle, onAnswer, onApprovals, onDelivery }: { dialog: React.RefObject<HTMLDialogElement | null>; task: Task | null; tasks: Task[]; runs: Run[]; tokenRuns: Run[]; evidence: TaskEvidence[]; eventsByRun: Record<string, RunEvent[]>; busy: boolean; message: string; onClose(): void; onOpenTask(task: Task): Promise<void>; onAction(path: "trigger" | "pause" | "resume" | "cancel", success: string): Promise<void>; onLifecycle(task: Task): Promise<void>; onAnswer(event: FormEvent<HTMLFormElement>, requestId: string, questions: RunQuestion[]): Promise<void>; onApprovals(): void; onDelivery(): void }) {
   const [activeTab, setActiveTab] = useState<"comments" | "runs" | "evidence" | "changes">("comments");
   const [openRunIds, setOpenRunIds] = useState<Set<string>>(new Set());
   const [comments, setComments] = useState<TaskComment[]>([]);
@@ -793,6 +798,7 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsB
         {controllable && <button disabled={busy} onClick={() => void onAction("pause", "任务已暂停，可稍后恢复。")}>暂停</button>}
         {active && <button className="secondary" disabled={busy} onClick={() => void onAction("cancel", "当前 Run 已取消。")}>取消 Run</button>}
         {latest?.status === "waiting_approval" && <button onClick={onApprovals}>前往处理审批</button>}
+        {canOpenTaskDelivery(task) && <button className="secondary" onClick={onDelivery}>前往交付中心</button>}
       </div>
       <TaskReadonlyProperties task={task} tasks={tasks} />
       {latest?.status === "waiting_input" && requestId && questions.length > 0 && <form className="run-input-form" onSubmit={(event) => void onAnswer(event, requestId, questions)}><h3>Agent 等待你的输入</h3>{questions.map((question) => <fieldset key={question.id}><legend>{question.header || question.question}</legend>{question.options.length ? question.options.map((option) => <label key={option.label}><input type="radio" name={question.id} value={option.label} required disabled={busy} /><span><strong>{option.label}</strong>{option.description && <small>{option.description}</small>}</span></label>) : <label>{question.question}<input name={question.id} required disabled={busy} /></label>}</fieldset>)}<button disabled={busy}>提交并继续</button></form>}
@@ -1034,28 +1040,32 @@ function CommentMentionText({ children, tasks, onOpenTask }: { children: ReactNo
 
 function CodeChanges({ changes }: { changes: Array<{ run: Run; change: CodeChange; current: boolean }> }) {
   const kindLabels: Record<string, string> = { add: "新增", update: "修改", delete: "删除", move: "移动" };
-  return <div className="code-change-list">{changes.length ? changes.map(({ run, change, current }) => <article key={`${run.id}-${change.path}`} className="code-change-record">
+  return <div className="code-change-list">{changes.length ? changes.map(({ run, change, current }) => <article key={`${run.id}-${change.id}`} className="code-change-record">
     <header><span><small>{current ? "当前执行" : "历史执行"} · Run #{run.attempt_no} · {kindLabels[change.kind] ?? change.kind}</small><strong>{change.path}</strong>{change.movePath && <small>移动自 {change.movePath}</small>}</span><time>{new Date(change.event.created_at).toLocaleString()}</time></header>
     {change.diff ? <pre className="code-diff" aria-label={`${change.path} 的代码差异`}>{diffLines(change.diff).map((line, index) => <span key={index} className={`diff-${line.kind}`}>{line.text || " "}</span>)}</pre> : <p>Agent 已报告文件变化，但未提供 Diff。</p>}
-  </article>) : <p className="task-tab-empty">Agent 修改文件后，最新 Diff 会显示在这里。</p>}</div>;
+  </article>) : <p className="task-tab-empty">Agent 修改文件后，Diff 会显示在这里。</p>}</div>;
 }
 
 function EvidenceRecords({ evidence }: { evidence: TaskEvidence[] }) {
-  return <div className="code-change-list">{evidence.length ? evidence.map((item) => <article key={item.id} className="code-change-record"><header><span><small>{item.type} · {item.status}{item.run_id ? ` · Run ${item.run_id.slice(0, 8)}` : ""}</small><strong>{item.summary}</strong></span><time>{new Date(item.created_at).toLocaleString()}</time></header>{item.payload_json && item.payload_json !== "{}" && <details><summary>查看结构化详情</summary><pre>{item.payload_json}</pre></details>}</article>) : <p className="task-tab-empty">该任务暂无评审证据。</p>}</div>;
+  return <div className="code-change-list">{evidence.length ? evidence.map((item) => <article key={item.id} className="code-change-record"><header><span><small>{item.type} · {item.status}{item.run_id ? ` · Run ${item.run_id.slice(0, 8)}` : ""}</small><strong>{item.summary}</strong></span><time>{new Date(item.created_at).toLocaleString()}</time></header>{item.payload_json && item.payload_json !== "{}" && <details><summary>查看结构化详情</summary><pre className="evidence-payload">{formatJson(item.payload_json)}</pre></details>}</article>) : <p className="task-tab-empty">该任务暂无评审证据。</p>}</div>;
 }
 
 function RunTimelineGroup({ run, events, current, open, onToggle }: { run: Run; events: RunEvent[]; current: boolean; open: boolean; onToggle(open: boolean): void }) {
   const timelineEvents = runTimelineEvents(events);
   const tokens = tokenUsageTotals([run]);
   const price = tokenPrice([run]);
+  const record = useRef<HTMLElement>(null);
   const timeline = useRef<HTMLDivElement>(null);
   const wasOpen = useRef(false);
   const pendingInitialScroll = useRef(false);
   useEffect(() => {
     if (!open) {
+      const collapsed = wasOpen.current;
       wasOpen.current = false;
       pendingInitialScroll.current = false;
-      return;
+      if (!collapsed) return;
+      const frame = window.requestAnimationFrame(() => record.current?.scrollIntoView({ block: "start", inline: "nearest" }));
+      return () => window.cancelAnimationFrame(frame);
     }
     if (!wasOpen.current) pendingInitialScroll.current = true;
     wasOpen.current = open;
@@ -1063,11 +1073,11 @@ function RunTimelineGroup({ run, events, current, open, onToggle }: { run: Run; 
     pendingInitialScroll.current = false;
     const frame = window.requestAnimationFrame(() => {
       const target = timeline.current;
-      if (target) target.scrollTop = target.scrollHeight;
+      target?.parentElement?.scrollIntoView({ block: "end", inline: "nearest" });
     });
     return () => window.cancelAnimationFrame(frame);
   }, [open, timelineEvents.length]);
-  return <section className={`run-record ${open ? "open" : ""}`}>
+  return <section ref={record} className={`run-record ${open ? "open" : ""}`}>
     <button className="run-record-toggle" aria-expanded={open} onClick={() => onToggle(!open)}>
       <span className="run-record-chevron" aria-hidden="true">{open ? "▾" : "▸"}</span>
       <span><small>{current ? "当前执行" : "历史执行"}</small><strong>Run #{run.attempt_no} · {run.role}</strong><RunRecordDuration run={run} /><small className="run-record-tokens" title={tokens ? `输入 ${formatTokenCount(tokens.input)}，输出 ${formatTokenCount(tokens.output)}，缓存 ${formatTokenCount(tokens.cached)}` : undefined}>Token {tokens ? formatTokenCount(tokens.total) : "—"} · {price === null ? "价格不可用" : `约 ${formatTokenPrice(price)}`}</small></span>

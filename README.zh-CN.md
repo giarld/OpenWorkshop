@@ -39,6 +39,45 @@ OpenWorkshop 将现有本地代码库、固定角色 Codex Agent 和人工决策
 
 系统会识别 Git、SVN 或无版本控制项目。Git 写任务可以使用独立 Worktree 隔离；SVN 和无版本控制项目采用串行写入，避免并发修改同一工作目录。
 
+### 任务推进模型
+
+```mermaid
+flowchart TD
+    A[Backlog 待办池] -->|人工触发| B[Todo 待处理]
+    B -->|Runner 领取| C[In Progress 执行中]
+    C --> D{开发与独立评审}
+    D -->|评审通过且达到轮次| E[Done 已完成]
+    D -->|评审未通过| F[开发返工]
+    F --> C
+    C -->|信息缺失、权限不足或不可恢复失败| G[Blocked 已阻塞]
+    G -->|人工答复或主管判断| B
+    E -->|证据扫描且有效子任务全部完成| H[主任务最终验收]
+    H -->|显式预览并授权交付| I[交付成功后 Done]
+    H -->|人工拒绝| F
+    E -->|人工归档| J[Archived 已归档]
+    J -->|人工解除归档| E
+```
+
+主任务负责协调整个依赖任务树；单独触发子任务时，只授权该任务及其未完成的前置依赖。主任务必须经过人工验收才能进入 `Done`；子任务阻塞时，主任务保持或退回 `Todo`，直到任务恢复或问题得到处理。
+
+### 执行与审查流程
+
+```mermaid
+flowchart TD
+    A[开发 Run] -->|成功| B[记录 Diff 与开发摘要]
+    B --> C[独立 Reviewer Run]
+    C --> D{审查结果}
+    D -->|通过且达到评审轮次| E[任务 Done]
+    D -->|通过但仍需更多轮次| C
+    D -->|存在阻塞问题| F[开发返工 Run]
+    F -->|修复并自查| C
+    F -->|多轮后仍无法闭环| G[任务 Blocked]
+    C -->|需要审批或人工输入| H[等待人工]
+    H --> C
+```
+
+每轮审查都会读取验收标准、当前需求版本、开发摘要、文件变化和项目验证约束。返工 Run 不计入成功评审轮次；默认需要两轮独立评审通过。
+
 ## 产品能力
 
 ### 项目与委托
@@ -167,16 +206,34 @@ workshop approval decide <approval-id> \
   --output json
 ```
 
-最终验收并读取交付文档：
+查看验收结果，选择明确的交付方式并读取交付文档：
 
 ```bash
 workshop task acceptance <main-task-id> --output json
-workshop task accept <main-task-id> --output json
+workshop task delivery-preview <main-task-id> --data-file preview.json --output json
+workshop task deliver <main-task-id> --data-file delivery.json --output json
+workshop delivery get <delivery-id> --output json
+workshop delivery retry <delivery-id> --output json
+workshop delivery cancel <delivery-id> --output json
 
 workshop document list <project-id> \
   --query '{"commissionId":"<commission-id>","type":"delivery"}' \
   --output json
 ```
+
+`preview.json` 包含所选交付方式及该方式的参数，例如：
+
+```json
+{"method":"document"}
+```
+
+先运行 `task delivery-preview`，再将其返回顶层字段 `fingerprint` 复制到新的 `delivery.json`，并保留相同请求参数：
+
+```json
+{"method":"document","previewFingerprint":"<preview 输出中的 fingerprint>"}
+```
+
+选择 `vcs_commit` 或 `github_pr` 时，在两个文件中填写该方式支持的 Commit、Remote、分支或 PR 字段。`task deliver` 只负责创建异步交付并立即返回 Delivery ID 和当前状态；使用 `delivery get` 轮询，不会隐式等待后台执行。旧的无参数 `task accept` 命令已禁用。
 
 Codex 等 Agent 也可以跳过 Workshop 的需求澄清和规划 Agent，直接导入已经由用户确认的需求与任务计划：
 

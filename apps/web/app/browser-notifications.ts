@@ -3,12 +3,14 @@ export type AppNotification = {
   kind: string;
   title: string;
   body: string;
-  entity_type: "task" | "approval";
+  entity_type: "task" | "approval" | "delivery";
   entity_id: string;
   project_id: string | null;
   read_at: string | null;
   system_notified_at: string | null;
 };
+
+export type NotificationTarget = { entityType: "task" | "approval" | "delivery"; entityId: string; projectId: string | null };
 
 type BrowserNotificationHandle = {
   onClick(handler: () => void): void;
@@ -27,19 +29,18 @@ export type BrowserNotificationRuntime = {
 };
 
 export function notificationEntityHash(item: Pick<AppNotification, "entity_type" | "entity_id" | "project_id">): string {
-  const target = item.entity_type === "task" ? "task" : "approval";
-  return `#${target}-${item.entity_id}${item.project_id ? `?project=${encodeURIComponent(item.project_id)}` : ""}`;
+  return `#${item.entity_type}-${item.entity_id}${item.project_id ? `?project=${encodeURIComponent(item.project_id)}` : ""}`;
 }
 
-export function notificationHashTarget(hash: string): { entityType: "task" | "approval"; entityId: string; projectId: string | null } | null {
-  const match = /^#(task|approval)-([^?]+)(?:\?project=([^&]+))?$/.exec(hash);
+export function notificationHashTarget(hash: string): NotificationTarget | null {
+  const match = /^#(task|approval|delivery)-([^?]+)(?:\?project=([^&]+))?$/.exec(hash);
   if (!match) return null;
-  return { entityType: match[1] as "task" | "approval", entityId: match[2]!, projectId: match[3] ? decodeURIComponent(match[3]) : null };
+  return { entityType: match[1] as NotificationTarget["entityType"], entityId: match[2]!, projectId: match[3] ? decodeURIComponent(match[3]) : null };
 }
 
-export function notificationNavigation(item: Pick<AppNotification, "entity_type" | "entity_id" | "project_id">, currentHash = "", currentProjectId = ""): { hash: string; updateHash: boolean; switchProject: boolean; view: "board" | "notifications"; projectId: string | null; entityType: "task" | "approval"; entityId: string } {
+export function notificationNavigation(item: Pick<AppNotification, "entity_type" | "entity_id" | "project_id">, currentHash = "", currentProjectId = ""): { hash: string; updateHash: boolean; switchProject: boolean; view: "board" | "notifications" | "delivery"; projectId: string | null; entityType: NotificationTarget["entityType"]; entityId: string } {
   const hash = notificationEntityHash(item);
-  return { hash, updateHash: currentHash !== hash, switchProject: Boolean(item.project_id && item.project_id !== currentProjectId), view: item.entity_type === "task" ? "board" : "notifications", projectId: item.project_id, entityType: item.entity_type, entityId: item.entity_id };
+  return { hash, updateHash: currentHash !== hash, switchProject: Boolean(item.project_id && item.project_id !== currentProjectId), view: item.entity_type === "task" ? "board" : item.entity_type === "delivery" ? "delivery" : "notifications", projectId: item.project_id, entityType: item.entity_type, entityId: item.entity_id };
 }
 
 export async function pushBrowserNotifications(items: AppNotification[], runtime: BrowserNotificationRuntime): Promise<void> {

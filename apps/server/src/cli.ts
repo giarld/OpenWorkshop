@@ -18,7 +18,7 @@ import { browserCommand, ensureBackgroundService, startBackgroundService, waitFo
 import { installWorkshopSkill } from "./skill-installer.js";
 import { updateOpenWorkshop } from "./update-command.js";
 import { isVersionCommand, WORKSHOP_VERSION } from "./version.js";
-import { familyHelp, parseWorkflowCommand, WORKFLOW_COMMANDS, workflowHelp, type WorkflowRequest } from "./workflow-cli.js";
+import { familyHelp, formatWorkflowResult, parseWorkflowCommand, workflowHttpError, WORKFLOW_COMMANDS, workflowHelp, type WorkflowRequest } from "./workflow-cli.js";
 
 const runFile = promisify(execFile);
 
@@ -294,11 +294,7 @@ async function apiRequest(home: string, request: WorkflowRequest, authenticated 
   let data: unknown = text;
   if (response.headers.get("content-type")?.includes("application/json") && text) data = JSON.parse(text);
   if (!response.ok) {
-    if (request.output === "json" && data && typeof data === "object") throw new Error(JSON.stringify(data));
-    const message = data && typeof data === "object" && "message" in data ? String(data.message)
-      : data && typeof data === "object" && "error" in data ? String(data.error)
-      : text || response.statusText;
-    throw new Error(`HTTP ${response.status}: ${message}`);
+    throw workflowHttpError(response.status, response.statusText, data, text, request.output);
   }
   return { data: response.status === 204 ? { ok: true } : data, response };
 }
@@ -321,8 +317,7 @@ function serviceUrl(state: RuntimeState): string {
 }
 
 function printResult(data: unknown, output: string, text = false): void {
-  if (text || typeof data === "string") console.log(data);
-  else console.log(JSON.stringify(data, null, output === "json" ? undefined : 2));
+  process.stdout.write(formatWorkflowResult(data, output, text));
 }
 
 function help(): string {

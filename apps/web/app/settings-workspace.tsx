@@ -250,6 +250,7 @@ function AgentPresetManager({ settings, busy, onRefresh }: { settings: AgentSett
     if (!response.ok) { const result = await response.json() as { error?: string }; throw new Error(result.error ?? "请求失败"); }
     const result = await response.json();
     await onRefresh();
+    window.dispatchEvent(new CustomEvent("agent-preset-changed"));
     return result;
   }
 

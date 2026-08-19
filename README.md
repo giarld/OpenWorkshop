@@ -39,6 +39,45 @@ Archive requirements, plans, reviews, and delivery documents
 
 OpenWorkshop recognizes Git, SVN, and projects without version control. Git write tasks can use isolated worktrees; SVN and unversioned projects serialize writes to avoid concurrent changes in the same working directory.
 
+### Task Progression Model
+
+```mermaid
+flowchart TD
+    A[Backlog] -->|Human trigger| B[Todo]
+    B -->|Runner claims| C[In Progress]
+    C --> D{Development and review}
+    D -->|Review passed and threshold met| E[Done]
+    D -->|Review failed| F[Developer rework]
+    F --> C
+    C -->|Missing information, permission, or unrecoverable failure| G[Blocked]
+    G -->|Human reply or supervisor decision| B
+    E -->|Evidence scan and all valid subtasks complete| H[Main-task acceptance]
+    H -->|Explicit delivery preview and authorization| I[Done after delivery succeeds]
+    H -->|Human rejects| F
+    E -->|Human archive| J[Archived]
+    J -->|Human unarchives| E
+```
+
+The main task coordinates its dependency tree, while a directly triggered subtask only authorizes that task and its unfinished prerequisites. A main task cannot enter `Done` before human acceptance; a blocked subtask keeps the main task in `Todo` until it is recovered or otherwise resolved.
+
+### Execution and Review Flow
+
+```mermaid
+flowchart TD
+    A[Developer Run] -->|Succeeded| B[Record diff and summary]
+    B --> C[Independent Reviewer Run]
+    C --> D{Review result}
+    D -->|Passed, review rounds met| E[Task Done]
+    D -->|Passed, more rounds required| C
+    D -->|Blocking finding| F[Developer rework Run]
+    F -->|Fix and self-check| C
+    F -->|Cannot close after repeated attempts| G[Task Blocked]
+    C -->|Approval or input needed| H[Wait for human]
+    H --> C
+```
+
+Each review reads the acceptance criteria, current requirement version, development summary, file changes, and project verification constraints. Rework runs do not count toward successful review rounds; the default is two successful independent review rounds.
+
 ## Features
 
 ### Projects and Requests
@@ -167,16 +206,34 @@ workshop approval decide <approval-id> \
   --output json
 ```
 
-Accept the final result and read delivery documents:
+Inspect acceptance, choose an explicit delivery method, and read delivery documents:
 
 ```bash
 workshop task acceptance <main-task-id> --output json
-workshop task accept <main-task-id> --output json
+workshop task delivery-preview <main-task-id> --data-file preview.json --output json
+workshop task deliver <main-task-id> --data-file delivery.json --output json
+workshop delivery get <delivery-id> --output json
+workshop delivery retry <delivery-id> --output json
+workshop delivery cancel <delivery-id> --output json
 
 workshop document list <project-id> \
   --query '{"commissionId":"<commission-id>","type":"delivery"}' \
   --output json
 ```
+
+`preview.json` contains the selected method and method-specific options. For example:
+
+```json
+{"method":"document"}
+```
+
+Run `task delivery-preview` first, then copy its top-level `fingerprint` into a new `delivery.json` alongside the same request:
+
+```json
+{"method":"document","previewFingerprint":"<fingerprint-from-preview-output>"}
+```
+
+Use `vcs_commit` or `github_pr` with the optional commit, remote, branch, or PR fields supported by that method in both files. `task deliver` returns the Delivery ID and current state immediately; poll with `delivery get` instead of waiting for the background worker. The old parameterless `task accept` command is intentionally unavailable.
 
 Codex and other Agents can bypass Workshop's requirements clarification and Planning Agent by directly importing a requirement and task plan that the user has already approved:
 

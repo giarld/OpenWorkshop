@@ -43,6 +43,7 @@ test("keeps the saved workspace page on refresh instead of letting a stale hash 
   assert.equal(initialWorkspaceView("settings", "#approval-old"), "settings");
   assert.equal(initialWorkspaceView("history", ""), "board");
   assert.equal(initialWorkspaceView(null, "#task-current"), "board");
+  assert.equal(initialWorkspaceView(null, "#delivery-current"), "delivery");
   assert.equal(initialWorkspaceView("removed-page", "#approval-current"), "notifications");
   assert.equal(initialWorkspaceView(null, ""), "commissions");
 });
@@ -50,6 +51,7 @@ test("keeps the saved workspace page on refresh instead of letting a stale hash 
 test("clears a stale notification hash only when restoring a saved workspace page", () => {
   assert.equal(isStaleWorkspaceHash("delivery", "#task-old"), true);
   assert.equal(isStaleWorkspaceHash("settings", "#approval-old"), true);
+  assert.equal(isStaleWorkspaceHash("delivery", "#delivery-old"), false);
   assert.equal(isStaleWorkspaceHash(null, "#task-current"), false);
   assert.equal(isStaleWorkspaceHash("removed-page", "#approval-current"), false);
   assert.equal(isStaleWorkspaceHash("delivery", "#section"), false);

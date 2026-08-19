@@ -3,14 +3,14 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import type { Task } from "./task-board";
 import type { AppNotification } from "./browser-notifications";
-import { deliveryEntries, type DeliveryCommission, type DeliveryEntry } from "./delivery-workspace-state";
+import { deliveryEntries, deliveryFormFromRequest, deliveryRequestFromForm, shouldRefreshDeliveryEntries, startDeliveryPolling, EMPTY_DELIVERY_FORM, type DeliveryCommission, type DeliveryEntry, type DeliveryFormState } from "./delivery-workspace-state";
+import { DeliveryControls, type Acceptance, type DeliveryPreview, type DeliveryRecord } from "./delivery-workspace-controls";
 
 type DocumentSummary = { id: string; commission_id: string | null; title: string; type: string; version_no: number; locked: number };
 type DocumentDetails = DocumentSummary & { currentVersion: { content_markdown: string; version_no: number; locked: number }; versions: Array<{ id: string; version_no: number; locked: number; created_at: string }> };
-type Acceptance = { commissionStatus: string; task: Task; deliveryDocument: { id: string; contentMarkdown: string; versionNo: number } | null; tasks: Array<{ id: string; number_path: string; title: string; status: string; blocked_reason: string | null; human_waiver_reason: string | null }>; runs: Array<{ id: string; role: string; status: string; failure_summary: string | null }>; evidence: Array<{ id: string; type: string; status: string; summary: string }> };
 type Approval = { id: string; kind: string; status: string; request: Record<string, unknown> };
 
-export function DeliveryWorkspace({ projectId, tasks, section, hidden, onChanged, onNavigateNotification }: { projectId: string; tasks: Task[]; section: "delivery" | "notifications"; hidden: boolean; onChanged(): void; onNavigateNotification(item: AppNotification): void }) {
+export function DeliveryWorkspace({ projectId, tasks, section, hidden, onChanged, onNavigateNotification, notificationTargetId, onNotificationTargetHandled }: { projectId: string; tasks: Task[]; section: "delivery" | "notifications"; hidden: boolean; onChanged(): void; onNavigateNotification(item: AppNotification): void; notificationTargetId?: string | null; onNotificationTargetHandled?: () => void }) {
   const [documents, setDocuments] = useState<DocumentSummary[]>([]);
   const [commissions, setCommissions] = useState<DeliveryCommission[]>([]);
   const [activeEntry, setActiveEntry] = useState<DeliveryEntry | null>(null);
@@ -19,22 +19,56 @@ export function DeliveryWorkspace({ projectId, tasks, section, hidden, onChanged
   const [acceptance, setAcceptance] = useState<Acceptance | null>(null);
   const [acceptanceLoading, setAcceptanceLoading] = useState(false);
   const [acceptanceError, setAcceptanceError] = useState("");
+  const [deliveryForm, setDeliveryForm] = useState<DeliveryFormState>(EMPTY_DELIVERY_FORM);
+  const [deliveryPreview, setDeliveryPreview] = useState<DeliveryPreview | null>(null);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [message, setMessage] = useState("");
   const dialog = useRef<HTMLDialogElement>(null);
+  const handledNotificationTarget = useRef<string | null>(null);
   const entries = deliveryEntries(commissions, tasks);
+  useEffect(() => {
+    if (!notificationTargetId) { handledNotificationTarget.current = null; return; }
+    if (hidden || section !== "delivery" || handledNotificationTarget.current === notificationTargetId) return;
+    handledNotificationTarget.current = notificationTargetId;
+    let cancelled = false;
+    void api<DeliveryRecord>(`/api/deliveries/${notificationTargetId}`).then((delivery) => {
+      if (cancelled) return;
+      const entry = entries.find((item) => item.commissionId === delivery.commissionId);
+      if (!entry) {
+        setMessage("找不到该交付记录对应的当前项目数据。");
+        onNotificationTargetHandled?.();
+        return;
+      }
+      void openDelivery(entry).finally(() => {
+        if (!cancelled) onNotificationTargetHandled?.();
+      });
+    }).catch((error) => {
+      if (cancelled) return;
+      setMessage(`打开交付记录失败：${(error as Error).message}`);
+      onNotificationTargetHandled?.();
+    });
+    return () => { cancelled = true; };
+  }, [entries, hidden, notificationTargetId, projectId, section]);
 
   useEffect(() => {
     setActiveEntry(null); setDocuments([]); setSelectedDocument(null); setAcceptance(null); setAcceptanceLoading(false); setAcceptanceError("");
     void loadCommissions();
   }, [projectId]);
   useEffect(() => {
+    if (shouldRefreshDeliveryEntries(hidden, section)) void loadCommissions();
+  }, [hidden, projectId, section]);
+  useEffect(() => {
     const element = dialog.current;
     if (activeEntry && element && !element.open) element.showModal();
     if (!activeEntry && element?.open) element.close();
   }, [activeEntry]);
   useEffect(() => { if (hidden || section !== "delivery") setActiveEntry(null); }, [hidden, section]);
+  useEffect(() => {
+    const delivery = acceptance?.currentDelivery;
+    if (!delivery || !activeEntry) return;
+    return startDeliveryPolling(delivery.status, true, () => void loadAcceptance(activeEntry.mainTask.id), (callback, delay) => window.setInterval(callback, delay), (timer) => window.clearInterval(timer));
+  }, [acceptance?.currentDelivery?.status, activeEntry]);
   useEffect(() => {
     if (hidden || section !== "notifications") return;
     const refresh = () => { void loadNotifications(); void loadApprovals(); };
@@ -74,23 +108,70 @@ export function DeliveryWorkspace({ projectId, tasks, section, hidden, onChanged
   }
 
   async function openDelivery(entry: DeliveryEntry) {
-    setActiveEntry(entry); setDocuments([]); setSelectedDocument(null); setAcceptance(null); setAcceptanceError(""); setMessage("");
+    setActiveEntry(entry); setDocuments([]); setSelectedDocument(null); setAcceptance(null); setAcceptanceError(""); setDeliveryForm(EMPTY_DELIVERY_FORM); setDeliveryPreview(null); setMessage("");
     try { await Promise.all([loadDocuments(entry.commissionId), loadAcceptance(entry.mainTask.id)]); }
     catch (error) { setMessage(`交付页面加载失败：${(error as Error).message}`); }
   }
 
   async function loadAcceptance(taskId: string) {
     setAcceptanceLoading(true); setAcceptanceError("");
-    try { setAcceptance(await api<Acceptance>(`/api/tasks/${taskId}/acceptance`)); }
+    try {
+      const value = await api<Acceptance>(`/api/tasks/${taskId}/acceptance`);
+      setAcceptance(value);
+      setDeliveryForm(deliveryFormFromRequest(value.currentDelivery?.request));
+    }
     catch (error) { setAcceptance(null); setAcceptanceError((error as Error).message); }
     finally { setAcceptanceLoading(false); }
   }
 
-  async function decide(action: "accept" | "reject", reason?: string) {
+  function deliveryBody(): Record<string, unknown> { return deliveryRequestFromForm(deliveryForm); }
+
+  function updateDeliveryForm(field: keyof DeliveryFormState, value: string | boolean): void {
+    setDeliveryForm((current) => ({ ...current, [field]: value } as DeliveryFormState));
+    setDeliveryPreview(null);
+  }
+
+  async function previewDelivery() {
+    if (!acceptance) return;
+    try { setDeliveryPreview(await api<DeliveryPreview>(`/api/tasks/${acceptance.task.id}/delivery-preview`, { method: "POST", body: JSON.stringify(deliveryBody()) })); setMessage("交付预览已生成，请核对后确认。"); }
+    catch (error) { setDeliveryPreview(null); setMessage(`生成预览失败：${(error as Error).message}`); }
+  }
+
+  async function deliver() {
+    if (!acceptance || !activeEntry) return;
+    if (!deliveryPreview) return;
+    const body = deliveryBody();
+    try {
+      await api(`/api/tasks/${acceptance.task.id}/deliver`, { method: "POST", body: JSON.stringify({ ...body, previewFingerprint: deliveryPreview.fingerprint }) });
+      setDeliveryPreview(null); setMessage("交付已提交执行，正在等待结果。"); onChanged(); await loadAcceptance(activeEntry.mainTask.id);
+    } catch (error) { setDeliveryPreview(null); setMessage(`交付操作失败：${(error as Error).message}`); }
+  }
+
+  async function retryDelivery() {
+    const delivery = acceptance?.currentDelivery;
+    if (!delivery || !activeEntry) return;
+    try { await api(`/api/deliveries/${delivery.id}/retry`, { method: "POST" }); setMessage("已提交交付重试。"); await loadAcceptance(activeEntry.mainTask.id); }
+    catch (error) { setMessage(`重试失败：${(error as Error).message}`); }
+  }
+  async function reconcileDelivery() {
+    const delivery = acceptance?.currentDelivery;
+    if (!delivery || !activeEntry || !window.confirm("请确认已人工核对：外部 Commit、Push、SVN Commit 或 PR 均未成功。确认后将允许重新执行。")) return;
+    try { await api(`/api/deliveries/${delivery.id}/reconcile`, { method: "POST", body: JSON.stringify({ decision: "retry", confirmedNoExternalEffect: true }) }); setMessage("已提交人工核对后的交付重试。"); await loadAcceptance(activeEntry.mainTask.id); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "人工核对失败。"); }
+  }
+
+  async function cancelDelivery() {
+    const delivery = acceptance?.currentDelivery;
+    if (!delivery || !activeEntry) return;
+    try { await api(`/api/deliveries/${delivery.id}/cancel`, { method: "POST" }); setMessage("交付已取消。"); await loadAcceptance(activeEntry.mainTask.id); }
+    catch (error) { setMessage(`取消失败：${(error as Error).message}`); }
+  }
+
+  async function decide(action: "reject", reason?: string) {
     const taskId = acceptance!.task.id;
     try {
-      await api(`/api/tasks/${taskId}/${action}`, action === "reject" ? { method: "POST", body: JSON.stringify({ reason }) } : { method: "POST" });
-      setMessage(action === "accept" ? "最终验收已批准。" : "已记录验收拒绝评论，并重新打开原任务返工。"); onChanged(); await loadCommissions(); await loadDocuments(activeEntry!.commissionId); await loadAcceptance(taskId); await loadNotifications();
+      await api(`/api/tasks/${taskId}/reject`, { method: "POST", body: JSON.stringify({ reason }) });
+      setMessage("已记录验收拒绝评论，并重新打开原任务返工。"); onChanged(); await loadCommissions(); await loadDocuments(activeEntry!.commissionId); await loadAcceptance(taskId); await loadNotifications();
     } catch (error) {
       try { setAcceptance(await api<Acceptance>(`/api/tasks/${taskId}/acceptance`)); } catch { /* Keep the original action error. */ }
       setMessage(`验收操作失败：${(error as Error).message}`);
@@ -135,10 +216,10 @@ export function DeliveryWorkspace({ projectId, tasks, section, hidden, onChanged
       {activeEntry && <div className="commission-dialog-body delivery-dialog-body">
         {message && <p className="workspace-message delivery-dialog-message" role="status">{message}</p>}
         <section className="delivery-panel"><header><div><p className="eyebrow">Documents</p><h2>文档与版本</h2></div>{documents.length > 0 && <select aria-label="选择文档" value={selectedDocument?.id ?? ""} onChange={(event) => void selectDocument(event.target.value)}>{documents.map((item) => <option key={item.id} value={item.id}>{item.type} · {item.title}</option>)}</select>}</header>
-          {selectedDocument ? <><div className="document-actions"><span>v{selectedDocument.currentVersion.version_no} · {selectedDocument.currentVersion.locked ? "已锁定" : "可编辑"}</span><a className="button-link" href={`/api/documents/${selectedDocument.id}/export.md`}>导出 Markdown</a><button className="secondary compact" disabled={Boolean(selectedDocument.currentVersion.locked)} onClick={lockDocument}>锁定版本</button><button className="compact" disabled={content === selectedDocument.currentVersion.content_markdown} onClick={saveDocument}>保存新版本</button></div><textarea className="document-editor" value={content} onChange={(event) => setContent(event.target.value)} aria-label="Markdown 文档内容" /><p>版本历史：{selectedDocument.versions.map((version) => `v${version.version_no}${version.locked ? "🔒" : ""}`).join("、")}</p></> : <p>该需求暂无交付文档。</p>}
+        {selectedDocument ? <><div className="document-actions"><span>v{selectedDocument.currentVersion.version_no} · {selectedDocument.currentVersion.locked ? "已锁定" : "可编辑"}</span><a className="button-link" href={`/api/documents/${selectedDocument.id}/export.md`}>导出 Markdown</a><button className="secondary compact" disabled={Boolean(selectedDocument.currentVersion.locked)} onClick={() => void lockDocument()}>锁定版本</button><button className="compact" disabled={content === selectedDocument.currentVersion.content_markdown} onClick={() => void saveDocument()}>保存新版本</button></div><textarea className="document-editor" value={content} onChange={(event) => setContent(event.target.value)} aria-label="Markdown 文档内容" /><p>版本历史：{selectedDocument.versions.map((version) => `v${version.version_no}${version.locked ? "🔒" : ""}`).join("、")}</p></> : <p>该需求暂无交付文档。</p>}
         </section>
         <section className="delivery-panel"><header><div><p className="eyebrow">Acceptance</p><h2>最终验收</h2></div>{acceptance && <span className="delivery-status">{STATUS_LABELS[acceptance.commissionStatus] ?? acceptance.commissionStatus}</span>}</header>
-          {acceptance ? <><dl className="acceptance-summary"><div><dt>任务</dt><dd>{acceptance.tasks.length}</dd></div><div><dt>Run</dt><dd>{acceptance.runs.length}</dd></div><div><dt>证据</dt><dd>{acceptance.evidence.length}</dd></div></dl>{acceptance.deliveryDocument ? <section className="acceptance-report"><header><strong>交付报告 v{acceptance.deliveryDocument.versionNo}</strong><a href={`/api/documents/${acceptance.deliveryDocument.id}/export.md`}>导出 Markdown</a></header><pre>{acceptance.deliveryDocument.contentMarkdown}</pre></section> : <p>交付报告尚未生成。</p>}<div className="acceptance-actions"><button disabled={acceptance.commissionStatus !== "awaiting_acceptance" || Boolean(acceptance.task.archived_at)} onClick={() => void decide("accept")}>批准交付</button><RejectForm disabled={acceptance.commissionStatus !== "awaiting_acceptance" || Boolean(acceptance.task.archived_at)} onReject={(reason) => decide("reject", reason)} /></div></> : acceptanceLoading ? <p>正在加载任务交付信息…</p> : acceptanceError ? <div className="delivery-load-error" role="alert"><p>任务交付信息加载失败：{acceptanceError}</p><button className="secondary compact" onClick={() => void loadAcceptance(activeEntry.mainTask.id)}>重新加载</button></div> : <p>暂无任务交付信息。</p>}
+        {acceptance ? <><dl className="acceptance-summary"><div><dt>任务</dt><dd>{acceptance.tasks.length}</dd></div><div><dt>Run</dt><dd>{acceptance.runs.length}</dd></div><div><dt>证据</dt><dd>{acceptance.evidence.length}</dd></div></dl>{acceptance.deliveryDocument ? <section className="acceptance-report"><header><strong>交付报告 v{acceptance.deliveryDocument.versionNo}</strong><a href={`/api/documents/${acceptance.deliveryDocument.id}/export.md`}>导出 Markdown</a></header><pre>{acceptance.deliveryDocument.contentMarkdown}</pre></section> : <p>交付报告尚未生成。</p>}<DeliveryControls acceptance={acceptance} preview={deliveryPreview} form={deliveryForm} onFormChange={updateDeliveryForm} onPreview={() => void previewDelivery()} onDeliver={() => void deliver()} onRetry={() => void retryDelivery()} onReconcile={() => void reconcileDelivery()} onCancel={() => void cancelDelivery()} /><div className="acceptance-actions"><RejectForm disabled={acceptance.commissionStatus !== "awaiting_acceptance" || Boolean(acceptance.task.archived_at) || Boolean(acceptance.currentDelivery && ["queued", "preparing", "running"].includes(acceptance.currentDelivery.status))} onReject={(reason) => decide("reject", reason)} /></div></> : acceptanceLoading ? <p>正在加载任务交付信息…</p> : acceptanceError ? <div className="delivery-load-error" role="alert"><p>任务交付信息加载失败：{acceptanceError}</p><button className="secondary compact" onClick={() => void loadAcceptance(activeEntry.mainTask.id)}>重新加载</button></div> : <p>暂无任务交付信息。</p>}
         </section>
       </div>}
     </dialog>

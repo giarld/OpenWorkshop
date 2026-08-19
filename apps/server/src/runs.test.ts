@@ -13,6 +13,7 @@ import { registerAgentSettingsRoutes } from "./agent-settings.ts";
 import { openWorkshopDatabase, SettingsStore } from "./database.ts";
 import { answerRevisionCard, beginPlanRevision, saveRevisionProposal } from "./plan-revisions.ts";
 import { appendRunEvent, approvalKind, codexTokenUsage, CodexRunController, EventHub, pruneRawRunEvents, registerProductionRunRoutes, registerRunRoutes, type RunClientLauncher, type RunController } from "./runs.ts";
+import { createExecutionGrant } from "./scheduler.ts";
 import { registerTaskRoutes } from "./tasks.ts";
 
 test("reads cumulative Codex token usage without double-counting cache", () => {
@@ -380,7 +381,9 @@ test("reconcile context distinguishes a successful Reviewer Run from a failed re
       .run(reviewerRunId, taskId, commissionId);
     database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'review', 'failed', ?, ?, ?)")
       .run(randomUUID(), taskId, reviewerRunId, review.summary, JSON.stringify(review), now);
-    appendRunEvent(database, new EventHub(), reviewerRunId, "agent_message.completed", "agentMessage completed", { method: "item/completed", item: { type: "agentMessage", id: "review-message", text: JSON.stringify(review) } });
+    const eventHub = new EventHub();
+    for (const delta of ["review", " result"]) appendRunEvent(database, eventHub, reviewerRunId, "agent.message.delta", "Agent message", { itemId: "review-message", delta });
+    appendRunEvent(database, eventHub, reviewerRunId, "agent_message.completed", "agentMessage completed", { method: "item/completed", item: { type: "agentMessage", id: "review-message", text: JSON.stringify(review) } });
     addTaskComment(database, { taskId, authorType: "human", content: "人工已修复并测试通过" });
     const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
       initialize: async () => undefined,
@@ -395,10 +398,74 @@ test("reconcile context distinguishes a successful Reviewer Run from a failed re
     const previousRuns = await readFile(join(home, ".openworkshop", "runs", result.runId!, "previous-runs.md"), "utf8");
     assert.match(previousRuns, /Attempt 1 · reviewer · Run succeeded · review · Review failed · Reviewer found four blocking gaps/);
     assert.match(previousRuns, /agent_message\.completed/);
+    assert.doesNotMatch(previousRuns, /agent\.message\.delta/);
     assert.match(previousRuns, /Missing coverage/);
     assert.match(prompts[0]!, /distinguish Run execution status from the structured review result/);
     assert.match(prompts[0]!, /human or external process changed or validated the current workspace/);
     assert.match(prompts[0]!, /Never use wait_human for final acceptance or task closure of a child task/);
+  } finally {
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("Reviewer context binds rework review to task-owned and current Developer changes", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-review-scope-"));
+  const database = await openWorkshopDatabase(home);
+  const server = Fastify();
+  const prompts: string[] = [];
+  try {
+    const { projectId, commissionId, taskId } = seedTask(database, home);
+    const ownedRunId = randomUUID();
+    const failedReviewRunId = randomUUID();
+    const sourceRunId = randomUUID();
+    const reviewerRunId = randomUUID();
+    const now = new Date().toISOString();
+    const insertRun = database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, trigger_ref_id, status, attempt_no, config_snapshot_json, context_snapshot_json, execution_grant_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', ?)");
+    insertRun.run(ownedRunId, projectId, commissionId, taskId, "developer", "scheduler", null, "succeeded", 1, null);
+    insertRun.run(failedReviewRunId, projectId, commissionId, taskId, "reviewer", "review", ownedRunId, "succeeded", 2, null);
+    insertRun.run(sourceRunId, projectId, commissionId, taskId, "developer", "rework", failedReviewRunId, "succeeded", 3, null);
+    const grant = createExecutionGrant(database, taskId);
+    insertRun.run(reviewerRunId, projectId, commissionId, taskId, "reviewer", "review", sourceRunId, "queued", 4, grant.id);
+    database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'diff', 'passed', 'owned', ?, ?)")
+      .run(randomUUID(), taskId, ownedRunId, JSON.stringify({ changes: [
+        { path: "src/owned.ts", changeType: "modified", baselineHash: "old", hash: "owned", safe: true },
+        { path: "notes/user.txt", changeType: "modified", baselineHash: "old", hash: "user", safe: false }
+      ] }), now);
+    const failedReview = { passed: false, summary: "Fix the parser boundary", checks: [], findings: [{ severity: "blocking", file: "src/owned.ts", line: 10, message: "Parser accepts invalid input" }] };
+    database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'review', 'failed', ?, ?, ?)")
+      .run(randomUUID(), taskId, failedReviewRunId, failedReview.summary, JSON.stringify(failedReview), now);
+    database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'diff', 'passed', 'current', ?, ?)")
+      .run(randomUUID(), taskId, sourceRunId, JSON.stringify({ changes: [{ path: "src/current.ts", changeType: "modified", baselineHash: "old", hash: "current", safe: true }] }), now);
+    appendRunEvent(database, new EventHub(), sourceRunId, "file_change.completed", "Updated current source", {
+      item: { type: "fileChange", changes: [{ path: "src/current.ts", diff: "@@ fixed parser boundary" }] }
+    });
+    await registerProductionRunRoutes(server, database, () => ({
+      initialize: async () => undefined,
+      startRun: async (options) => {
+        prompts.push(options.prompt);
+        return { threadId: "thread-review-scope", turnId: "turn-review-scope", completed: new Promise<NormalizedCodexEvent>(() => undefined) };
+      },
+      steer: async () => undefined,
+      interrupt: async () => undefined,
+      close: async () => undefined
+    }), join(home, "attachments"));
+
+    const directory = join(home, ".openworkshop", "runs", reviewerRunId);
+    const scope = await readFile(join(directory, "review-scope.md"), "utf8");
+    const previous = await readFile(join(directory, "previous-runs.md"), "utf8");
+    assert.match(scope, /Mode: rework verification/);
+    assert.match(scope, /src\/current\.ts/);
+    assert.match(scope, /src\/owned\.ts/);
+    assert.doesNotMatch(scope, /notes\/user\.txt/);
+    assert.match(scope, /Fix the parser boundary/);
+    assert.match(scope, /fixed parser boundary/);
+    assert.match(previous, /file_change\.completed/);
+    assert.match(prompts[0]!, /review-scope\.md/);
+    assert.match(prompts[0]!, /Do not start an unrelated whole-repository audit/);
+    assert.match(prompts[0]!, /regress every unresolved blocking finding first/);
+    assert.match(prompts[0]!, /stop and return those regressions without searching for new issues/);
   } finally {
     await server.close();
     database.close();
@@ -627,6 +694,42 @@ test("interrupts a Run cancelled while Codex is starting the turn", async () => 
     await terminalReached;
     assert.deepEqual(interrupts, ["thread-starting:turn-starting"]);
     assert.deepEqual(terminal, [runId]);
+  } finally {
+    await controller.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("warns once when a running Codex turn stops producing events", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-run-inactivity-"));
+  const database = await openWorkshopDatabase(home);
+  const { taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  let emit!: (event: NormalizedCodexEvent) => void;
+  const controller = new CodexRunController(database, new EventHub(), (options) => {
+    emit = options.onEvent!;
+    return {
+      initialize: async () => undefined,
+      startRun: async () => ({ threadId: "thread-idle", turnId: "turn-idle", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
+      steer: async () => undefined,
+      interrupt: async () => undefined,
+      close: async () => undefined
+    };
+  }, undefined, join(home, "attachments"), 40);
+  try {
+    await controller.start(runId, home);
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    emit(codexEvent("agent.message.delta", "Still working", "item/agentMessage/delta", {}));
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE kind = 'attention' AND entity_id = ?").get(taskId) as { count: number }).count, 0);
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    assert.equal((database.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string }).status, "running");
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE kind = 'attention' AND entity_id = ?").get(taskId) as { count: number }).count, 1);
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM run_events WHERE run_id = ? AND event_type = 'run.inactivity_warning'").get(runId) as { count: number }).count, 1);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE kind = 'attention' AND entity_id = ?").get(taskId) as { count: number }).count, 1);
   } finally {
     await controller.close();
     database.close();

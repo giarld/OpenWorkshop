@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { deliveryEntries, type DeliveryCommission } from "./delivery-workspace-state.ts";
+import { Children, isValidElement, type ReactElement, type ReactNode } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { DeliveryControls, type Acceptance, type DeliveryPreview, type DeliveryRecord } from "./delivery-workspace-controls.ts";
+import { DELIVERY_POLL_INTERVAL_MS, deliveryEntries, deliveryFormFromRequest, deliveryRequestFromForm, deliveryWriteState, EMPTY_DELIVERY_FORM, shouldPollDelivery, shouldRefreshDeliveryEntries, startDeliveryPolling, type DeliveryCommission } from "./delivery-workspace-state.ts";
 import type { Task } from "./task-board.ts";
 
 const task = (overrides: Partial<Task>): Task => ({
@@ -36,6 +39,89 @@ const commission = (overrides: Partial<DeliveryCommission> = {}): DeliveryCommis
   ...overrides
 });
 
+const capabilities = (overrides: Partial<Acceptance["deliveryCapabilities"]> = {}): Acceptance["deliveryCapabilities"] => ({
+  vcsType: "git",
+  document: { available: true, reason: null },
+  vcs_commit: { available: true, reason: null },
+  github_pr: { available: true, reason: null },
+  files: ["src/change.ts"],
+  unownedPaths: [],
+  driftedPaths: [],
+  git: { branch: "main", head: "base", detached: false },
+  github: { remotes: ["origin"], selectedRemote: "origin", repository: "owner/repo", defaultBranch: "main" },
+  ...overrides
+});
+
+const acceptance = (overrides: Partial<Acceptance> = {}): Acceptance => ({
+  commissionStatus: "awaiting_acceptance",
+  task: task({}),
+  deliveryDocument: null,
+  tasks: [],
+  runs: [],
+  evidence: [],
+  deliveryCapabilities: capabilities(),
+  currentDelivery: null,
+  deliveryAttempts: [],
+  ...overrides
+});
+
+const delivery = (overrides: Partial<DeliveryRecord> = {}): DeliveryRecord => ({
+  id: "delivery",
+  commissionId: "commission",
+  mainTaskId: "main",
+  method: "document",
+  status: "queued",
+  request: { method: "document" },
+  progress: { currentStep: null, steps: {} },
+  result: {},
+  externalEffectStarted: false,
+  attempts: [],
+  ...overrides
+});
+
+const preview = (overrides: Partial<DeliveryPreview> = {}): DeliveryPreview => ({
+  fingerprint: "fingerprint",
+  method: "vcs_commit",
+  request: { method: "vcs_commit", commitMessage: "Ship change" },
+  files: [{ path: "src/change.ts", changeType: "modified", hash: "hash" }],
+  baseline: { branch: "main", head: "base", svnRevision: null },
+  remote: null,
+  repository: null,
+  sourceBranch: null,
+  targetBranch: null,
+  draft: false,
+  ...overrides
+});
+
+type ButtonProps = { children?: ReactNode; disabled?: boolean; onClick?: () => void };
+
+function buttons(node: ReactNode): Array<ReactElement<ButtonProps>> {
+  if (!isValidElement(node)) return [];
+  const props = node.props as unknown as ButtonProps;
+  const current = node.type === "button" ? [node as ReactElement<ButtonProps>] : [];
+  return [...current, ...Children.toArray(props.children).flatMap(buttons)];
+}
+
+function buttonByText(node: ReactNode, text: string): ReactElement<ButtonProps> {
+  const button = buttons(node).find((item) => Children.toArray(item.props.children).join("").includes(text));
+  assert.ok(button, `找不到按钮：${text}`);
+  return button;
+}
+
+function controlTree(options: { acceptance?: Acceptance; form?: typeof EMPTY_DELIVERY_FORM; preview?: DeliveryPreview | null; onPreview?: () => void; onDeliver?: () => void; onRetry?: () => void; onCancel?: () => void }): ReactElement {
+  return DeliveryControls({
+    acceptance: options.acceptance ?? acceptance(),
+    preview: options.preview ?? null,
+    form: options.form ?? EMPTY_DELIVERY_FORM,
+    onFormChange: () => undefined,
+    onPreview: options.onPreview ?? (() => undefined),
+    onDeliver: options.onDeliver ?? (() => undefined),
+    onRetry: options.onRetry ?? (() => undefined),
+    onReconcile: () => undefined,
+    onCancel: options.onCancel ?? (() => undefined)
+  });
+}
+
 test("builds one delivery entry per active commission with a main task", () => {
   const entries = deliveryEntries([commission()], [task({}), task({ id: "child", parent_id: "main", number_path: "1.1", status: "done" })]);
   assert.equal(entries.length, 1);
@@ -46,4 +132,121 @@ test("builds one delivery entry per active commission with a main task", () => {
 
 test("omits archived commissions and commissions without a resolvable main task", () => {
   assert.deepEqual(deliveryEntries([commission({ archived_at: "2026-08-10T00:00:00.000Z" }), commission({ id: "missing", main_task_id: "missing" })], [task({})]), []);
+});
+
+test("refreshes delivery entries whenever the delivery view becomes visible", () => {
+  assert.equal(shouldRefreshDeliveryEntries(false, "delivery"), true);
+  assert.equal(shouldRefreshDeliveryEntries(true, "delivery"), false);
+  assert.equal(shouldRefreshDeliveryEntries(false, "notifications"), false);
+});
+
+test("maps every persisted delivery request field back into the form", () => {
+  const form = deliveryFormFromRequest({ method: "github_pr", commitMessage: "ship", remote: "origin", sourceBranch: "openworkshop/change", targetBranch: "main", prTitle: "Ship it", prBody: "Details", draft: true });
+  assert.deepEqual(form, { method: "github_pr", commitMessage: "ship", remote: "origin", sourceBranch: "openworkshop/change", targetBranch: "main", prTitle: "Ship it", prBody: "Details", draft: true });
+  assert.deepEqual(deliveryRequestFromForm(form), form);
+});
+
+test("keeps delivery writes read-only after success and enforces cancellation boundaries", () => {
+  assert.deepEqual(deliveryWriteState("done", "succeeded", false), { readOnly: true, canEdit: false, cancellable: false });
+  assert.deepEqual(deliveryWriteState("awaiting_acceptance", "queued", false), { readOnly: false, canEdit: false, cancellable: true });
+  assert.deepEqual(deliveryWriteState("awaiting_acceptance", "running", true), { readOnly: false, canEdit: false, cancellable: false });
+  assert.deepEqual(deliveryWriteState("awaiting_acceptance", "failed", true), { readOnly: false, canEdit: false, cancellable: false });
+});
+
+test("renders capability reasons and blocks unsafe repository preview actions", () => {
+  const html = renderToStaticMarkup(controlTree({
+    acceptance: acceptance({ deliveryCapabilities: capabilities({ vcs_commit: { available: false, reason: "存在未归属改动" }, github_pr: { available: false, reason: "需要先登录 gh" }, unownedPaths: ["notes.txt"] }) }),
+    form: { ...EMPTY_DELIVERY_FORM, method: "vcs_commit" }
+  }));
+  assert.match(html, /提交并交付/);
+  assert.match(html, /存在未归属改动/);
+  assert.match(html, /需要先登录 gh/);
+  assert.match(html, /未归属：notes.txt/);
+  assert.match(html, /生成交付预览/);
+  assert.match(html, /disabled/);
+  assert.match(html, /delivery-method-option/);
+  assert.match(html, /delivery-safety-alert/);
+  assert.ok(html.indexOf("生成交付预览") < html.indexOf("未归属：notes.txt"));
+});
+
+test("explains why delivery remains unavailable before final coordination", () => {
+  const html = renderToStaticMarkup(controlTree({ acceptance: acceptance({ commissionStatus: "active" }) }));
+  assert.match(html, /交付将在主任务完成最终协调后开放。/);
+  assert.match(html, /生成交付预览/);
+});
+
+test("renders an expired preview as regeneration and never invokes delivery confirmation", () => {
+  let previewCalls = 0;
+  let deliverCalls = 0;
+  const tree = controlTree({
+    form: { ...EMPTY_DELIVERY_FORM, method: "vcs_commit" },
+    preview: preview({ method: "github_pr" }),
+    onPreview: () => { previewCalls += 1; },
+    onDeliver: () => { deliverCalls += 1; }
+  });
+  const html = renderToStaticMarkup(tree);
+  assert.match(html, /交付预览（已失效）/);
+  assert.match(html, /表单或交付方式已变化，请重新生成预览。/);
+  assert.match(html, /重新生成预览/);
+  assert.doesNotMatch(html, /确认并交付/);
+  buttonByText(tree, "重新生成预览").props.onClick?.();
+  assert.equal(previewCalls, 1);
+  assert.equal(deliverCalls, 0);
+  const validTree = controlTree({ form: { ...EMPTY_DELIVERY_FORM, method: "vcs_commit" }, preview: preview(), onDeliver: () => { deliverCalls += 1; } });
+  assert.match(renderToStaticMarkup(validTree), /确认并交付/);
+  buttonByText(validTree, "确认并交付").props.onClick?.();
+  assert.equal(deliverCalls, 1);
+});
+
+test("polls only active delivery states at the shared interval", () => {
+  assert.equal(DELIVERY_POLL_INTERVAL_MS, 2_000);
+  assert.equal(shouldPollDelivery("queued", true), true);
+  assert.equal(shouldPollDelivery("preparing", true), true);
+  assert.equal(shouldPollDelivery("running", true), true);
+  assert.equal(shouldPollDelivery("failed", true), false);
+  assert.equal(shouldPollDelivery("succeeded", true), false);
+  assert.equal(shouldPollDelivery("running", false), false);
+});
+
+test("refreshes active delivery on the polling timer and clears it on teardown", () => {
+  let scheduled: (() => void) | null = null;
+  let delay = 0;
+  let cancelled = 0;
+  let refreshes = 0;
+  const stop = startDeliveryPolling("running", true, () => { refreshes += 1; }, (callback, timeout) => { scheduled = callback; delay = timeout; return 17; }, (timer) => { cancelled = timer; });
+  assert.equal(delay, DELIVERY_POLL_INTERVAL_MS);
+  const pollCallback = scheduled as (() => void) | null;
+  if (!pollCallback) throw new Error("未注册交付轮询回调");
+  pollCallback();
+  assert.equal(refreshes, 1);
+  stop();
+  assert.equal(cancelled, 17);
+});
+
+test("exposes retry and cancellation buttons only at their persisted boundaries", () => {
+  let retryCalls = 0;
+  let cancelCalls = 0;
+  const failedTree = controlTree({ acceptance: acceptance({ currentDelivery: delivery({ status: "failed", externalEffectStarted: true, attempts: [{ attemptNo: 1, status: "failed", failureSummary: "提交失败" }] }) }), onRetry: () => { retryCalls += 1; } });
+  buttonByText(failedTree, "重试").props.onClick?.();
+  assert.equal(retryCalls, 1);
+  const queuedTree = controlTree({ acceptance: acceptance({ currentDelivery: delivery({ status: "queued" }) }), onCancel: () => { cancelCalls += 1; } });
+  buttonByText(queuedTree, "取消").props.onClick?.();
+  assert.equal(cancelCalls, 1);
+  const preparingTree = controlTree({ acceptance: acceptance({ currentDelivery: delivery({ status: "preparing" }) }), onCancel: () => { cancelCalls += 1; } });
+  buttonByText(preparingTree, "取消").props.onClick?.();
+  assert.equal(cancelCalls, 2);
+  const runningHtml = renderToStaticMarkup(controlTree({ acceptance: acceptance({ currentDelivery: delivery({ status: "running", externalEffectStarted: true }) }) }));
+  assert.doesNotMatch(runningHtml, /取消/);
+});
+
+test("renders succeeded delivery as read-only result with no write controls", () => {
+  const html = renderToStaticMarkup(controlTree({ acceptance: acceptance({ commissionStatus: "done", currentDelivery: delivery({ method: "github_pr", status: "succeeded", result: { method: "github_pr", prUrl: "https://github.com/owner/repo/pull/7" }, progress: { currentStep: null, steps: { pr: { status: "succeeded", detail: null } } }, attempts: [{ attemptNo: 1, status: "succeeded", failureSummary: null }] }) }) }));
+  assert.match(html, /交付已完成。/);
+  assert.match(html, /交付方式/);
+  assert.match(html, /GitHub PR/);
+  assert.match(html, /执行结果/);
+  assert.match(html, /第 1 次尝试完成/);
+  assert.match(html, /https:\/\/github\.com\/owner\/repo\/pull\/7/);
+  assert.doesNotMatch(html, /method|步骤 pr|succeeded/);
+  assert.doesNotMatch(html, /生成交付预览|重新生成预览|确认并交付|重试|取消/);
 });

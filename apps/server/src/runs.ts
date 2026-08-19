@@ -7,11 +7,12 @@ import { APPROVAL_POLICIES, COMMAND_APPROVAL_POLICY, COMMAND_SANDBOX_MODE, SANDB
 import type { AgentMentionHandler } from "./comments.ts";
 import { SettingsStore } from "./database.ts";
 import { notify } from "./notifications.ts";
-import { registerSchedulerRoutes, Scheduler } from "./scheduler.ts";
+import { isReworkRun, ProjectLockManager, registerSchedulerRoutes, Scheduler } from "./scheduler.ts";
 import { configuredSecrets, isHighRiskCommand, normalizeCommands, redactSensitive } from "./security.ts";
 
 type RunStatus = "queued" | "preparing" | "running" | "waiting_approval" | "waiting_input" | "succeeded" | "failed" | "cancelled" | "interrupted";
 type JsonObject = Record<string, unknown>;
+type TriggerEvidence = { event_type: string; summary: string; payload_json: string; created_at: string };
 
 type RunRow = {
   id: string;
@@ -81,6 +82,7 @@ export type RunClientLauncher = (options: CodexAppServerOptions) => RunClient;
 
 type ActiveRun = { client: RunClient; handle?: CodexRunHandle; contextDirectory: string; cleanupContext(): Promise<void> };
 type PendingSteer = { message: string; attachments: AttachmentRow[] };
+const DEFAULT_INACTIVITY_WARNING_MS = 30 * 60_000;
 
 export class CodexRunController {
   private readonly active = new Map<string, ActiveRun>();
@@ -89,19 +91,23 @@ export class CodexRunController {
   private readonly inputResponders = new Map<string, { respond: (answers: unknown) => void; questionIds: Set<string> }>();
   private readonly interruptModes = new Map<string, "pause" | "cancel">();
   private readonly pendingSteers = new Map<string, PendingSteer[]>();
+  private readonly inactivityTimers = new Map<string, NodeJS.Timeout>();
+  private readonly inactivityWarnings = new Set<string>();
   private readonly database: DatabaseSync;
   private readonly hub: EventHub;
   private readonly launch: RunClientLauncher;
   private readonly onTerminal: (runId: string) => Promise<void>;
   private readonly attachmentsRoot: string;
+  private readonly inactivityWarningMs: number;
   private closing = false;
 
-  constructor(database: DatabaseSync, hub: EventHub, launch: RunClientLauncher, onTerminal: (runId: string) => Promise<void> = async () => undefined, attachmentsRoot = "attachments") {
+  constructor(database: DatabaseSync, hub: EventHub, launch: RunClientLauncher, onTerminal: (runId: string) => Promise<void> = async () => undefined, attachmentsRoot = "attachments", inactivityWarningMs = DEFAULT_INACTIVITY_WARNING_MS) {
     this.database = database;
     this.hub = hub;
     this.launch = launch;
     this.onTerminal = onTerminal;
     this.attachmentsRoot = attachmentsRoot;
+    this.inactivityWarningMs = inactivityWarningMs;
   }
 
   async steer(runId: string, message: string, attachmentIds: readonly string[] = []): Promise<void> {
@@ -113,6 +119,7 @@ export class CodexRunController {
       const copies = await materializeRunAttachments(attachments, this.attachmentsRoot, run.contextDirectory);
       const input: CodexInput[] = [{ type: "text", text: attachmentMessage(message, copies) }, ...localImageInputs(copies)];
       await run.client.steer(run.handle!.threadId, run.handle!.turnId, attachments.length ? input : message);
+      this.armInactivityWarning(runId);
     } catch (error) {
       releaseRunAttachments(this.database, runId, attachments);
       throw error;
@@ -204,8 +211,10 @@ export class CodexRunController {
               ? `You are the independent supervisor reviewing a proposed task-plan revision before human confirmation. Read the approved requirement, active task tree, Runs, evidence, main-task comments, and the proposal in the Run context. Verify scope, task IDs, dependencies, deletion effects, Done-task reopen requirements, and whether the proposal can complete the approved requirement. Do not modify files or tasks and do not call task-management CLI commands.\n\nCurrent objective: ${task.title}\nContext files:\n${contextIndex}\n\nReturn JSON only: {"approved":boolean,"summary":"human-readable complete task diff and review conclusion","question":{"type":"text","prompt":"needed correction","options":[]}}. Omit question when approved; when rejected, include one actionable question if human input is required. A text question has no options; boolean requires exactly two options; single_choice requires at least two options; multiple_choice requires at least one option.`
           : `You are the project supervisor Agent. Reconcile the current task before it is executed again so completed work is not repeated. Read every context file, inspect the current workspace without modifying it, distinguish Run execution status from the structured review result, and choose exactly one next action.\n\nCurrent objective: ${task.title}\nExecution boundary: read-only coordination; do not modify project files, run destructive commands, or perform the task itself.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"action":"resume_reviewer|resume_developer|rework_developer|restart_developer|replan|wait_human","summary":"string"}. Use resume_reviewer when review was interrupted or failed for infrastructure reasons, or when a human or external process changed or validated the current workspace after the latest review and a fresh independent review is required. A successful build or test does not replace required review. Use resume_developer when an interrupted developer should continue; rework_developer when unresolved review findings require code changes; restart_developer only when prior development cannot be reused; replan when the task definition or dependencies must change; wait_human only when a concrete unanswered human decision or operation is required. Never use wait_human for final acceptance or task closure of a child task; final human acceptance belongs to the main task.`
         : run.role === "reviewer"
-          ? `You are the independent test/review Agent. Verify the current task against its acceptance criteria and project instructions. Read every context file before acting.\n\nCurrent objective: ${task.title}\nExecution boundary: inspect the current workspace; do not implement fixes.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"passed":boolean,"summary":"string","checks":[],"findings":[{"severity":"blocking|warning","file":"path","line":null,"message":"string"}]}. Only blocking findings make passed false.`
-          : `You are the developer Agent. Read every context file before acting.\n\nCurrent objective: ${task.title}\nExecution boundary: ${task.read_only ? "read-only analysis; do not modify project files" : "work only inside the provided workspace and complete the task acceptance criteria"}.\nContext files:\n${contextIndex}\n\nComplete the task and report the key result, checks, constraints, and remaining risks in the final message. The final message is saved to the task discussion; mention @负责人 when human attention or a decision is required.`;
+          ? `You are the independent test/review Agent. Verify the current task against its acceptance criteria and project instructions. Read every context file before acting, starting with review-scope.md and treating its boundary rules as binding. Do not start an unrelated whole-repository audit. In a rework review, regress every unresolved blocking finding first. If any previous finding remains, stop and return those regressions without searching for new issues; only after all previous findings pass may you continue reviewing for new problems.\n\nCurrent objective: ${task.title}\nExecution boundary: inspect the current workspace; do not implement fixes.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"passed":boolean,"summary":"string","checks":[],"findings":[{"severity":"blocking|warning","scope":"task_change|direct_dependency|unrelated","file":"path","line":null,"message":"string"}]}. Only blocking findings make passed false. Unrelated findings must be warnings. A blocking direct_dependency finding must explain the concrete dependency on an in-scope change.`
+          : isReworkRun(this.database, run.id)
+            ? `You are the developer Agent handling review rework. Read every context file before acting and resolve every blocking finding from the triggering review. After each fix, self-review the affected behavior and checks. If you find any remaining or newly introduced problem, fix it and self-review again. Repeat until all findings are closed, with at most 3 self-review rounds. Do not hand work back to Reviewer while a known issue remains.\n\nCurrent objective: ${task.title}\nExecution boundary: work only inside the provided workspace.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"resolved":boolean,"summary":"string","selfReviewRounds":1,"remainingFindings":["string"]}. Set resolved true only when all triggering findings and self-review findings are closed, with remainingFindings empty. If findings remain after 3 rounds, set resolved false, selfReviewRounds to 3, and list every remaining finding; the task will be blocked.`
+            : `You are the developer Agent. Read every context file before acting.\n\nCurrent objective: ${task.title}\nExecution boundary: ${task.read_only ? "read-only analysis; do not modify project files" : "work only inside the provided workspace and complete the task acceptance criteria"}.\nContext files:\n${contextIndex}\n\nComplete the task and report the key result, checks, constraints, and remaining risks in the final message. The final message is saved to the task discussion; mention @负责人 when human attention or a decision is required.`;
       const handle = await client.startRun({
         cwd,
         sandbox: sandboxMode,
@@ -231,6 +240,7 @@ export class CodexRunController {
       }
       this.database.prepare("UPDATE runs SET status = 'running' WHERE id = ? AND status = 'preparing'").run(runId);
       appendRunEvent(this.database, this.hub, runId, "run.status", "Run running", { status: "running" });
+      this.armInactivityWarning(runId);
       await this.flushPendingSteers(runId, client, handle);
     } catch (error) {
       this.releasePendingSteers(runId);
@@ -307,6 +317,7 @@ export class CodexRunController {
         .run(usage.input, usage.output, usage.cached, runId);
     }
     appendRunEvent(this.database, this.hub, runId, event.type, event.summary, { method: event.method, ...(event.requestId === undefined ? {} : { requestId: event.requestId }), ...event.payload });
+    this.armInactivityWarning(runId);
     if (event.type === "request.resolved") this.resolveRequest(runId, String(event.payload.requestId ?? ""));
   }
 
@@ -359,7 +370,30 @@ export class CodexRunController {
       : [...this.approvalResponders.keys()].some((key) => key.startsWith(prefix)) ? "waiting_approval"
       : "running";
     if (this.active.has(runId)) this.database.prepare("UPDATE runs SET status = ? WHERE id = ? AND status IN ('preparing', 'running', 'waiting_approval', 'waiting_input')").run(status, runId);
+    if (status === "running") this.armInactivityWarning(runId);
+    else this.clearInactivityTimer(runId);
     return status;
+  }
+
+  private armInactivityWarning(runId: string): void {
+    this.clearInactivityTimer(runId);
+    if (this.inactivityWarnings.has(runId) || this.inactivityWarningMs <= 0 || !this.active.has(runId)) return;
+    const timer = setTimeout(() => {
+      this.inactivityTimers.delete(runId);
+      const run = this.database.prepare("SELECT status, task_id FROM runs WHERE id = ?").get(runId) as { status: RunStatus; task_id: string } | undefined;
+      if (!run || run.status !== "running" || !this.active.has(runId)) return;
+      this.inactivityWarnings.add(runId);
+      appendRunEvent(this.database, this.hub, runId, "run.inactivity_warning", "Run has produced no events for an extended period", { inactivityMs: this.inactivityWarningMs });
+      notify(this.database, "attention", "Run 长时间无事件", `Run 已连续 ${Math.round(this.inactivityWarningMs / 60_000)} 分钟没有产生新事件，请检查后决定暂停或继续等待。`, "task", run.task_id);
+    }, this.inactivityWarningMs);
+    timer.unref();
+    this.inactivityTimers.set(runId, timer);
+  }
+
+  private clearInactivityTimer(runId: string): void {
+    const timer = this.inactivityTimers.get(runId);
+    if (timer) clearTimeout(timer);
+    this.inactivityTimers.delete(runId);
   }
 
   private async complete(runId: string, event: NormalizedCodexEvent): Promise<void> {
@@ -389,6 +423,8 @@ export class CodexRunController {
     const run = this.active.get(runId);
     this.active.delete(runId);
     this.interruptModes.delete(runId);
+    this.clearInactivityTimer(runId);
+    this.inactivityWarnings.delete(runId);
     this.releasePendingSteers(runId);
     for (const key of this.approvalResponders.keys()) if (key.startsWith(`${runId}:`)) this.approvalResponders.delete(key);
     for (const key of this.inputResponders.keys()) if (key.startsWith(`${runId}:`)) this.inputResponders.delete(key);
@@ -444,16 +480,17 @@ function runContextFiles(database: DatabaseSync, run: RunRow, task: TaskContext,
     )
     WHERE run.task_id = ? AND run.id <> ? ORDER BY run.rowid DESC LIMIT 20
   `).all(run.task_id, run.id) as Array<Record<string, unknown>>;
-  const evidence = run.trigger_ref_id ? database.prepare(`
+  const evidence = run.trigger_ref_id ? compactTriggerEvidence(database.prepare(`
     SELECT event_type, summary, payload_json, created_at FROM run_events
-    WHERE run_id = ? AND event_type IN ('agent.message.delta', 'agent_message.completed', 'file.changed', 'command.completed')
-    ORDER BY id DESC LIMIT 50
-  `).all(run.trigger_ref_id) as Array<Record<string, unknown>> : [];
+    WHERE run_id = ? AND event_type IN ('agent.message.delta', 'agent_message.completed', 'file.changed', 'file_change.completed', 'command.completed')
+    ORDER BY id
+  `).all(run.trigger_ref_id) as TriggerEvidence[]) : [];
   const requirementMessages = database.prepare("SELECT role, content, created_at FROM requirement_messages WHERE commission_id = ? ORDER BY created_at, rowid").all(run.commission_id) as Array<{ role: string; content: string; created_at: string }>;
   const mainTaskInstructions = task.main_task_id && task.main_task_id !== run.task_id
     ? database.prepare("SELECT content, created_at FROM comments WHERE task_id = ? AND author_type = 'human' AND deleted_at IS NULL ORDER BY created_at, rowid").all(task.main_task_id) as Array<{ content: string; created_at: string }>
     : [];
   const comments = database.prepare("SELECT id, parent_id, run_id, author_type, agent_role, kind, content, created_at FROM comments WHERE task_id = ? AND deleted_at IS NULL ORDER BY created_at, rowid").all(run.task_id) as Array<{ id: string; parent_id: string | null; run_id: string | null; author_type: string; agent_role: string | null; kind: string; content: string; created_at: string }>;
+  const reviewScope = run.role === "reviewer" ? reviewerScope(database, run) : undefined;
   const treeContext = ["coordinate", "plan_revision", "plan_revision_review"].includes(run.trigger_type);
   const revisionContext = run.trigger_type.startsWith("plan_revision") && run.trigger_ref_id
     ? database.prepare("SELECT status, proposal_json FROM plan_revisions WHERE id = ?").get(run.trigger_ref_id) as { status: string; proposal_json: string | null } | undefined
@@ -482,12 +519,108 @@ function runContextFiles(database: DatabaseSync, run: RunRow, task: TaskContext,
       return `## ${item.number_path} ${item.title}\n\n- ID: ${item.id}\n- Status: ${item.status}\n- Owner: ${item.owner_type}\n- Latest Run: ${item.latest_run_id ? `${item.latest_run_id} · ${item.latest_run_role} · ${item.latest_run_status}` : "none"}\n- Depends on: ${taskTreeDependencies.filter((dependency) => dependency.task_path === item.number_path).map((dependency) => dependency.dependency_path).join(", ") || "none"}\n- Blocked: ${item.blocked_reason ?? "no"}\n- Description: ${item.description || "No description."}\n- Acceptance: ${prettyJson(item.acceptance_json)}\n- Run history: ${runs.length ? runs.map((taskRun) => `Attempt ${taskRun.attempt_no} · ${taskRun.id} · ${taskRun.role} · ${taskRun.trigger_type} · ${taskRun.status}${taskRun.failure_summary ? ` · ${taskRun.failure_summary}` : ""}`).join("; ") : "none"}\n- Evidence: ${taskEvidence.length ? taskEvidence.map((entry) => `${entry.type}/${entry.status} · run:${entry.run_id ?? "none"} · ${entry.summary} · ${entry.payload_json}`).join("; ") : "none"}`;
     }).join("\n\n")}\n` } : {}),
     ...(revisionContext ? { "plan-revision.md": `# Plan Revision\n\n- Status: ${revisionContext.status}\n\n## Proposed Changes\n\n\`\`\`json\n${revisionContext.proposal_json ? prettyJson(revisionContext.proposal_json) : "null"}\n\`\`\`\n` } : {}),
-    "previous-runs.md": `# Previous Runs\n\n${previousRuns.length ? previousRuns.map((item) => `- Attempt ${item.attempt_no} · ${item.role} · Run ${item.status} · ${item.trigger_type}${item.review_status ? ` · Review ${item.review_status}${item.review_summary ? ` · ${item.review_summary}` : ""}` : ""}${item.failure_summary ? ` · ${item.failure_summary}` : ""}`).join("\n") : "No previous Runs."}${evidence.length ? `\n\n## Trigger Run Evidence\n\n${evidence.toReversed().map((item) => `- ${item.created_at} · ${item.event_type} · ${item.summary}\n  ${item.payload_json}`).join("\n")}` : ""}\n`,
+    ...(reviewScope ? { "review-scope.md": reviewScope } : {}),
+    "previous-runs.md": `# Previous Runs\n\n${previousRuns.length ? previousRuns.map((item) => `- Attempt ${item.attempt_no} · ${item.role} · Run ${item.status} · ${item.trigger_type}${item.review_status ? ` · Review ${item.review_status}${item.review_summary ? ` · ${item.review_summary}` : ""}` : ""}${item.failure_summary ? ` · ${item.failure_summary}` : ""}`).join("\n") : "No previous Runs."}${evidence.length ? `\n\n## Trigger Run Evidence\n\n${evidence.map((item) => `- ${item.created_at} · ${item.event_type} · ${item.summary}\n  ${item.payload_json}`).join("\n")}` : ""}\n`,
     "project-profile.md": `# Project: ${task.project_name}\n\n- Root: ${task.project_root}\n- VCS: ${task.vcs_type}\n- VCS root: ${task.vcs_root ?? "none"}\n\n## Profile\n\n\`\`\`json\n${prettyJson(task.profile_json ?? "{}")}\n\`\`\`\n`,
     "messages.md": `# Messages\n\n${requirementMessages.length ? requirementMessages.map((item) => `## ${item.role} · ${item.created_at}\n\n${item.content}`).join("\n\n") : "No requirement messages."}${comments.length ? `\n\n# Task Comments\n\n${comments.map((item) => `## ${item.id} · ${item.author_type}${item.agent_role ? `/${item.agent_role}` : ""} · ${item.kind} · ${item.created_at}${item.parent_id ? ` · reply-to:${item.parent_id}` : ""}${item.run_id ? ` · run:${item.run_id}` : ""}\n\n${attachmentMessage(item.content, attachmentsByComment.get(item.id) ?? [])}`).join("\n\n")}` : ""}\n`
   };
   database.prepare("UPDATE runs SET context_snapshot_json = ? WHERE id = ?").run(JSON.stringify({ version: 1, files }), run.id);
   return files;
+}
+
+function compactTriggerEvidence(events: TriggerEvidence[]): TriggerEvidence[] {
+  const completedItems = new Set<string>();
+  const deltas = new Map<string, TriggerEvidence>();
+  const compacted: TriggerEvidence[] = [];
+  for (const event of events) {
+    const payload = JSON.parse(event.payload_json) as JsonObject;
+    if (event.event_type === "agent_message.completed") {
+      const item = payload.item as JsonObject | undefined;
+      if (typeof item?.id === "string") {
+        completedItems.add(item.id);
+        deltas.delete(item.id);
+      }
+      compacted.push(event);
+      continue;
+    }
+    if (event.event_type !== "agent.message.delta") {
+      compacted.push(event);
+      continue;
+    }
+    const itemId = typeof payload.itemId === "string" ? payload.itemId : "unknown";
+    if (completedItems.has(itemId)) continue;
+    const previous = deltas.get(itemId);
+    if (previous) {
+      const previousPayload = JSON.parse(previous.payload_json) as JsonObject;
+      previousPayload.delta = String(previousPayload.delta ?? "") + String(payload.delta ?? "");
+      previous.payload_json = JSON.stringify(previousPayload);
+    } else {
+      deltas.set(itemId, { ...event, payload_json: JSON.stringify({ ...payload, delta: String(payload.delta ?? "") }) });
+    }
+  }
+  return [...compacted, ...deltas.values()].sort((left, right) => left.created_at.localeCompare(right.created_at)).slice(-50);
+}
+
+function reviewerScope(database: DatabaseSync, run: RunRow): string {
+  const sourceRun = run.trigger_ref_id
+    ? database.prepare("SELECT role, trigger_type FROM runs WHERE id = ?").get(run.trigger_ref_id) as { role: string; trigger_type: string } | undefined
+    : undefined;
+  const diffs = database.prepare("SELECT run_id, payload_json FROM evidence WHERE task_id = ? AND type = 'diff' ORDER BY rowid")
+    .all(run.task_id) as Array<{ run_id: string | null; payload_json: string }>;
+  const taskPaths = new Set(diffs.flatMap(({ payload_json }) => diffEvidencePaths(payload_json, true)));
+  const currentPaths = new Set(diffs.filter(({ run_id }) => run_id === run.trigger_ref_id).flatMap(({ payload_json }) => diffEvidencePaths(payload_json, false)));
+  const fileChanges = run.trigger_ref_id ? database.prepare(`SELECT payload_json FROM run_events
+    WHERE run_id = ? AND event_type IN ('file.changed', 'file_change.completed') ORDER BY id LIMIT 20`)
+    .all(run.trigger_ref_id) as Array<{ payload_json: string }> : [];
+  const latestReview = database.prepare("SELECT status, payload_json FROM evidence WHERE task_id = ? AND type = 'review' ORDER BY rowid DESC LIMIT 1")
+    .get(run.task_id) as { status: string; payload_json: string } | undefined;
+  const rework = sourceRun?.role === "developer" && ["rework", "resume"].includes(sourceRun.trigger_type) && latestReview?.status === "failed";
+  const paths = (items: Set<string>) => items.size ? [...items].sort().map((path) => `- ${path}`).join("\n") : "- None recorded.";
+  const changes = fileChanges.length ? fileChanges.map(({ payload_json }) => prettyJson(payload_json)).join("\n\n") : "No structured file-change event was recorded; use the current-delta paths and diff Evidence.";
+  return `# Review Scope
+
+- Mode: ${rework ? "rework verification" : "full task verification"}
+- Source Run: ${run.trigger_ref_id ?? "none"}
+
+## Current Developer Delta Paths
+
+${paths(currentPaths)}
+
+## Cumulative Task-Owned Paths
+
+${paths(taskPaths)}
+
+## Current Developer Diff Events
+
+${changes}
+
+## Unresolved Review Result
+
+${latestReview?.status === "failed" ? prettyJson(latestReview.payload_json) : "None."}
+
+## Binding Boundary Rules
+
+- In rework verification, first regress every unresolved blocking finding against the current Developer delta. If any previous finding remains, stop and return those findings before searching for new issues.
+- A blocking finding must concern a current-delta path, a cumulative task-owned path, or a direct caller, schema, migration, or test whose behavior is changed by one of those paths.
+- A direct-dependency finding outside the listed paths must state the concrete dependency in its message.
+- Unrelated pre-existing workspace changes may be reported only as warnings and must not make the review fail.
+- Full task verification covers the cumulative task-owned paths and their direct regression boundary, not every uncommitted file in the workspace.
+`;
+}
+
+function diffEvidencePaths(payloadJson: string, safeOnly: boolean): string[] {
+  let payload: Record<string, unknown>;
+  try { payload = JSON.parse(payloadJson) as Record<string, unknown>; } catch { return []; }
+  const paths: string[] = [];
+  for (const changes of [payload.changes, payload.appliedChanges]) {
+    if (!Array.isArray(changes)) continue;
+    for (const change of changes) {
+      if (!change || typeof change !== "object" || Array.isArray(change)) continue;
+      const item = change as Record<string, unknown>;
+      if (typeof item.path === "string" && (!safeOnly || item.safe === true)) paths.push(item.path);
+    }
+  }
+  return paths;
 }
 
 function remapAttachmentPaths(files: RunContextFiles, sources: readonly AttachmentRow[], copies: readonly AttachmentRow[]): RunContextFiles {
@@ -509,13 +642,13 @@ function prettyJson(value: string): string {
   catch { return value; }
 }
 
-export async function registerProductionRunRoutes(server: FastifyInstance, database: DatabaseSync, launch: RunClientLauncher, attachmentsRoot = "attachments"): Promise<AgentMentionHandler> {
+export async function registerProductionRunRoutes(server: FastifyInstance, database: DatabaseSync, launch: RunClientLauncher, attachmentsRoot = "attachments", projectLocks = new ProjectLockManager()): Promise<AgentMentionHandler> {
   const hub = new EventHub();
   const projectRoots = database.prepare("SELECT real_path FROM projects WHERE archived_at IS NULL").all() as Array<{ real_path: string }>;
   await Promise.all(projectRoots.map(({ real_path }) => recoverRunContexts(real_path)));
   let scheduler!: Scheduler;
   const controller = new CodexRunController(database, hub, launch, (runId) => scheduler.terminal(runId), attachmentsRoot);
-  scheduler = new Scheduler(database, controller);
+  scheduler = new Scheduler(database, controller, undefined, projectLocks);
   const controls: RunController = {
     steer: (runId, message, attachmentIds) => controller.steer(runId, message, attachmentIds),
     interrupt: (runId, mode) => controller.interrupt(runId, mode),

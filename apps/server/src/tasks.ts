@@ -45,6 +45,7 @@ type TaskRow = {
 type CommissionRow = { id: string; project_id: string; main_task_id: string | null; status: string; archived_at: string | null; lifecycle_operation?: string | null };
 type TaskView = TaskRow & { acceptanceCriteria: unknown[]; labels: Array<{ id: string; name: string; color: string }>; dependencyIds: string[]; latestRunStatus: string | null; children?: TaskView[] };
 export type TaskPlan = { mainTask: Record<string, unknown>; tasks: Array<Record<string, unknown>> };
+export type AcceptanceDetailsExtension = (taskId: string) => Promise<Record<string, unknown>>;
 
 class CycleError extends Error {
   readonly path: string[];
@@ -55,7 +56,7 @@ class CycleError extends Error {
   }
 }
 
-export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSync, mentionAgent?: AgentMentionHandler, attachmentsRoot = "attachments"): void {
+export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSync, mentionAgent?: AgentMentionHandler, attachmentsRoot = "attachments", acceptanceDetailsExtension?: AcceptanceDetailsExtension): void {
   registerAttachmentParsers(server);
   server.get<{ Params: { id: string }; Querystring: Record<string, string | undefined> }>("/api/projects/:id/tasks", async (request) => {
     projectExists(database, request.params.id);
@@ -361,21 +362,13 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
     return taskView(database, request.params.id);
   });
 
-  server.get<{ Params: { id: string } }>("/api/tasks/:id/acceptance", async (request) => acceptanceDetails(database, request.params.id));
+  server.get<{ Params: { id: string } }>("/api/tasks/:id/acceptance", async (request) => ({
+    ...acceptanceDetails(database, request.params.id),
+    ...(acceptanceDetailsExtension ? await acceptanceDetailsExtension(request.params.id) : {})
+  }));
 
-  server.post<{ Params: { id: string } }>("/api/tasks/:id/accept", async (request) => {
-    transaction(database, () => {
-      const task = activeTask(database, request.params.id);
-      const commission = commissionForMainTask(database, task);
-      if (commission.status !== "awaiting_acceptance") throw conflict("Main task is not awaiting acceptance");
-      const now = new Date().toISOString();
-      database.prepare("UPDATE tasks SET status = 'done', updated_at = ? WHERE id = ?").run(now, task.id);
-      database.prepare("UPDATE commissions SET status = 'done', updated_at = ? WHERE id = ?").run(now, commission.id);
-      database.prepare("UPDATE execution_grants SET status = 'exhausted' WHERE commission_id = ? AND status = 'active'").run(commission.id);
-      generateAcceptanceDocuments(database, commission.id);
-      notify(database, "completed", `已验收：${task.title}`, "最终验收已批准。", "task", task.id);
-    });
-    return taskView(database, request.params.id);
+  server.post<{ Params: { id: string } }>("/api/tasks/:id/accept", async () => {
+    throw conflict("Explicit delivery method and preview are required");
   });
 
   server.post<{ Params: { id: string }; Body: Record<string, unknown> }>("/api/tasks/:id/reject", async (request) => {
@@ -386,6 +379,8 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
       if (commission.status !== "awaiting_acceptance") throw conflict("Main task is not awaiting acceptance");
       const now = new Date().toISOString();
       database.prepare("INSERT INTO comments (id, task_id, author_type, kind, content, created_at) VALUES (?, ?, 'human', 'rejection', ?, ?)").run(randomUUID(), task.id, reason, now);
+      database.prepare("UPDATE delivery_attempts SET status = 'cancelled', finished_at = COALESCE(finished_at, ?) WHERE delivery_id IN (SELECT id FROM deliveries WHERE main_task_id = ?) AND status IN ('failed', 'waiting_human')").run(now, task.id);
+      database.prepare("UPDATE deliveries SET status = 'cancelled', updated_at = ?, completed_at = COALESCE(completed_at, ?) WHERE main_task_id = ? AND status IN ('failed', 'waiting_human')").run(now, now, task.id);
       database.prepare("UPDATE commissions SET status = 'active', updated_at = ? WHERE id = ?").run(now, commission.id);
       // ponytail: reopen the latest completed AI leaf; replace with supervisor-selected task routing when that role is scheduled directly.
       const rework = database.prepare("SELECT id FROM tasks WHERE commission_id = ? AND id <> ? AND status = 'done' AND owner_type = 'ai' AND archived_at IS NULL AND NOT EXISTS (SELECT 1 FROM tasks AS child WHERE child.parent_id = tasks.id AND child.archived_at IS NULL) ORDER BY updated_at DESC, rowid DESC LIMIT 1").get(commission.id, task.id) as { id: string } | undefined;

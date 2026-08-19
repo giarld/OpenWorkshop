@@ -86,7 +86,7 @@ async function installOwnedLock(lockPath: string, recoveryPath: string, root: st
     try {
       await rename(temporaryPath, lockPath);
     } catch (error) {
-      if (isFileExistsError(error) || hasCode(error, "ENOTEMPTY") || (hasCode(error, "EPERM") && await pathExists(lockPath))) return false;
+      if (isFileExistsError(error) || hasCode(error, "ENOTEMPTY") || await pathExists(lockPath)) return false;
       throw error;
     }
     const recoveryOwner = await readLockOwner(recoveryPath);
