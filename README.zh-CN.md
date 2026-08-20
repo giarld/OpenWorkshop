@@ -214,6 +214,7 @@ workshop task delivery-preview <main-task-id> --data-file preview.json --output 
 workshop task deliver <main-task-id> --data-file delivery.json --output json
 workshop delivery get <delivery-id> --output json
 workshop delivery retry <delivery-id> --output json
+workshop delivery reconcile <delivery-id> --data-file reconcile.json --output json
 workshop delivery cancel <delivery-id> --output json
 
 workshop document list <project-id> \
@@ -233,7 +234,7 @@ workshop document list <project-id> \
 {"method":"document","previewFingerprint":"<preview 输出中的 fingerprint>"}
 ```
 
-选择 `vcs_commit` 或 `github_pr` 时，在两个文件中填写该方式支持的 Commit、Remote、分支或 PR 字段。`task deliver` 只负责创建异步交付并立即返回 Delivery ID 和当前状态；使用 `delivery get` 轮询，不会隐式等待后台执行。旧的无参数 `task accept` 命令已禁用。
+选择 `vcs_commit` 或 `github_pr` 时，在两个文件中填写该方式支持的 Commit、Remote、分支或 PR 字段。仓库交付只提交当前委托可归属路径，其他非交叉修改保持原状；当前委托路径发生内容冲突时交付失败。`task deliver` 只负责创建异步交付并立即返回 Delivery ID 和当前状态；使用 `delivery get` 轮询，不会隐式等待后台执行。交付进入 `waiting_human` 时，使用 `delivery reconcile` 记录已核实的外部结果，或确认没有外部副作用后再重试。旧的无参数 `task accept` 命令已禁用。
 
 Codex 等 Agent 也可以跳过 Workshop 的需求澄清和规划 Agent，直接导入已经由用户确认的需求与任务计划：
 

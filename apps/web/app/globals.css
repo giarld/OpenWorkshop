@@ -418,9 +418,9 @@ aside { padding: .8rem 1rem; border-left: .25rem solid #c47a2c; background: #fff
 .commission-message { max-width: 84%; padding: .7rem .8rem; border-radius: .35rem; background: #f0ece3; }
 .commission-message.human { justify-self: end; background: #f8e7d9; }
 .commission-message.agent { background: #e7efe9; }
-.commission-message p { white-space: pre-wrap; }
+.commission-message p { color: var(--ink); white-space: pre-wrap; }
 .thinking-message { display: grid; gap: .45rem; }
-.analysis-progress { display: grid; gap: .25rem; color: #536057; font-size: .76rem; }
+.analysis-progress { display: grid; gap: .25rem; color: var(--ink); font-size: .76rem; }
 .analysis-progress > span:not(:last-child) { opacity: .65; }
 .analysis-progress > span:last-child { display: flex; align-items: center; gap: .45rem; }
 .thinking-dots { display: inline-flex; align-items: center; gap: .22rem; height: 1rem; }

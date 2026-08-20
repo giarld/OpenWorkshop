@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -45,7 +45,7 @@ test("document delivery completes atomically without repository commands", async
   } finally { await server.close(); database.close(); await rm(home, { recursive: true, force: true }); }
 });
 
-test("Git commit delivery uses only attributed paths and creates no push command", async () => {
+test("Git commit delivery excludes and preserves unrelated workspace changes", async () => {
   const project = await mkdtemp(join(tmpdir(), "project-workshop-git-delivery-"));
   const databaseHome = await mkdtemp(join(tmpdir(), "project-workshop-git-db-"));
   const database = await openWorkshopDatabase(databaseHome);
@@ -71,6 +71,10 @@ test("Git commit delivery uses only attributed paths and creates no push command
     assert.equal(preview.statusCode, 200);
     const previewBody = preview.json() as { fingerprint: string; files: Array<{ path: string }> };
     assert.deepEqual(previewBody.files.map(({ path }) => path), ["change.txt"]);
+    await writeFile(join(project, "other.txt"), "peripheral change\n", "utf8");
+    await runFile("git", ["add", "other.txt"], { cwd: project });
+    await mkdir(join(project, ".memory"));
+    await writeFile(join(project, ".memory", "note.md"), "plugin output\n", "utf8");
     const queued = await server.inject({ method: "POST", url: `/api/tasks/${fixture.taskId}/deliver`, payload: { method: "vcs_commit", commitMessage: "deliver change", previewFingerprint: previewBody.fingerprint } });
     assert.equal(queued.statusCode, 202);
     await worker.wake();
@@ -78,6 +82,103 @@ test("Git commit delivery uses only attributed paths and creates no push command
     assert.equal(delivery.status, "succeeded");
     assert.match(delivery.result.commitHash, /^[0-9a-f]{40}$/);
     assert.equal((await runFile("git", ["log", "-1", "--pretty=%s"], { cwd: project })).stdout.trim(), "deliver change");
+    assert.equal((await runFile("git", ["show", "--pretty=", "--name-only", "HEAD"], { cwd: project })).stdout.trim(), "change.txt");
+    assert.equal(await readFile(join(project, "other.txt"), "utf8"), "peripheral change\n");
+    assert.equal(await readFile(join(project, ".memory", "note.md"), "utf8"), "plugin output\n");
+    assert.equal((await runFile("git", ["diff", "--cached", "--name-only"], { cwd: project })).stdout.trim(), "other.txt");
+  } finally { await server.close(); database.close(); await rm(project, { recursive: true, force: true }); await rm(databaseHome, { recursive: true, force: true }); }
+});
+
+test("SVN delivery commits only attributed paths and records the revision", async () => {
+  const project = await mkdtemp(join(tmpdir(), "project-workshop-svn-delivery-"));
+  const databaseHome = await mkdtemp(join(tmpdir(), "project-workshop-svn-delivery-db-"));
+  const database = await openWorkshopDatabase(databaseHome);
+  const server = Fastify();
+  const fixture = seed(database, project, "svn");
+  await writeFile(join(project, "change.txt"), "after\n", "utf8");
+  const hash = createHash("sha256").update(await readFile(join(project, "change.txt"))).digest("hex");
+  database.prepare("INSERT INTO evidence (id, task_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, '*', 'diff', 'passed', 'attributed', ?, ?)")
+    .run(randomUUID(), fixture.taskId, JSON.stringify({ changes: [{ path: "change.txt", changeType: "modified", hash, baselineHash: null, safe: true }] }), new Date().toISOString());
+  database.prepare("UPDATE commissions SET status = 'awaiting_acceptance' WHERE id = ?").run(fixture.commissionId);
+  const calls: Array<{ file: string; args: string[] }> = [];
+  const runner = async (file: string, args: string[]): Promise<string> => {
+    calls.push({ file, args });
+    if (file !== "svn") throw new Error(`unexpected ${file}`);
+    if (args[0] === "status") return `<?xml version="1.0"?><status><target path="."><entry path="change.txt"><wc-status item="modified"/></entry><entry path=".memory/note.md"><wc-status item="unversioned"/></entry></target></status>`;
+    if (args[0] === "info") return "10\n";
+    if (args[0] === "commit") return "Committed revision 11.\n";
+    throw new Error(`unexpected svn ${args.join(" ")}`);
+  };
+  const worker = registerDeliveryRoutes(server, database, undefined, runner);
+  try {
+    const preview = await server.inject({ method: "POST", url: `/api/tasks/${fixture.taskId}/delivery-preview`, payload: { method: "vcs_commit", commitMessage: "deliver change" } });
+    assert.equal(preview.statusCode, 200);
+    const queued = await server.inject({ method: "POST", url: `/api/tasks/${fixture.taskId}/deliver`, payload: { method: "vcs_commit", commitMessage: "deliver change", previewFingerprint: preview.json().fingerprint } });
+    await worker.wake();
+    const delivery = (await server.inject({ method: "GET", url: `/api/deliveries/${queued.json().id as string}` })).json() as { status: string; result: { svnRevision: string } };
+    assert.equal(delivery.status, "succeeded");
+    assert.equal(delivery.result.svnRevision, "11");
+    const commit = calls.find(({ file, args }) => file === "svn" && args[0] === "commit");
+    assert.deepEqual(commit?.args, ["commit", "--non-interactive", "--no-auth-cache", "-m", "deliver change", "change.txt"]);
+  } finally { await server.close(); database.close(); await rm(project, { recursive: true, force: true }); await rm(databaseHome, { recursive: true, force: true }); }
+});
+
+test("GitHub PR delivery resumes after an uncertain create response without duplicating the PR", async () => {
+  const project = await mkdtemp(join(tmpdir(), "project-workshop-pr-delivery-"));
+  const databaseHome = await mkdtemp(join(tmpdir(), "project-workshop-pr-delivery-db-"));
+  const database = await openWorkshopDatabase(databaseHome);
+  const server = Fastify();
+  const fixture = seed(database, project, "git");
+  await mkdir(join(project, "src"));
+  const filePath = join(project, "src", "change.ts");
+  await writeFile(filePath, "export const value = 1;\n", "utf8");
+  await writeFile(join(project, "other.txt"), "original\n", "utf8");
+  await runFile("git", ["init", "-b", "main"], { cwd: project });
+  await runFile("git", ["config", "user.email", "test@example.invalid"], { cwd: project });
+  await runFile("git", ["config", "user.name", "Test"], { cwd: project });
+  await runFile("git", ["add", "."], { cwd: project });
+  await runFile("git", ["commit", "-m", "base"], { cwd: project });
+  await writeFile(filePath, "export const value = 2;\n", "utf8");
+  const hash = createHash("sha256").update(await readFile(filePath)).digest("hex");
+  database.prepare("INSERT INTO evidence (id, task_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, '*', 'diff', 'passed', 'attributed', ?, ?)")
+    .run(randomUUID(), fixture.taskId, JSON.stringify({ changes: [{ path: "src/change.ts", changeType: "modified", hash, baselineHash: null, safe: true }] }), new Date().toISOString());
+  database.prepare("UPDATE commissions SET status = 'awaiting_acceptance' WHERE id = ?").run(fixture.commissionId);
+  let remoteHead: string | null = null;
+  let prQueries = 0;
+  let prCreates = 0;
+  const runner = async (file: string, args: string[], cwd: string): Promise<string> => {
+    if (file === "gh" && args[0] === "auth") return "";
+    if (file === "gh" && args[0] === "repo") return JSON.stringify({ defaultBranchRef: { name: "main" } });
+    if (file === "gh" && args[0] === "pr" && args[1] === "list") {
+      prQueries += 1;
+      return prQueries === 1 ? "[]" : JSON.stringify([{ url: "https://github.com/owner/repo/pull/7", number: 7 }]);
+    }
+    if (file === "gh" && args[0] === "pr" && args[1] === "create") { prCreates += 1; throw new Error("response lost after PR creation"); }
+    if (file === "git" && args[0] === "remote" && args.length === 1) return "origin\n";
+    if (file === "git" && args[0] === "remote" && args[1] === "get-url") return "git@github.com:owner/repo.git\n";
+    if (file === "git" && args[0] === "ls-remote") return remoteHead ? `${remoteHead}\trefs/heads/openworkshop/test\n` : "";
+    if (file === "git" && args[0] === "push") { remoteHead = (await runFile("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim(); return ""; }
+    return (await runFile(file, args, { cwd })).stdout;
+  };
+  const worker = registerDeliveryRoutes(server, database, undefined, runner);
+  try {
+    const request = { method: "github_pr", commitMessage: "deliver change", remote: "origin", sourceBranch: "openworkshop/test", targetBranch: "main", prTitle: "Deliver change", prBody: "Details", draft: true };
+    const preview = await server.inject({ method: "POST", url: `/api/tasks/${fixture.taskId}/delivery-preview`, payload: request });
+    assert.equal(preview.statusCode, 200);
+    await writeFile(join(project, "other.txt"), "peripheral change\n", "utf8");
+    const queued = await server.inject({ method: "POST", url: `/api/tasks/${fixture.taskId}/deliver`, payload: { ...request, previewFingerprint: preview.json().fingerprint } });
+    await worker.wake();
+    const delivery = (await server.inject({ method: "GET", url: `/api/deliveries/${queued.json().id as string}` })).json() as { status: string; result: { prUrl: string; sourceBranch: string; draft: boolean } };
+    assert.equal(delivery.status, "succeeded");
+    assert.equal(delivery.result.prUrl, "https://github.com/owner/repo/pull/7");
+    assert.equal(delivery.result.sourceBranch, "openworkshop/test");
+    assert.equal(delivery.result.draft, true);
+    assert.equal(prCreates, 1);
+    assert.equal(prQueries, 2);
+    assert.equal((await runFile("git", ["branch", "--show-current"], { cwd: project })).stdout.trim(), "main");
+    assert.equal((await runFile("git", ["show", "openworkshop/test:src/change.ts"], { cwd: project })).stdout, "export const value = 2;\n");
+    assert.equal((await readFile(filePath, "utf8")).replaceAll("\r\n", "\n"), "export const value = 1;\n");
+    assert.equal(await readFile(join(project, "other.txt"), "utf8"), "peripheral change\n");
   } finally { await server.close(); database.close(); await rm(project, { recursive: true, force: true }); await rm(databaseHome, { recursive: true, force: true }); }
 });
 
@@ -89,10 +190,11 @@ test("Git recovery accepts a Commit that was created before the command reported
   const fixture = seed(database, project, "git");
   const filePath = join(project, "change.txt");
   await writeFile(filePath, "before\n", "utf8");
+  await writeFile(join(project, "other.txt"), "original\n", "utf8");
   await runFile("git", ["init"], { cwd: project });
   await runFile("git", ["config", "user.email", "test@example.invalid"], { cwd: project });
   await runFile("git", ["config", "user.name", "Test"], { cwd: project });
-  await runFile("git", ["add", "change.txt"], { cwd: project });
+  await runFile("git", ["add", "."], { cwd: project });
   await runFile("git", ["commit", "-m", "base"], { cwd: project });
   await writeFile(filePath, "after\n", "utf8");
   const hash = createHash("sha256").update(await readFile(filePath)).digest("hex");
@@ -132,8 +234,9 @@ test("delivery capabilities fail closed and reject a stale Git preview", async (
   database.prepare("UPDATE commissions SET status = 'awaiting_acceptance' WHERE id = ?").run(fixture.commissionId);
   try {
     const unavailable = await worker.acceptanceDetails(fixture.taskId) as { deliveryCapabilities: { vcs_commit: { available: boolean; reason: string } } };
-    assert.equal(unavailable.deliveryCapabilities.vcs_commit.available, false);
-    assert.match(unavailable.deliveryCapabilities.vcs_commit.reason, /没有可归属/);
+    assert.equal(unavailable.deliveryCapabilities.vcs_commit.available, true);
+    assert.equal(unavailable.deliveryCapabilities.vcs_commit.reason, null);
+    assert.equal((await server.inject({ method: "POST", url: `/api/tasks/${fixture.taskId}/delivery-preview`, payload: { method: "vcs_commit" } })).statusCode, 409);
     await writeFile(filePath, "after\n", "utf8");
     const hash = createHash("sha256").update(await readFile(filePath)).digest("hex");
     database.prepare("INSERT INTO evidence (id, task_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, '*', 'diff', 'passed', 'attributed', ?, ?)")
@@ -262,7 +365,7 @@ test("Git recovery rejects a same-message commit whose content drifted from the 
   await runFile("git", ["init"], { cwd: project });
   await runFile("git", ["config", "user.email", "test@example.invalid"], { cwd: project });
   await runFile("git", ["config", "user.name", "Test"], { cwd: project });
-  await runFile("git", ["add", "change.txt"], { cwd: project });
+  await runFile("git", ["add", "."], { cwd: project });
   await runFile("git", ["commit", "-m", "base"], { cwd: project });
   await writeFile(filePath, "after\n", "utf8");
   const hash = createHash("sha256").update(await readFile(filePath)).digest("hex");

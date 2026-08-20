@@ -214,6 +214,7 @@ workshop task delivery-preview <main-task-id> --data-file preview.json --output 
 workshop task deliver <main-task-id> --data-file delivery.json --output json
 workshop delivery get <delivery-id> --output json
 workshop delivery retry <delivery-id> --output json
+workshop delivery reconcile <delivery-id> --data-file reconcile.json --output json
 workshop delivery cancel <delivery-id> --output json
 
 workshop document list <project-id> \
@@ -233,7 +234,7 @@ Run `task delivery-preview` first, then copy its top-level `fingerprint` into a 
 {"method":"document","previewFingerprint":"<fingerprint-from-preview-output>"}
 ```
 
-Use `vcs_commit` or `github_pr` with the optional commit, remote, branch, or PR fields supported by that method in both files. `task deliver` returns the Delivery ID and current state immediately; poll with `delivery get` instead of waiting for the background worker. The old parameterless `task accept` command is intentionally unavailable.
+Use `vcs_commit` or `github_pr` with the optional commit, remote, branch, or PR fields supported by that method in both files. Repository delivery commits only paths attributable to the current commission and preserves unrelated, non-overlapping workspace changes; conflicting changes on a commission-owned path fail delivery. `task deliver` returns the Delivery ID and current state immediately; poll with `delivery get` instead of waiting for the background worker. For `waiting_human`, use `delivery reconcile` to record a verified external result or confirm that no external side effect occurred before retrying. The old parameterless `task accept` command is intentionally unavailable.
 
 Codex and other Agents can bypass Workshop's requirements clarification and Planning Agent by directly importing a requirement and task plan that the user has already approved:
 

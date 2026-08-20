@@ -108,7 +108,7 @@ function buttonByText(node: ReactNode, text: string): ReactElement<ButtonProps> 
   return button;
 }
 
-function controlTree(options: { acceptance?: Acceptance; form?: typeof EMPTY_DELIVERY_FORM; preview?: DeliveryPreview | null; onPreview?: () => void; onDeliver?: () => void; onRetry?: () => void; onCancel?: () => void }): ReactElement {
+function controlTree(options: { acceptance?: Acceptance; form?: typeof EMPTY_DELIVERY_FORM; preview?: DeliveryPreview | null; onPreview?: () => void; onDeliver?: () => void; onRetry?: () => void; onReconcileRetry?: () => void; onReconcileComplete?: () => void; onCancel?: () => void }): ReactElement {
   return DeliveryControls({
     acceptance: options.acceptance ?? acceptance(),
     preview: options.preview ?? null,
@@ -117,7 +117,8 @@ function controlTree(options: { acceptance?: Acceptance; form?: typeof EMPTY_DEL
     onPreview: options.onPreview ?? (() => undefined),
     onDeliver: options.onDeliver ?? (() => undefined),
     onRetry: options.onRetry ?? (() => undefined),
-    onReconcile: () => undefined,
+    onReconcileRetry: options.onReconcileRetry ?? (() => undefined),
+    onReconcileComplete: options.onReconcileComplete ?? (() => undefined),
     onCancel: options.onCancel ?? (() => undefined)
   });
 }
@@ -153,20 +154,29 @@ test("keeps delivery writes read-only after success and enforces cancellation bo
   assert.deepEqual(deliveryWriteState("awaiting_acceptance", "failed", true), { readOnly: false, canEdit: false, cancellable: false });
 });
 
-test("renders capability reasons and blocks unsafe repository preview actions", () => {
-  const html = renderToStaticMarkup(controlTree({
-    acceptance: acceptance({ deliveryCapabilities: capabilities({ vcs_commit: { available: false, reason: "存在未归属改动" }, github_pr: { available: false, reason: "需要先登录 gh" }, unownedPaths: ["notes.txt"] }) }),
+test("keeps VCS preview available while excluding unrelated workspace changes", () => {
+  const tree = controlTree({
+    acceptance: acceptance({ deliveryCapabilities: capabilities({ unownedPaths: ["notes.txt"] }) }),
     form: { ...EMPTY_DELIVERY_FORM, method: "vcs_commit" }
-  }));
-  assert.match(html, /提交并交付/);
-  assert.match(html, /存在未归属改动/);
-  assert.match(html, /需要先登录 gh/);
-  assert.match(html, /未归属：notes.txt/);
+  });
+  const html = renderToStaticMarkup(tree);
+  assert.equal(buttonByText(tree, "生成交付预览").props.disabled, false);
+  assert.match(html, /以下额外修改不会纳入本次交付/);
+  assert.match(html, /notes.txt/);
+  assert.doesNotMatch(html, /delivery-safety-alert/);
+});
+
+test("blocks VCS preview when task-owned content has drifted", () => {
+  const tree = controlTree({
+    acceptance: acceptance({ deliveryCapabilities: capabilities({ vcs_commit: { available: false, reason: "委托变更内容已漂移" }, driftedPaths: ["src/change.ts"] }) }),
+    form: { ...EMPTY_DELIVERY_FORM, method: "vcs_commit" }
+  });
+  const html = renderToStaticMarkup(tree);
+  assert.equal(buttonByText(tree, "生成交付预览").props.disabled, true);
+  assert.match(html, /委托变更内容已漂移/);
+  assert.match(html, /内容漂移：src\/change\.ts/);
   assert.match(html, /生成交付预览/);
-  assert.match(html, /disabled/);
-  assert.match(html, /delivery-method-option/);
   assert.match(html, /delivery-safety-alert/);
-  assert.ok(html.indexOf("生成交付预览") < html.indexOf("未归属：notes.txt"));
 });
 
 test("explains why delivery remains unavailable before final coordination", () => {
@@ -237,6 +247,20 @@ test("exposes retry and cancellation buttons only at their persisted boundaries"
   assert.equal(cancelCalls, 2);
   const runningHtml = renderToStaticMarkup(controlTree({ acceptance: acceptance({ currentDelivery: delivery({ status: "running", externalEffectStarted: true }) }) }));
   assert.doesNotMatch(runningHtml, /取消/);
+});
+
+test("offers both human reconciliation outcomes for an unknown external result", () => {
+  let retryCalls = 0;
+  let completeCalls = 0;
+  const tree = controlTree({
+    acceptance: acceptance({ currentDelivery: delivery({ method: "github_pr", status: "waiting_human", externalEffectStarted: true }) }),
+    onReconcileRetry: () => { retryCalls += 1; },
+    onReconcileComplete: () => { completeCalls += 1; }
+  });
+  buttonByText(tree, "确认外部交付已完成").props.onClick?.();
+  buttonByText(tree, "确认无外部副作用并重试").props.onClick?.();
+  assert.equal(completeCalls, 1);
+  assert.equal(retryCalls, 1);
 });
 
 test("renders succeeded delivery as read-only result with no write controls", () => {

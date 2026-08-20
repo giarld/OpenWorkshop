@@ -62,16 +62,17 @@ export type DeliveryControlsProps = {
   onPreview(): void;
   onDeliver(): void;
   onRetry(): void;
-  onReconcile(): void;
+  onReconcileRetry(): void;
+  onReconcileComplete(): void;
   onCancel(): void;
 };
 
-export function DeliveryControls({ acceptance, preview, form, onFormChange, onPreview, onDeliver, onRetry, onReconcile, onCancel }: DeliveryControlsProps): ReactElement {
+export function DeliveryControls({ acceptance, preview, form, onFormChange, onPreview, onDeliver, onRetry, onReconcileRetry, onReconcileComplete, onCancel }: DeliveryControlsProps): ReactElement {
   const current = acceptance.currentDelivery;
   const capabilities = acceptance.deliveryCapabilities;
   const state = deliveryWriteState(acceptance.commissionStatus, current?.status ?? null, Boolean(current?.externalEffectStarted));
   const capability = capabilities[form.method];
-  const attributionBlocked = form.method !== "document" && Boolean(capabilities.unownedPaths.length || capabilities.driftedPaths.length);
+  const attributionBlocked = form.method !== "document" && capabilities.driftedPaths.length > 0;
   const previewMatchesMethod = Boolean(preview && preview.method === form.method);
   const previewReady = Boolean(preview && previewMatchesMethod && state.canEdit && capability.available && !attributionBlocked);
   const failure = current?.attempts.find((attempt) => attempt.status === "failed" || attempt.status === "waiting_human");
@@ -114,21 +115,26 @@ export function DeliveryControls({ acceptance, preview, form, onFormChange, onPr
                     previewReady ? "确认并交付" : preview ? "重新生成预览" : "生成交付预览"
                   ),
                   current?.status === "failed" ? createElement("button", { type: "button", className: "secondary", onClick: onRetry }, "重试") : null,
-                  current?.status === "waiting_human" ? createElement("button", { type: "button", className: "secondary", onClick: onReconcile }, "确认无外部副作用并重试") : null,
+                  current?.status === "waiting_human" ? createElement(Fragment, null,
+                    createElement("button", { type: "button", className: "secondary", onClick: onReconcileComplete }, "确认外部交付已完成"),
+                    createElement("button", { type: "button", className: "secondary", onClick: onReconcileRetry }, "确认无外部副作用并重试")
+                  ) : null,
                   state.cancellable ? createElement("button", { type: "button", className: "secondary", onClick: onCancel }, "取消") : null
                 ),
-                (capabilities.unownedPaths.length > 0 || capabilities.driftedPaths.length > 0)
+                capabilities.driftedPaths.length > 0
                   ? createElement(
                       "div",
                       { className: "delivery-safety-alert", role: "alert" },
-                      createElement("p", null, "仓库交付已阻止，存在不可安全归属的改动："),
+                      createElement("p", null, "仓库交付已阻止，本次任务文件与额外修改发生冲突："),
                       createElement(
                         "ul",
                         null,
-                        ...capabilities.unownedPaths.map((path) => createElement("li", { key: `unowned-${path}` }, `未归属：${path}`)),
                         ...capabilities.driftedPaths.map((path) => createElement("li", { key: `drifted-${path}` }, `内容漂移：${path}`))
                       )
                     )
+                  : null,
+                capabilities.unownedPaths.length > 0 && form.method !== "document"
+                  ? createElement("p", { role: "status" }, `以下额外修改不会纳入本次交付，完成后保持原状：${capabilities.unownedPaths.join("、")}`)
                   : null,
                 preview
                   ? createElement(DeliveryPreviewSummary, { preview, stale: !previewMatchesMethod })

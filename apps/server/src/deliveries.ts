@@ -371,9 +371,7 @@ export class DeliveryWorker {
     try {
       const attribution = await commissionAttributionSnapshot(this.database, context.commissionId, context.projectRoot, context.vcsType, this.runner);
       const files = attribution.ownedPaths;
-      const attributionReason = attribution.unownedPaths.length ? `存在无法归属改动：${attribution.unownedPaths.join(", ")}`
-        : attribution.driftedPaths.length ? `委托变更内容已漂移：${attribution.driftedPaths.join(", ")}`
-          : files.length ? null : "当前委托没有可归属的变更";
+      const attributionReason = attribution.driftedPaths.length ? `委托变更内容已漂移：${attribution.driftedPaths.join(", ")}` : null;
       const busyReason = hasActiveWriteRun(this.database, context.projectId) ? "项目存在活动写 Run" : null;
       if (context.vcsType === "svn") {
         const reason = busyReason ?? attributionReason;
@@ -423,6 +421,7 @@ export class DeliveryWorker {
       return { preview: { ...core, fingerprint: fingerprint(core) }, capabilities };
     }
     const attribution = await commissionAttributionSnapshot(this.database, context.commissionId, context.projectRoot, context.vcsType, this.runner);
+    if (attribution.driftedPaths.length) throw conflict(`Commission changes conflict with additional workspace changes: ${attribution.driftedPaths.join(", ")}`);
     const owned = new Set(attribution.ownedPaths);
     const files = attribution.snapshot.changes.filter(({ path }) => owned.has(path));
     if (!files.length) throw conflict("Current commission has no attributable repository changes");
@@ -441,7 +440,8 @@ export class DeliveryWorker {
       validBranch(targetBranch, "targetBranch");
     }
     const normalized = request.method === "github_pr" ? { ...request, remote: selectedRemote, sourceBranch, targetBranch } : request;
-    const core = { version: 1, taskId: context.taskId, commissionId: context.commissionId, projectId: context.projectId, method: request.method, request: normalized, files, snapshot: attribution.snapshot, baseline: { branch, head, svnRevision }, remote: selectedRemote, repository, sourceBranch, targetBranch, draft: normalized.draft } satisfies Omit<DeliveryPreview, "fingerprint">;
+    const snapshot = { ...attribution.snapshot, changes: files };
+    const core = { version: 1, taskId: context.taskId, commissionId: context.commissionId, projectId: context.projectId, method: request.method, request: normalized, files, snapshot, baseline: { branch, head, svnRevision }, remote: selectedRemote, repository, sourceBranch, targetBranch, draft: normalized.draft } satisfies Omit<DeliveryPreview, "fingerprint">;
     return { preview: { ...core, fingerprint: fingerprint(core) }, capabilities };
   }
 
@@ -520,12 +520,13 @@ export class DeliveryWorker {
     }
     const attribution = await commissionAttributionSnapshot(this.database, context.commissionId, context.projectRoot, context.vcsType, this.runner);
     const expected = new Map(preview.files.map((change) => [change.path, change]));
-    const actual = new Map(attribution.snapshot.changes.map((change) => [change.path, change]));
+    const owned = new Set(attribution.ownedPaths);
+    const actual = new Map(attribution.snapshot.changes.filter(({ path }) => owned.has(path)).map((change) => [change.path, change]));
     const matches = expected.size === actual.size && [...expected].every(([path, change]) => {
       const current = actual.get(path);
       return current?.changeType === change.changeType && current.hash === change.hash;
     });
-    if (!attribution.unownedPaths.length && !attribution.driftedPaths.length && matches) return;
+    if (!attribution.driftedPaths.length && matches) return;
     throw new DeliveryFailure(
       recovering ? "delivery_state_unknown" : "preview_expired",
       recovering ? "恢复前无法确认工作区仍对应原交付预览，请人工核对外部结果。" : "交付预览已失效，请重新生成预览并确认。",
@@ -538,59 +539,68 @@ export class DeliveryWorker {
     const repository = requiredString(preview.repository, "repository");
     const sourceBranch = validBranch(preview.sourceBranch, "sourceBranch");
     const targetBranch = validBranch(preview.targetBranch, "targetBranch");
-    let result = parseObject(active.delivery.result_json);
+    const originalBranch = requiredString(preview.baseline.branch, "baseline.branch");
+    try {
+      let result = parseObject(active.delivery.result_json);
 
-    this.setStep(active, "branch", "running");
-    const currentBranch = (await this.runner("git", ["branch", "--show-current"], context.projectRoot)).trim();
-    if (currentBranch !== sourceBranch) {
-      const local = (await this.runner("git", ["branch", "--list", sourceBranch], context.projectRoot)).trim();
-      if (local) {
-        const branchHead = (await this.runner("git", ["rev-parse", sourceBranch], context.projectRoot)).trim();
-        const knownCommit = optionalStoredString(result.commitHash);
-        if (branchHead !== preview.baseline.head && branchHead !== knownCommit) throw new DeliveryFailure("source_branch_unknown", "源分支已存在且指向未知 Commit，请人工核对。", true);
-        await this.runner("git", ["switch", sourceBranch], context.projectRoot);
-      } else {
-        const remoteHead = await remoteBranchHead(this.runner, context.projectRoot, remote, sourceBranch).catch(() => null);
-        if (remoteHead) throw new DeliveryFailure("source_branch_exists_remote", "远程源分支已存在但本地状态未知，请人工核对。", true);
-        await this.runner("git", ["switch", "-c", sourceBranch], context.projectRoot);
+      this.setStep(active, "branch", "running");
+      const currentBranch = (await this.runner("git", ["branch", "--show-current"], context.projectRoot)).trim();
+      if (currentBranch !== sourceBranch) {
+        const local = (await this.runner("git", ["branch", "--list", sourceBranch], context.projectRoot)).trim();
+        if (local) {
+          const branchHead = (await this.runner("git", ["rev-parse", sourceBranch], context.projectRoot)).trim();
+          const knownCommit = optionalStoredString(result.commitHash);
+          if (branchHead !== preview.baseline.head && branchHead !== knownCommit) throw new DeliveryFailure("source_branch_unknown", "源分支已存在且指向未知 Commit，请人工核对。", true);
+          await this.runner("git", ["switch", sourceBranch], context.projectRoot);
+        } else {
+          const remoteHead = await remoteBranchHead(this.runner, context.projectRoot, remote, sourceBranch).catch(() => null);
+          if (remoteHead) throw new DeliveryFailure("source_branch_exists_remote", "远程源分支已存在但本地状态未知，请人工核对。", true);
+          await this.runner("git", ["switch", "-c", sourceBranch], context.projectRoot);
+        }
       }
-    }
-    this.setStep(active, "branch", "succeeded", { sourceBranch, originalBranch: preview.baseline.branch });
+      this.setStep(active, "branch", "succeeded", { sourceBranch, originalBranch });
 
-    result = await this.gitCommit(active, context, request, preview);
-    const commitHash = requiredString(result.commitHash, "commitHash");
+      result = await this.gitCommit(active, context, request, preview);
+      const commitHash = requiredString(result.commitHash, "commitHash");
 
-    this.setStep(active, "push", "running");
-    let remoteHead: string | null;
-    try { remoteHead = await remoteBranchHead(this.runner, context.projectRoot, remote, sourceBranch); }
-    catch { throw new DeliveryFailure("push_status_unknown", "无法确认远程分支状态，请人工核对网络与 Remote。", true); }
-    if (remoteHead && remoteHead !== commitHash) throw new DeliveryFailure("remote_branch_conflict", "远程源分支指向其他 Commit，请人工核对。", true);
-    if (!remoteHead) {
-      try { await this.runner("git", ["push", "--set-upstream", remote, sourceBranch], context.projectRoot); }
-      catch {
+      this.setStep(active, "push", "running");
+      let remoteHead: string | null;
+      try { remoteHead = await remoteBranchHead(this.runner, context.projectRoot, remote, sourceBranch); }
+      catch { throw new DeliveryFailure("push_status_unknown", "无法确认远程分支状态，请人工核对网络与 Remote。", true); }
+      if (remoteHead && remoteHead !== commitHash) throw new DeliveryFailure("remote_branch_conflict", "远程源分支指向其他 Commit，请人工核对。", true);
+      if (!remoteHead) {
+        try { await this.runner("git", ["push", "--set-upstream", remote, sourceBranch], context.projectRoot); }
+        catch {
+          remoteHead = await remoteBranchHead(this.runner, context.projectRoot, remote, sourceBranch).catch(() => null);
+          if (remoteHead !== commitHash) throw new DeliveryFailure("git_push_failed", "Git Push 失败，请检查网络、Remote 与本机凭据后重试。");
+        }
         remoteHead = await remoteBranchHead(this.runner, context.projectRoot, remote, sourceBranch).catch(() => null);
-        if (remoteHead !== commitHash) throw new DeliveryFailure("git_push_failed", "Git Push 失败，请检查网络、Remote 与本机凭据后重试。");
+        if (remoteHead !== commitHash) throw new DeliveryFailure("push_status_unknown", "Push 后无法确认远程分支 Commit，请人工核对。", true);
       }
-      remoteHead = await remoteBranchHead(this.runner, context.projectRoot, remote, sourceBranch).catch(() => null);
-      if (remoteHead !== commitHash) throw new DeliveryFailure("push_status_unknown", "Push 后无法确认远程分支 Commit，请人工核对。", true);
-    }
-    this.setStep(active, "push", "succeeded", { remote, sourceBranch, commitHash });
+      this.setStep(active, "push", "succeeded", { remote, sourceBranch, commitHash });
 
-    this.setStep(active, "pr", "running");
-    let pr = await existingPullRequest(this.runner, context.projectRoot, repository, sourceBranch).catch(() => undefined);
-    if (!pr) {
-      const args = ["pr", "create", "--repo", repository, "--head", sourceBranch, "--base", targetBranch, "--title", request.prTitle!, "--body", request.prBody!];
-      if (request.draft) args.push("--draft");
-      try {
-        const output = await this.runner("gh", args, context.projectRoot);
-        const url = output.match(/https:\/\/github\.com\/[^\s]+/i)?.[0];
-        if (url) pr = { url, number: null };
-      } catch { /* Query below prevents duplicate PR creation after an uncertain response. */ }
-      pr ??= await existingPullRequest(this.runner, context.projectRoot, repository, sourceBranch).catch(() => undefined);
-      if (!pr) throw new DeliveryFailure("github_pr_failed", "GitHub PR 创建失败；已确认没有可识别的现有 PR，请检查 gh 后重试。");
+      this.setStep(active, "pr", "running");
+      let pr = await existingPullRequest(this.runner, context.projectRoot, repository, sourceBranch).catch(() => undefined);
+      if (!pr) {
+        const args = ["pr", "create", "--repo", repository, "--head", sourceBranch, "--base", targetBranch, "--title", request.prTitle!, "--body", request.prBody!];
+        if (request.draft) args.push("--draft");
+        try {
+          const output = await this.runner("gh", args, context.projectRoot);
+          const url = output.match(/https:\/\/github\.com\/[^\s]+/i)?.[0];
+          if (url) pr = { url, number: null };
+        } catch { /* Query below prevents duplicate PR creation after an uncertain response. */ }
+        pr ??= await existingPullRequest(this.runner, context.projectRoot, repository, sourceBranch).catch(() => undefined);
+        if (!pr) throw new DeliveryFailure("github_pr_failed", "GitHub PR 创建失败；已确认没有可识别的现有 PR，请检查 gh 后重试。");
+      }
+      this.setStep(active, "pr", "succeeded", { prUrl: pr.url, prNumber: pr.number });
+      return { ...parseObject(deliveryById(this.database, active.delivery.id).result_json), method: request.method, commitHash, remote, sourceBranch, targetBranch, draft: request.draft, prUrl: pr.url, prNumber: pr.number };
+    } finally {
+      const currentBranch = (await this.runner("git", ["branch", "--show-current"], context.projectRoot).catch(() => "")).trim();
+      if (currentBranch && currentBranch !== originalBranch) {
+        try { await this.runner("git", ["switch", originalBranch], context.projectRoot); }
+        catch { throw new DeliveryFailure("workspace_restore_failed", "PR 交付后无法恢复原分支；其他工作区修改仍保留，请人工核对。", true); }
+      }
     }
-    this.setStep(active, "pr", "succeeded", { prUrl: pr.url, prNumber: pr.number });
-    return { ...parseObject(deliveryById(this.database, active.delivery.id).result_json), method: request.method, commitHash, remote, sourceBranch, targetBranch, draft: request.draft, prUrl: pr.url, prNumber: pr.number };
   }
 
   private setStep(active: ActiveDelivery, step: string, status: StepStatus, resultPatch: JsonObject = {}): void {
@@ -966,7 +976,7 @@ async function recoveredCommitMatchesPreview(database: DatabaseSync, context: De
       .split("\0").filter(Boolean).sort();
     if (expectedPaths.length !== committedPaths.length || expectedPaths.some((path, index) => path !== committedPaths[index])) return false;
     const attribution = await commissionAttributionSnapshot(database, context.commissionId, context.projectRoot, context.vcsType, runner);
-    if (attribution.unownedPaths.length || attribution.driftedPaths.length) return false;
+    if (attribution.driftedPaths.length) return false;
     for (const change of preview.files) if (await contentHash(resolve(context.projectRoot, change.path)) !== change.hash) return false;
     await runner("git", ["diff", "--quiet", commitHash, "--", ...expectedPaths], context.projectRoot);
     return true;

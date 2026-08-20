@@ -98,7 +98,7 @@ test("delivery CLI reports actionable data-file errors and keeps task accept dis
 
 test("delivery help, JSON output, and HTTP errors remain machine-readable", () => {
   const help = workflowHelp();
-  for (const command of ["task delivery-preview", "task deliver", "delivery get", "delivery retry", "delivery cancel"]) assert.equal(help.includes(command), true);
+  for (const command of ["task delivery-preview", "task deliver", "delivery get", "delivery retry", "delivery reconcile", "delivery cancel"]) assert.equal(help.includes(command), true);
   assert.match(help, /delivery-preview <main-task-id> --data-file preview\.json/);
   assert.match(help, /task deliver <main-task-id> --data-file delivery\.json/);
   assert.match(familyHelp("task"), /delivery-preview <id> --data-file <path>/);

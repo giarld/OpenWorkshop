@@ -153,10 +153,22 @@ export function DeliveryWorkspace({ projectId, tasks, section, hidden, onChanged
     try { await api(`/api/deliveries/${delivery.id}/retry`, { method: "POST" }); setMessage("已提交交付重试。"); await loadAcceptance(activeEntry.mainTask.id); }
     catch (error) { setMessage(`重试失败：${(error as Error).message}`); }
   }
-  async function reconcileDelivery() {
+  async function reconcileDeliveryRetry() {
     const delivery = acceptance?.currentDelivery;
     if (!delivery || !activeEntry || !window.confirm("请确认已人工核对：外部 Commit、Push、SVN Commit 或 PR 均未成功。确认后将允许重新执行。")) return;
     try { await api(`/api/deliveries/${delivery.id}/reconcile`, { method: "POST", body: JSON.stringify({ decision: "retry", confirmedNoExternalEffect: true }) }); setMessage("已提交人工核对后的交付重试。"); await loadAcceptance(activeEntry.mainTask.id); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "人工核对失败。"); }
+  }
+
+  async function reconcileDeliveryComplete() {
+    const delivery = acceptance?.currentDelivery;
+    if (!delivery || !activeEntry) return;
+    const vcsType = acceptance.deliveryCapabilities.vcsType;
+    const label = delivery.method === "github_pr" ? "GitHub PR URL" : vcsType === "svn" ? "SVN Revision" : "Git Commit Hash";
+    const value = window.prompt(`请输入已人工核对成功的 ${label}：`)?.trim();
+    if (!value) return;
+    const result = delivery.method === "github_pr" ? { prUrl: value } : vcsType === "svn" ? { svnRevision: value } : { commitHash: value };
+    try { await api(`/api/deliveries/${delivery.id}/reconcile`, { method: "POST", body: JSON.stringify({ decision: "complete", result }) }); setMessage("已记录人工核对结果，交付完成。"); onChanged(); await loadAcceptance(activeEntry.mainTask.id); }
     catch (error) { setMessage(error instanceof Error ? error.message : "人工核对失败。"); }
   }
 
@@ -219,7 +231,7 @@ export function DeliveryWorkspace({ projectId, tasks, section, hidden, onChanged
         {selectedDocument ? <><div className="document-actions"><span>v{selectedDocument.currentVersion.version_no} · {selectedDocument.currentVersion.locked ? "已锁定" : "可编辑"}</span><a className="button-link" href={`/api/documents/${selectedDocument.id}/export.md`}>导出 Markdown</a><button className="secondary compact" disabled={Boolean(selectedDocument.currentVersion.locked)} onClick={() => void lockDocument()}>锁定版本</button><button className="compact" disabled={content === selectedDocument.currentVersion.content_markdown} onClick={() => void saveDocument()}>保存新版本</button></div><textarea className="document-editor" value={content} onChange={(event) => setContent(event.target.value)} aria-label="Markdown 文档内容" /><p>版本历史：{selectedDocument.versions.map((version) => `v${version.version_no}${version.locked ? "🔒" : ""}`).join("、")}</p></> : <p>该需求暂无交付文档。</p>}
         </section>
         <section className="delivery-panel"><header><div><p className="eyebrow">Acceptance</p><h2>最终验收</h2></div>{acceptance && <span className="delivery-status">{STATUS_LABELS[acceptance.commissionStatus] ?? acceptance.commissionStatus}</span>}</header>
-        {acceptance ? <><dl className="acceptance-summary"><div><dt>任务</dt><dd>{acceptance.tasks.length}</dd></div><div><dt>Run</dt><dd>{acceptance.runs.length}</dd></div><div><dt>证据</dt><dd>{acceptance.evidence.length}</dd></div></dl>{acceptance.deliveryDocument ? <section className="acceptance-report"><header><strong>交付报告 v{acceptance.deliveryDocument.versionNo}</strong><a href={`/api/documents/${acceptance.deliveryDocument.id}/export.md`}>导出 Markdown</a></header><pre>{acceptance.deliveryDocument.contentMarkdown}</pre></section> : <p>交付报告尚未生成。</p>}<DeliveryControls acceptance={acceptance} preview={deliveryPreview} form={deliveryForm} onFormChange={updateDeliveryForm} onPreview={() => void previewDelivery()} onDeliver={() => void deliver()} onRetry={() => void retryDelivery()} onReconcile={() => void reconcileDelivery()} onCancel={() => void cancelDelivery()} /><div className="acceptance-actions"><RejectForm disabled={acceptance.commissionStatus !== "awaiting_acceptance" || Boolean(acceptance.task.archived_at) || Boolean(acceptance.currentDelivery && ["queued", "preparing", "running"].includes(acceptance.currentDelivery.status))} onReject={(reason) => decide("reject", reason)} /></div></> : acceptanceLoading ? <p>正在加载任务交付信息…</p> : acceptanceError ? <div className="delivery-load-error" role="alert"><p>任务交付信息加载失败：{acceptanceError}</p><button className="secondary compact" onClick={() => void loadAcceptance(activeEntry.mainTask.id)}>重新加载</button></div> : <p>暂无任务交付信息。</p>}
+        {acceptance ? <><dl className="acceptance-summary"><div><dt>任务</dt><dd>{acceptance.tasks.length}</dd></div><div><dt>Run</dt><dd>{acceptance.runs.length}</dd></div><div><dt>证据</dt><dd>{acceptance.evidence.length}</dd></div></dl>{acceptance.deliveryDocument ? <section className="acceptance-report"><header><strong>交付报告 v{acceptance.deliveryDocument.versionNo}</strong><a href={`/api/documents/${acceptance.deliveryDocument.id}/export.md`}>导出 Markdown</a></header><pre>{acceptance.deliveryDocument.contentMarkdown}</pre></section> : <p>交付报告尚未生成。</p>}<DeliveryControls acceptance={acceptance} preview={deliveryPreview} form={deliveryForm} onFormChange={updateDeliveryForm} onPreview={() => void previewDelivery()} onDeliver={() => void deliver()} onRetry={() => void retryDelivery()} onReconcileRetry={() => void reconcileDeliveryRetry()} onReconcileComplete={() => void reconcileDeliveryComplete()} onCancel={() => void cancelDelivery()} /><div className="acceptance-actions"><RejectForm disabled={acceptance.commissionStatus !== "awaiting_acceptance" || Boolean(acceptance.task.archived_at) || Boolean(acceptance.currentDelivery && ["queued", "preparing", "running"].includes(acceptance.currentDelivery.status))} onReject={(reason) => decide("reject", reason)} /></div></> : acceptanceLoading ? <p>正在加载任务交付信息…</p> : acceptanceError ? <div className="delivery-load-error" role="alert"><p>任务交付信息加载失败：{acceptanceError}</p><button className="secondary compact" onClick={() => void loadAcceptance(activeEntry.mainTask.id)}>重新加载</button></div> : <p>暂无任务交付信息。</p>}
         </section>
       </div>}
     </dialog>

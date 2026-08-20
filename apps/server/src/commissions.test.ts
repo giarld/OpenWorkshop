@@ -321,6 +321,35 @@ test("streams sanitized requirement progress before the final result", async () 
   }
 });
 
+test("reports a running clarification while the initiating response is pending", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-clarification-running-"));
+  const server = Fastify();
+  const database = await openWorkshopDatabase(home);
+  let release: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => { release = resolve; });
+  let enter: (() => void) | undefined;
+  const entered = new Promise<void>((resolve) => { enter = resolve; });
+  const analyzer: RequirementAnalyzer = async () => {
+    enter?.();
+    await started;
+    return { question: "Which platform?" };
+  };
+  try {
+    const projectId = seedProject(database);
+    registerCommissionRoutes(server, database, join(home, "attachments"), analyzer);
+    const commissionId = (await server.inject({ method: "POST", url: `/api/projects/${projectId}/commissions`, payload: { title: "Running", message: "Build it" } })).json().id;
+    const analysis = server.inject({ method: "POST", url: `/api/commissions/${commissionId}/analyze` });
+    await entered;
+    assert.equal((await server.inject({ method: "GET", url: `/api/commissions/${commissionId}` })).json().clarification_analysis_running, true);
+    release?.();
+    assert.equal((await analysis).statusCode, 200);
+    assert.equal((await server.inject({ method: "GET", url: `/api/commissions/${commissionId}` })).json().clarification_analysis_running, false);
+  } finally {
+    release?.();
+    await server.close(); database.close(); await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("preserves requirement analysis errors before and after streaming starts", async () => {
   const home = await mkdtemp(join(tmpdir(), "project-workshop-clarification-errors-"));
   const server = Fastify();

@@ -167,7 +167,7 @@ test("delivery JSON and active-attempt constraints are enforced", async () => {
 });
 
 test("SVN snapshots record exclusive-workspace deltas conservatively", async () => {
-  const home = await mkdtemp(join(tmpdir(), "project-workshop-svn-attribution-"));
+  const home = await mkdtemp(join(process.cwd(), ".project-workshop-svn-attribution-"));
   const repository = join(home, "repository"), workingCopy = join(home, "working-copy");
   try {
     await command("svnadmin", ["create", repository], { windowsHide: true });

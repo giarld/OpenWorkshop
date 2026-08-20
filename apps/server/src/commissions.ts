@@ -55,6 +55,7 @@ export type RequirementAnalyzer = (input: {
 
 export function registerCommissionRoutes(server: FastifyInstance, database: DatabaseSync, attachmentsRoot: string, analyze?: RequirementAnalyzer, plan?: TaskPlanner): void {
   registerAttachmentParsers(server);
+  const runningAnalyses = new Set<string>();
 
   server.get<{ Params: { id: string }; Querystring: { archived?: string } }>("/api/projects/:id/commissions", async (request) => {
     projectExists(database, request.params.id);
@@ -87,10 +88,10 @@ export function registerCommissionRoutes(server: FastifyInstance, database: Data
       database.exec("ROLLBACK");
       throw error;
     }
-    return reply.code(201).send(commissionDetails(database, id));
+    return reply.code(201).send(commissionDetails(database, id, runningAnalyses));
   });
 
-  server.get<{ Params: { id: string } }>("/api/commissions/:id", async (request) => commissionDetails(database, request.params.id));
+  server.get<{ Params: { id: string } }>("/api/commissions/:id", async (request) => commissionDetails(database, request.params.id, runningAnalyses));
 
   server.delete<{ Params: { id: string } }>("/api/commissions/:id", async (request, reply) => {
     await deleteClarifyingCommission(database, attachmentsRoot, request.params.id);
@@ -134,6 +135,8 @@ export function registerCommissionRoutes(server: FastifyInstance, database: Data
     assertNoPendingRequirement(database, commission.id);
     const messages = database.prepare("SELECT role, content FROM requirement_messages WHERE commission_id = ? ORDER BY created_at, rowid").all(commission.id) as Array<{ role: string; content: string }>;
     if (messages.at(-1)?.role === "agent") throw conflict("Reply to the Requirement Agent before continuing analysis");
+    if (runningAnalyses.has(commission.id)) throw conflict("Requirement analysis is already running");
+    runningAnalyses.add(commission.id);
     const streaming = request.headers.accept === "application/x-ndjson";
     let streamStarted = false;
     const write = (value: unknown) => {
@@ -198,6 +201,8 @@ export function registerCommissionRoutes(server: FastifyInstance, database: Data
         return reply;
       }
       throw error;
+    } finally {
+      runningAnalyses.delete(commission.id);
     }
   });
 
@@ -380,10 +385,11 @@ function limitedText(text: string): string {
   return encoded.length <= MAX_EXTRACTED_BYTES ? text : `${encoded.subarray(0, MAX_EXTRACTED_BYTES).toString("utf8")}\n[truncated]`;
 }
 
-function commissionDetails(database: DatabaseSync, id: string) {
+function commissionDetails(database: DatabaseSync, id: string, runningAnalyses?: ReadonlySet<string>) {
   const commission = commissionById(database, id);
   return {
     ...commission,
+    clarification_analysis_running: runningAnalyses?.has(id) ?? false,
     attachments: database.prepare("SELECT * FROM attachments WHERE commission_id = ? ORDER BY created_at, rowid").all(id),
     messages: database.prepare("SELECT * FROM requirement_messages WHERE commission_id = ? ORDER BY created_at, rowid").all(id),
     requirements: database.prepare("SELECT * FROM requirement_versions WHERE commission_id = ? ORDER BY version_no DESC").all(id)

@@ -5,7 +5,7 @@ import ReactMarkdown from "react-markdown";
 import { clarificationOptionLabel, clarificationOptions, clarificationStep, stageAfterAnalysis, type CommissionStage } from "./commission-flow";
 import { formatTokenCount } from "./task-run";
 
-type Commission = { id: string; title: string; status: string; summary: string | null; main_task_id: string | null; archived_at: string | null; archive_size_bytes: number | null; clarification_token_input: number; clarification_token_output: number; clarification_token_cached: number };
+type Commission = { id: string; title: string; status: string; summary: string | null; main_task_id: string | null; archived_at: string | null; archive_size_bytes: number | null; clarification_token_input: number; clarification_token_output: number; clarification_token_cached: number; clarification_analysis_running?: boolean };
 type Message = { id: string; role: "human" | "agent" | "system"; content: string; options_json: string | null; created_at: string };
 type Attachment = { id: string; original_name: string; size_bytes: number };
 type Requirement = { id: string; version_no: number; content_markdown: string; acceptance_json: string; status: string };
@@ -40,6 +40,11 @@ export function CommissionWorkspace({ projectId, section, hidden, onChanged, onS
   }, [dialogMode]);
   useEffect(() => { if (hidden) setDialogMode(null); }, [hidden]);
   useEffect(() => { if (dialogMode === "clarification" && timeline.current) timeline.current.scrollTop = timeline.current.scrollHeight; }, [dialogMode, selected?.id, selected?.messages.length, analyzing, analysisProgress.length]);
+  useEffect(() => {
+    if (dialogMode !== "clarification" || !selected?.clarification_analysis_running) return;
+    const timer = window.setInterval(() => void api<CommissionDetails>(`/api/commissions/${selected.id}`).then(setSelected, (error: Error) => setMessage(error.message)), 1000);
+    return () => window.clearInterval(timer);
+  }, [dialogMode, selected?.id, selected?.clarification_analysis_running]);
 
   async function loadCommissions(preferredId?: string) {
     try {
@@ -221,6 +226,7 @@ export function CommissionWorkspace({ projectId, section, hidden, onChanged, onS
 
   const currentRequirement = selected?.requirements[0];
   const nextClarification = selected ? clarificationStep(selected.status, selected.messages) : "complete";
+  const analysisRunning = analyzing || Boolean(selected?.clarification_analysis_running);
   const latestOptions = clarificationOptions(selected?.messages.at(-1)?.options_json);
   const requirementCommissions = commissions.filter((item) => isClarified(item.status));
 
@@ -261,12 +267,12 @@ export function CommissionWorkspace({ projectId, section, hidden, onChanged, onS
 
       {dialogMode === "clarification" && selected && <div className="clarification-body commission-dialog-body">
         <p className="clarification-token">Token: 输入 {formatTokenCount(selected.clarification_token_input)} · 输出 {formatTokenCount(selected.clarification_token_output)}</p>
-        <div className="commission-timeline" ref={timeline}>{selected.messages.length ? selected.messages.map((item) => <article key={item.id} className={`commission-message ${item.role}`}><strong>{item.role === "human" ? "你" : item.role === "agent" ? "需求分析 Agent" : "系统"}</strong><p>{item.content}</p></article>) : <p>尚无澄清消息。</p>}{analyzing && <article className="commission-message agent thinking-message" role="status" aria-live="polite"><strong>需求分析 Agent</strong><div className="analysis-progress">{analysisProgress.slice(0, -1).map((item, index) => <span key={`${index}:${item}`}>{item}</span>)}<span>{analysisProgress.at(-1) ?? "正在启动分析"}<span className="thinking-dots" aria-hidden="true"><i /><i /><i /></span></span></div></article>}</div>
+        <div className="commission-timeline" ref={timeline}>{selected.messages.length ? selected.messages.map((item) => <article key={item.id} className={`commission-message ${item.role}`}><strong>{item.role === "human" ? "你" : item.role === "agent" ? "需求分析 Agent" : "系统"}</strong><p>{item.content}</p></article>) : <p>尚无澄清消息。</p>}{analysisRunning && <article className="commission-message agent thinking-message" role="status" aria-live="polite"><strong>需求分析 Agent</strong><div className="analysis-progress">{analysisProgress.slice(0, -1).map((item, index) => <span key={`${index}:${item}`}>{item}</span>)}<span>{analysisProgress.at(-1) ?? "正在进行需求分析"}<span className="thinking-dots" aria-hidden="true"><i /><i /><i /></span></span></div></article>}</div>
         <div className="clarification-controls">
-          {nextClarification === "reply" && (latestOptions.length ? <form className="clarification-choice-form" onSubmit={sendChoice}>{latestOptions.map((option, index) => <label key={option}><input type="radio" name="choice" value={option} required disabled={busy} />{clarificationOptionLabel(option, index === 0)}</label>)}<label><input type="radio" name="choice" value="__custom__" required disabled={busy} />其他（自定义）</label><input name="custom" autoComplete="off" placeholder="输入自定义答案" disabled={busy} /><button disabled={busy}>{busy ? "分析中…" : "提交选择并继续分析"}</button></form> : <form className="commission-message-form" onSubmit={sendMessage}><input name="content" placeholder="回复需求分析 Agent" required disabled={busy} /><button disabled={busy}>{busy ? "分析中…" : "回复并继续分析"}</button></form>)}
-          <form className="commission-message-form" onSubmit={uploadAttachment}><input name="file" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,.txt,.md,.pdf,.docx" required disabled={busy} /><button className="secondary" disabled={busy}>上传附件</button></form>
+          {nextClarification === "reply" && (latestOptions.length ? <form className="clarification-choice-form" onSubmit={sendChoice}>{latestOptions.map((option, index) => <label key={option}><input type="radio" name="choice" value={option} required disabled={busy || analysisRunning} />{clarificationOptionLabel(option, index === 0)}</label>)}<label><input type="radio" name="choice" value="__custom__" required disabled={busy || analysisRunning} />其他（自定义）</label><input name="custom" autoComplete="off" placeholder="输入自定义答案" disabled={busy || analysisRunning} /><button disabled={busy || analysisRunning}>{analysisRunning ? "分析中…" : "提交选择并继续分析"}</button></form> : <form className="commission-message-form" onSubmit={sendMessage}><input name="content" placeholder="回复需求分析 Agent" required disabled={busy || analysisRunning} /><button disabled={busy || analysisRunning}>{analysisRunning ? "分析中…" : "回复并继续分析"}</button></form>)}
+          <form className="commission-message-form" onSubmit={uploadAttachment}><input name="file" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,.txt,.md,.pdf,.docx" required disabled={busy || analysisRunning} /><button className="secondary" disabled={busy || analysisRunning}>上传附件</button></form>
           {selected.attachments.length > 0 && <p className="attachment-summary">附件：{selected.attachments.map((item) => `${item.original_name} (${Math.ceil(item.size_bytes / 1024)} KB)`).join("、")}</p>}
-          {nextClarification === "analyze" && <button onClick={() => void analyze()} disabled={busy}>{busy ? "分析中…" : "运行需求分析"}</button>}
+          {nextClarification === "analyze" && <button onClick={() => void analyze()} disabled={busy || analysisRunning}>{analysisRunning ? "分析中…" : "运行需求分析"}</button>}
         </div>
       </div>}
       {dialogMode === "requirement" && <div className="requirement-document commission-dialog-body">
