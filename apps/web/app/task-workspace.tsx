@@ -18,12 +18,12 @@ import { Children, useEffect, useMemo, useRef, useState, type FormEvent, type Re
 import ReactMarkdown from "react-markdown";
 import webPackage from "../package.json";
 import { AVATAR_SETTINGS_EVENT, DEFAULT_AVATARS, avatarSettings, isImageAvatar, type AvatarSettings } from "./avatar-settings";
-import { browserNotificationRuntime, notificationHashTarget, notificationNavigation, pushBrowserNotifications, type AppNotification, type NotificationTarget } from "./browser-notifications";
+import { browserNotificationRuntime, notificationHashTarget, notificationHashTargetsOtherProject, notificationNavigation, pushBrowserNotifications, type AppNotification, type NotificationTarget } from "./browser-notifications";
 import { DeliveryWorkspace } from "./delivery-workspace";
 import { CommissionWorkspace } from "./commission-workspace";
 import { UsageStatisticsWorkspace } from "./usage-statistics-workspace";
 import { PROJECT_NAME_MAX_LENGTH, activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, initialWorkspaceView, isStaleWorkspaceHash, projectIdAfterArchive, projectNameError, projectRunLabels, workspaceContentState, type ManagedProject, type WorkspaceView } from "./project-management";
-import { canOpenTaskDelivery, canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, diffLines, formatJson, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, mentionTriggerAtCursor, parseReviewComment, runCodeChanges, runEventDetail, runQuestions, runTimelineEvents, screenshotFileName, taskLifecycleAction, tokenPrice, tokenUsageTotals, upsertComment, type CodeChange, type MentionTrigger, type ReviewFinding, type RunEvent, type RunQuestion } from "./task-run";
+import { canOpenTaskDelivery, canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, currentRunsForEvents, formatJson, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, isNearScrollBottom, mentionTriggerAtCursor, parseReviewComment, runDiffChanges, runDiffFilePatches, runEventDetail, runQuestions, runTimelineEvents, sameCommentSnapshot, screenshotFileName, taskLifecycleAction, tokenPrice, tokenUsageTotals, upsertComment, type MentionTrigger, type ReviewFinding, type RunDiffChange, type RunDiffFilePatch, type RunEvent, type RunQuestion } from "./task-run";
 import {
   TASK_STATUSES,
   boardCollisionDetection,
@@ -45,7 +45,7 @@ import {
 type Project = ManagedProject;
 type RootPath = { id: string; path: string; real_path: string };
 type Commission = { id: string; title: string; status: string };
-type Run = { id: string; task_id: string; role: string; trigger_type: string; status: string; attempt_no: number; started_at: string | null; finished_at: string | null; failure_summary: string | null; token_input: number | null; token_output: number | null; token_cached: number | null; configSnapshot?: { model?: string } };
+type Run = { id: string; task_id: string; role: string; trigger_type: string; status: string; attempt_no: number; started_at: string | null; finished_at: string | null; failure_summary: string | null; token_input: number | null; token_output: number | null; token_cached: number | null; has_diff: boolean; configSnapshot?: { model?: string } };
 type TaskEvidence = { id: string; run_id: string | null; type: string; status: string; summary: string; payload_json: string; created_at: string };
 type TaskAttachment = { id: string; task_id: string; comment_id: string | null; run_id: string | null; original_name: string; media_type: string; size_bytes: number };
 type AttachmentUploadProgress = { phase: "uploading" | "complete"; current: number; total: number; fileName: string };
@@ -261,6 +261,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
 
   function selectProject(nextProjectId: string) {
     if (nextProjectId === projectIdRef.current) return;
+    if (notificationHashTargetsOtherProject(location.hash, nextProjectId)) history.replaceState(null, "", `${location.pathname}${location.search}`);
     projectIdRef.current = nextProjectId;
     projectDataRequestGate.invalidate();
     projectLoadingRequestGate.invalidate();
@@ -399,7 +400,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     setTaskTokenRuns([]);
     setTaskEvidence([]);
     setTaskRunEvents({});
-    await refreshTaskDialog(task.id, true);
+    await refreshTaskDialog(task.id);
   }
 
   async function openHistory() {
@@ -414,18 +415,26 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     finally { if (requestedProjectId === projectIdRef.current) setHistoryLoading(false); }
   }
 
-  async function refreshTaskDialog(taskId: string, includeHistory = false) {
+  async function refreshTaskDialog(taskId: string) {
     try {
       const tree = (tasks.find((task) => task.id === taskId) ?? historyTasks.find((task) => task.id === taskId))?.parent_id === null;
-      const [task, runs, tokenRuns, evidence] = await Promise.all([api<Task>(`/api/tasks/${taskId}`), api<Run[]>(`/api/tasks/${taskId}/runs`), tree ? api<Run[]>(`/api/tasks/${taskId}/runs?scope=tree`) : Promise.resolve(null), api<TaskEvidence[]>(`/api/tasks/${taskId}/evidence`)]);
+      const [task, runs, tokenRuns, evidence] = await Promise.all([api<Task>(`/api/tasks/${taskId}`), api<Run[]>(`/api/tasks/${taskId}/runs`), tree ? api<Run[]>(`/api/tasks/${taskId}/runs?scope=tree`) : Promise.resolve(null), api<TaskEvidence[]>(`/api/tasks/${taskId}/evidence?excludeDiff=true`)]);
       setTaskDialogTask((current) => current?.id === taskId ? task : current);
       setTaskRuns(runs);
       setTaskTokenRuns(tokenRuns ?? runs);
       setTaskEvidence(evidence);
-      const targets = includeHistory ? runs : runs.slice(0, 1);
+      const targets = currentRunsForEvents(runs);
       const loaded = await Promise.all(targets.map(async (run) => [run.id, await api<RunEvent[]>(`/api/runs/${run.id}/events`)] as const));
-      setTaskRunEvents((current) => Object.fromEntries([...Object.entries(includeHistory ? {} : current).filter(([id]) => runs.some((run) => run.id === id)), ...loaded]));
+      setTaskRunEvents((current) => Object.fromEntries([...Object.entries(current).filter(([id]) => runs.some((run) => run.id === id)), ...loaded]));
     } catch (error) { setMessage((error as Error).message); }
+  }
+
+  async function loadRunEvents(runId: string) {
+    if (Object.hasOwn(taskRunEvents, runId)) return;
+    try {
+      const events = await api<RunEvent[]>(`/api/runs/${runId}/events`);
+      setTaskRunEvents((current) => ({ ...current, [runId]: events }));
+    } catch (error) { setMessage(`运行记录加载失败：${(error as Error).message}`); }
   }
 
   async function taskAction(path: "trigger" | "pause" | "resume" | "cancel", success: string) {
@@ -532,7 +541,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
         </>}
       </section>
     </div>
-    <TaskRunDialog dialog={taskDialog} task={taskDialogTask} tasks={[...tasks, ...historyTasks]} runs={taskRuns} tokenRuns={taskTokenRuns} evidence={taskEvidence} eventsByRun={taskRunEvents} busy={taskBusy} message={message} onClose={() => setTaskDialogTask(null)} onOpenTask={openTask} onAction={taskAction} onLifecycle={taskLifecycle} onAnswer={answerRunInput} onApprovals={() => { setTaskDialogTask(null); setView("notifications"); }} onDelivery={() => { setTaskDialogTask(null); setView("delivery"); }} />
+    <TaskRunDialog dialog={taskDialog} task={taskDialogTask} tasks={[...tasks, ...historyTasks]} runs={taskRuns} tokenRuns={taskTokenRuns} evidence={taskEvidence} eventsByRun={taskRunEvents} busy={taskBusy} message={message} onClose={() => setTaskDialogTask(null)} onOpenTask={openTask} onOpenRun={loadRunEvents} onAction={taskAction} onLifecycle={taskLifecycle} onAnswer={answerRunInput} onApprovals={() => { setTaskDialogTask(null); setView("notifications"); }} onDelivery={() => { setTaskDialogTask(null); setView("delivery"); }} />
     <HistoryTasksDialog dialog={historyDialog} tasks={historyTasks} commissions={commissionTitles} loading={historyLoading} onOpen={openTask} />
     <ProjectManagementDialog dialog={projectManagementDialog} project={managedProject} busy={projectManagementBusy} error={projectManagementError} onClose={() => setManagedProject(null)} onSubmit={saveManagedProject} onArchive={archiveManagedProject} />
   </section>;
@@ -717,24 +726,31 @@ function TaskRow({ task, tasks, depth, collapsed, onToggle, onOpen }: { task: Ta
   </>;
 }
 
-function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsByRun, busy, message, onClose, onOpenTask, onAction, onLifecycle, onAnswer, onApprovals, onDelivery }: { dialog: React.RefObject<HTMLDialogElement | null>; task: Task | null; tasks: Task[]; runs: Run[]; tokenRuns: Run[]; evidence: TaskEvidence[]; eventsByRun: Record<string, RunEvent[]>; busy: boolean; message: string; onClose(): void; onOpenTask(task: Task): Promise<void>; onAction(path: "trigger" | "pause" | "resume" | "cancel", success: string): Promise<void>; onLifecycle(task: Task): Promise<void>; onAnswer(event: FormEvent<HTMLFormElement>, requestId: string, questions: RunQuestion[]): Promise<void>; onApprovals(): void; onDelivery(): void }) {
-  const [activeTab, setActiveTab] = useState<"comments" | "runs" | "evidence" | "changes">("comments");
+function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsByRun, busy, message, onClose, onOpenTask, onOpenRun, onAction, onLifecycle, onAnswer, onApprovals, onDelivery }: { dialog: React.RefObject<HTMLDialogElement | null>; task: Task | null; tasks: Task[]; runs: Run[]; tokenRuns: Run[]; evidence: TaskEvidence[]; eventsByRun: Record<string, RunEvent[]>; busy: boolean; message: string; onClose(): void; onOpenTask(task: Task): Promise<void>; onOpenRun(runId: string): Promise<void>; onAction(path: "trigger" | "pause" | "resume" | "cancel", success: string): Promise<void>; onLifecycle(task: Task): Promise<void>; onAnswer(event: FormEvent<HTMLFormElement>, requestId: string, questions: RunQuestion[]): Promise<void>; onApprovals(): void; onDelivery(): void }) {
+  const [activeTab, setActiveTab] = useState<"comments" | "runs" | "evidence">("comments");
   const [openRunIds, setOpenRunIds] = useState<Set<string>>(new Set());
+  const [runDiff, setRunDiff] = useState<{ run: Run; evidence: TaskEvidence | null; loading: boolean; error: string } | null>(null);
+  const runDiffDialog = useRef<HTMLDialogElement>(null);
   const [comments, setComments] = useState<TaskComment[]>([]);
   const [commentBusy, setCommentBusy] = useState(false);
   const [commentError, setCommentError] = useState("");
   const [commentUploadProgress, setCommentUploadProgress] = useState<AttachmentUploadProgress | null>(null);
   useEffect(() => {
     setActiveTab("comments");
+    setRunDiff(null);
     setCommentError("");
     if (!task) { setComments([]); return; }
     let current = true;
-    const load = () => void api<TaskComment[]>(`/api/tasks/${task.id}/comments`).then((items) => { if (current) setComments(items); }).catch((error: Error) => { if (current && !comments.length) setCommentError(error.message); });
+    const load = () => void api<TaskComment[]>(`/api/tasks/${task.id}/comments`).then((items) => { if (current) setComments((previous) => sameCommentSnapshot(previous, items) ? previous : items); }).catch((error: Error) => { if (current && !comments.length) setCommentError(error.message); });
     load();
     const timer = window.setInterval(load, 2000);
     return () => { current = false; window.clearInterval(timer); };
   }, [task?.id]);
-  useEffect(() => setOpenRunIds(new Set(runs[0] ? [runs[0].id] : [])), [task?.id, runs[0]?.id]);
+  useEffect(() => setOpenRunIds(new Set()), [task?.id, runs[0]?.id]);
+  useEffect(() => {
+    if (runDiff && !runDiffDialog.current?.open) runDiffDialog.current?.showModal();
+    if (!runDiff && runDiffDialog.current?.open) runDiffDialog.current.close();
+  }, [runDiff]);
   const latest = runs[0];
   const active = latest && ["queued", "preparing", "running", "waiting_approval", "waiting_input"].includes(latest.status);
   const controllable = latest && ["preparing", "running", "waiting_approval", "waiting_input"].includes(latest.status);
@@ -745,8 +761,16 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsB
   const inputEvent = [...events].reverse().find((event) => event.event_type === "input.requested");
   const questions = runQuestions(inputEvent);
   const requestId = String(inputEvent?.payload.requestId ?? "");
-  const codeChanges = runs.flatMap((run, index) => runCodeChanges(eventsByRun[run.id] ?? []).map((change) => ({ run, change, current: index === 0 })));
   const lifecycleAction = task ? taskLifecycleAction(task.status, Boolean(task.deleted_at)) : null;
+  async function openRunDiff(run: Run) {
+    setRunDiff({ run, evidence: null, loading: true, error: "" });
+    try {
+      const record = await api<TaskEvidence>(`/api/runs/${run.id}/diff`);
+      setRunDiff((current) => current?.run.id === run.id ? { run, evidence: record, loading: false, error: "" } : current);
+    } catch (error) {
+      setRunDiff((current) => current?.run.id === run.id ? { run, evidence: null, loading: false, error: (error as Error).message } : current);
+    }
+  }
   async function submitComment(event: FormEvent<HTMLFormElement>): Promise<boolean> {
     event.preventDefault();
     if (!task) return false;
@@ -785,7 +809,7 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsB
     } catch (error) { setCommentError((error as Error).message); }
     finally { setCommentBusy(false); }
   }
-  return <dialog ref={dialog} className="commission-dialog task-run-dialog" onClose={onClose}>
+  return <><dialog ref={dialog} className="commission-dialog task-run-dialog" onClose={() => { setRunDiff(null); onClose(); }}>
     <header className="commission-dialog-header"><div><p className="eyebrow">Task Execution</p><h2>任务运行</h2>{task && <p><TaskTitle task={task} /></p>}</div><div className="task-run-header-actions"><button className="secondary dialog-close" onClick={onClose}>关闭</button></div></header>
     {task && <div key={task.id} className="task-run-layout commission-dialog-body">
     <main className="task-run-content">
@@ -807,17 +831,19 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsB
     </main>
     <section className="task-run-tabs">
       <div className="task-run-tab-list" role="tablist" aria-label="任务协作记录">
-        {([['comments', '评论'], ['runs', '运行记录'], ['evidence', '评审证据'], ['changes', '修改记录']] as const).map(([id, label]) => <button key={id} type="button" role="tab" aria-selected={activeTab === id} className={activeTab === id ? "active" : ""} onClick={() => setActiveTab(id)}>{label}{id === "comments" && comments.length > 0 ? ` ${comments.length}` : id === "runs" && runs.length > 0 ? ` ${runs.length}` : id === "evidence" && evidence.length > 0 ? ` ${evidence.length}` : id === "changes" && codeChanges.length > 0 ? ` ${codeChanges.length}` : ""}</button>)}
+        {([['comments', '评论'], ['runs', '运行记录'], ['evidence', '评审证据']] as const).map(([id, label]) => <button key={id} type="button" role="tab" aria-selected={activeTab === id} className={activeTab === id ? "active" : ""} onClick={() => setActiveTab(id)}>{label}{id === "comments" && comments.length > 0 ? ` ${comments.length}` : id === "runs" && runs.length > 0 ? ` ${runs.length}` : id === "evidence" && evidence.length > 0 ? ` ${evidence.length}` : ""}</button>)}
       </div>
       <div className="task-run-tab-panel" role="tabpanel">
         {activeTab === "comments" && <TaskComments key={task.id} comments={comments} tasks={tasks.filter((item) => item.commission_id === task.commission_id)} mentionTasks={tasks.filter((item) => item.commission_id === task.commission_id && item.status !== "archived")} readOnly={task.status === "archived"} busy={commentBusy} error={commentError} uploadProgress={commentUploadProgress} onSubmit={submitComment} onDelete={deleteComment} onRespond={respondRevisionCard} onOpenTask={onOpenTask} />}
-        {activeTab === "runs" && <div className="run-records">{runs.length ? runs.map((run, index) => <RunTimelineGroup key={run.id} run={run} events={eventsByRun[run.id] ?? []} current={index === 0} open={openRunIds.has(run.id)} onToggle={(nextOpen) => setOpenRunIds((current) => { const next = new Set(current); if (nextOpen) next.add(run.id); else next.delete(run.id); return next; })} />) : <p className="task-tab-empty">启动任务后可在这里跟进执行过程。</p>}</div>}
+        {activeTab === "runs" && <div className="run-records">{runs.length ? runs.map((run, index) => <RunTimelineGroup key={run.id} run={run} events={eventsByRun[run.id]} current={index === 0} open={openRunIds.has(run.id)} onOpenDiff={openRunDiff} onToggle={(nextOpen) => { setOpenRunIds((current) => { const next = new Set(current); if (nextOpen) next.add(run.id); else next.delete(run.id); return next; }); if (nextOpen) void onOpenRun(run.id); }} />) : <p className="task-tab-empty">启动任务后可在这里跟进执行过程。</p>}</div>}
         {activeTab === "evidence" && <EvidenceRecords evidence={evidence} />}
-        {activeTab === "changes" && <CodeChanges changes={codeChanges} />}
       </div>
     </section>
     </div>}
-  </dialog>;
+  </dialog><dialog ref={runDiffDialog} className="commission-dialog run-diff-dialog" onClose={() => setRunDiff(null)}>
+    <header className="commission-dialog-header"><div><p className="eyebrow">Developer Run</p><h2>Run #{runDiff?.run.attempt_no} 修改记录</h2></div><button className="secondary dialog-close" onClick={() => setRunDiff(null)}>关闭</button></header>
+    <div className="commission-dialog-body">{runDiff?.loading ? <p className="task-tab-empty">正在加载修改记录…</p> : runDiff?.error ? <div className="workspace-message" role="alert"><p>{runDiff.error}</p><button onClick={() => void openRunDiff(runDiff.run)}>重试</button></div> : runDiff?.evidence ? <RunDiffRecord key={runDiff.evidence.id} evidence={runDiff.evidence} /> : null}</div>
+  </dialog></>;
 }
 
 function TaskReadonlyProperties({ task, tasks }: { task: Task; tasks: Task[] }) {
@@ -847,6 +873,7 @@ function TaskComments({ comments, tasks, mentionTasks, readOnly, busy, error, up
   const commentList = useRef<HTMLDivElement>(null);
   const mentionOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [avatars, setAvatars] = useState<AvatarSettings>(DEFAULT_AVATARS);
+  const [showScrollBottom, setShowScrollBottom] = useState(false);
   const rows = commentThreadRows(comments);
   useEffect(() => {
     void fetch("/api/settings").then(async (response) => { if (response.ok) setAvatars(avatarSettings(await response.json())); }).catch(() => undefined);
@@ -865,6 +892,17 @@ function TaskComments({ comments, tasks, mentionTasks, readOnly, busy, error, up
   useEffect(() => {
     if (mention) mentionOptionRefs.current[mentionIndex]?.scrollIntoView({ block: "nearest" });
   }, [mention, mentionIndex]);
+  useEffect(() => {
+    const scrollContainer = commentList.current?.closest<HTMLElement>(".commission-dialog-body");
+    if (!scrollContainer) return;
+    const update = () => setShowScrollBottom(!isNearScrollBottom(scrollContainer));
+    const frame = window.requestAnimationFrame(update);
+    scrollContainer.addEventListener("scroll", update, { passive: true });
+    const observer = new ResizeObserver(update);
+    observer.observe(scrollContainer);
+    if (commentList.current) observer.observe(commentList.current);
+    return () => { window.cancelAnimationFrame(frame); scrollContainer.removeEventListener("scroll", update); observer.disconnect(); };
+  }, [comments]);
   const submit = async (event: FormEvent<HTMLFormElement>) => { if (await onSubmit(event)) { setReplyTo(null); setMention(null); window.requestAnimationFrame(() => commentList.current?.parentElement?.scrollIntoView({ block: "end", inline: "nearest" })); } };
   const refreshMention = (target: HTMLTextAreaElement) => {
     setMention(mentionTriggerAtCursor(target.value, target.selectionStart ?? target.value.length));
@@ -883,6 +921,7 @@ function TaskComments({ comments, tasks, mentionTasks, readOnly, busy, error, up
       <CommentAvatar value={comment.author_type === "human" ? avatars.humanAvatar : comment.author_type === "agent" ? avatars.agentAvatar : "系"} />
       <div className={`comment-card ${comment.deleted_at ? "deleted" : ""} ${comment.revisionCard ? "revision-card" : ""}`}><header><span><strong>{comment.author_type === "human" ? "人工负责人" : comment.agent_role ? ROLE_LABELS[comment.agent_role] ?? comment.agent_role : comment.author_type === "agent" ? "AI Agent" : "系统"}</strong>{comment.author_type === "agent" && <small>Agent</small>}{comment.run_id && <small>Run</small>}</span><time>{new Date(comment.created_at).toLocaleString()}</time></header>{comment.deleted_at ? <p className="comment-deleted">评论已删除</p> : <>{comment.content && <CommentMarkdown content={comment.content} tasks={tasks} onOpenTask={onOpenTask} />}<AttachmentList taskId={comment.task_id} attachments={comment.attachments ?? []} />{comment.revisionCard && <PlanRevisionCard comment={comment} busy={busy || readOnly} onRespond={onRespond} />}</>}{!readOnly && !comment.deleted_at && !comment.revisionCard && <footer><button type="button" className="comment-reply" onClick={() => { setReplyTo(comment); window.setTimeout(() => textarea.current?.focus(), 0); }}>回复</button>{comment.author_type === "human" && <button type="button" className="comment-delete" onClick={() => void onDelete(comment)}>删除</button>}</footer>}</div>
     </article>) : <p className="task-tab-empty">{readOnly ? "该归档任务没有历史评论。" : "暂无评论，输入一条协作信息开始讨论。"}</p>}</div>
+    {showScrollBottom && <button type="button" className="comment-scroll-bottom" aria-label="滚动到评论底部" title="滚动到评论底部" onClick={() => { const scrollContainer = commentList.current?.closest<HTMLElement>(".commission-dialog-body"); scrollContainer?.scrollTo({ top: scrollContainer.scrollHeight, behavior: "smooth" }); }}><span aria-hidden="true">↓</span></button>}
     {readOnly ? <p className="task-tab-empty">归档任务的评论为只读，历史记录仍会保留。</p> : <form className="task-comment-form" onSubmit={(event) => void submit(event)}>
       {replyTo && <div className="comment-replying"><span>回复 {replyTo.author_type === "human" ? "人工负责人" : replyTo.agent_role ? ROLE_LABELS[replyTo.agent_role] ?? replyTo.agent_role : "系统"}：{replyTo.content.slice(0, 60)}</span><button type="button" className="secondary compact" onClick={() => setReplyTo(null)}>取消回复</button></div>}
       <input type="hidden" name="parentId" value={replyTo?.id ?? ""} />
@@ -1038,20 +1077,56 @@ function CommentMentionText({ children, tasks, onOpenTask }: { children: ReactNo
   }))}</>;
 }
 
-function CodeChanges({ changes }: { changes: Array<{ run: Run; change: CodeChange; current: boolean }> }) {
-  const kindLabels: Record<string, string> = { add: "新增", update: "修改", delete: "删除", move: "移动" };
-  return <div className="code-change-list">{changes.length ? changes.map(({ run, change, current }) => <article key={`${run.id}-${change.id}`} className="code-change-record">
-    <header><span><small>{current ? "当前执行" : "历史执行"} · Run #{run.attempt_no} · {kindLabels[change.kind] ?? change.kind}</small><strong>{change.path}</strong>{change.movePath && <small>移动自 {change.movePath}</small>}</span><time>{new Date(change.event.created_at).toLocaleString()}</time></header>
-    {change.diff ? <pre className="code-diff" aria-label={`${change.path} 的代码差异`}>{diffLines(change.diff).map((line, index) => <span key={index} className={`diff-${line.kind}`}>{line.text || " "}</span>)}</pre> : <p>Agent 已报告文件变化，但未提供 Diff。</p>}
-  </article>) : <p className="task-tab-empty">Agent 修改文件后，Diff 会显示在这里。</p>}</div>;
+function RunDiffRecord({ evidence }: { evidence: TaskEvidence }) {
+  const kindLabels: Record<string, string> = { added: "新增", modified: "修改", deleted: "删除", renamed: "重命名", copied: "复制" };
+  const files = runDiffChanges(evidence.payload_json);
+  const patches = runDiffFilePatches(evidence.payload_json);
+  const patchByPath = new Map(patches.map((file) => [file.path, file.patch]));
+  const diffFiles = [...files.map((file) => ({ ...file, patch: patchByPath.get(file.path) ?? "" })), ...patches.filter((patch) => !files.some((file) => file.path === patch.path)).map((patch) => ({ path: patch.path, changeType: patch.changeType, baselineHash: null, hash: null, safe: false, patch: patch.patch }))];
+  const [selectedPath, setSelectedPath] = useState(diffFiles[0]?.path ?? "");
+  const selected = diffFiles.find((file) => file.path === selectedPath) ?? diffFiles[0];
+  return <article className="code-change-record run-diff-record"><header><span><small>{evidence.status}</small><strong>{diffFiles.length ? `${diffFiles.length} 个文件的真实变化` : "无文件变化"}</strong></span><time>{new Date(evidence.created_at).toLocaleString()}</time></header>
+    {diffFiles.length ? <div className="run-diff-viewer"><nav className="run-diff-tree" aria-label="变更文件树"><DiffTree files={diffFiles} selectedPath={selected?.path ?? ""} onSelect={setSelectedPath} /></nav>{selected && <section className="run-diff-panel"><header><span><strong>{selected.path}</strong><small>{kindLabels[selected.changeType] ?? selected.changeType}{selected.safe ? "" : " · 无法安全归属"}</small></span></header>{selected.patch ? <DiffCode patch={selected.patch} /> : <p>该文件未记录逐行差异。</p>}</section>}</div> : <p>该 Run 未产生文件变化。</p>}
+  </article>;
+}
+
+type DiffFile = RunDiffChange & RunDiffFilePatch;
+type DiffTreeNode = { name: string; path?: string; file?: DiffFile; children: Map<string, DiffTreeNode> };
+
+function DiffTree({ files, selectedPath, onSelect }: { files: DiffFile[]; selectedPath: string; onSelect(path: string): void }) {
+  const root: DiffTreeNode = { name: "", children: new Map() };
+  for (const file of files) {
+    let node = root;
+    const segments = file.path.split("/");
+    segments.forEach((name, index) => {
+      const path = segments.slice(0, index + 1).join("/");
+      const child = node.children.get(name) ?? { name, path, children: new Map() };
+      node.children.set(name, child);
+      node = child;
+      if (index === segments.length - 1) node.file = file;
+    });
+  }
+  return <DiffTreeNodes nodes={[...root.children.values()]} selectedPath={selectedPath} onSelect={onSelect} />;
+}
+
+function DiffTreeNodes({ nodes, selectedPath, onSelect }: { nodes: DiffTreeNode[]; selectedPath: string; onSelect(path: string): void }) {
+  return <ul>{nodes.sort((left, right) => Number(Boolean(left.file)) - Number(Boolean(right.file)) || left.name.localeCompare(right.name)).map((node) => <li key={node.path}>
+    {node.file && <button type="button" className={node.file.path === selectedPath ? "active" : ""} aria-current={node.file.path === selectedPath ? "true" : undefined} onClick={() => onSelect(node.file!.path)}><span>{node.name}</span><small>{node.file.changeType.slice(0, 1).toUpperCase()}</small></button>}
+    {node.children.size > 0 && <details open><summary>{node.name}</summary><DiffTreeNodes nodes={[...node.children.values()]} selectedPath={selectedPath} onSelect={onSelect} /></details>}
+  </li>)}</ul>;
+}
+
+function DiffCode({ patch }: { patch: string }) {
+  const lineClass = (line: string) => line.startsWith("@@") ? "hunk" : line.startsWith("+") && !line.startsWith("+++") ? "added" : line.startsWith("-") && !line.startsWith("---") ? "deleted" : line.startsWith("diff --git") || line.startsWith("index ") || line.startsWith("---") || line.startsWith("+++") ? "meta" : "context";
+  return <pre className="run-diff-code">{patch.split("\n").map((line, index) => <span key={index} className={`run-diff-line ${lineClass(line)}`}>{line || " "}</span>)}</pre>;
 }
 
 function EvidenceRecords({ evidence }: { evidence: TaskEvidence[] }) {
   return <div className="code-change-list">{evidence.length ? evidence.map((item) => <article key={item.id} className="code-change-record"><header><span><small>{item.type} · {item.status}{item.run_id ? ` · Run ${item.run_id.slice(0, 8)}` : ""}</small><strong>{item.summary}</strong></span><time>{new Date(item.created_at).toLocaleString()}</time></header>{item.payload_json && item.payload_json !== "{}" && <details><summary>查看结构化详情</summary><pre className="evidence-payload">{formatJson(item.payload_json)}</pre></details>}</article>) : <p className="task-tab-empty">该任务暂无评审证据。</p>}</div>;
 }
 
-function RunTimelineGroup({ run, events, current, open, onToggle }: { run: Run; events: RunEvent[]; current: boolean; open: boolean; onToggle(open: boolean): void }) {
-  const timelineEvents = runTimelineEvents(events);
+function RunTimelineGroup({ run, events, current, open, onToggle, onOpenDiff }: { run: Run; events: RunEvent[] | undefined; current: boolean; open: boolean; onToggle(open: boolean): void; onOpenDiff(run: Run): void }) {
+  const timelineEvents = runTimelineEvents(events ?? []);
   const tokens = tokenUsageTotals([run]);
   const price = tokenPrice([run]);
   const record = useRef<HTMLElement>(null);
@@ -1078,12 +1153,11 @@ function RunTimelineGroup({ run, events, current, open, onToggle }: { run: Run; 
     return () => window.cancelAnimationFrame(frame);
   }, [open, timelineEvents.length]);
   return <section ref={record} className={`run-record ${open ? "open" : ""}`}>
-    <button className="run-record-toggle" aria-expanded={open} onClick={() => onToggle(!open)}>
+    <div className="run-record-header"><button className="run-record-toggle" aria-expanded={open} onClick={() => onToggle(!open)}>
       <span className="run-record-chevron" aria-hidden="true">{open ? "▾" : "▸"}</span>
       <span><small>{current ? "当前执行" : "历史执行"}</small><strong>Run #{run.attempt_no} · {run.role}</strong><RunRecordDuration run={run} /><small className="run-record-tokens" title={tokens ? `输入 ${formatTokenCount(tokens.input)}，输出 ${formatTokenCount(tokens.output)}，缓存 ${formatTokenCount(tokens.cached)}` : undefined}>Token {tokens ? formatTokenCount(tokens.total) : "—"} · {price === null ? "价格不可用" : `约 ${formatTokenPrice(price)}`}</small></span>
-      <span className={`run-record-status status-${run.status}`}>{RUN_STATUS_LABELS[run.status] ?? run.status}</span>
-    </button>
-    {open && <div ref={timeline} className="run-timeline">{timelineEvents.length ? timelineEvents.map((event) => <RunTimelineEvent key={event.id} event={event} />) : <p>此 Run 尚未产生事件。</p>}</div>}
+    </button>{run.role === "developer" && run.has_diff && <button className="secondary compact run-diff-button" onClick={() => onOpenDiff(run)}>修改记录</button>}<span className={`run-record-status status-${run.status}`}>{RUN_STATUS_LABELS[run.status] ?? run.status}</span></div>
+    {open && <div ref={timeline} className="run-timeline">{events === undefined ? <p>正在加载运行记录…</p> : timelineEvents.length ? timelineEvents.map((event) => <RunTimelineEvent key={event.id} event={event} />) : <p>此 Run 尚未产生事件。</p>}</div>}
   </section>;
 }
 
@@ -1140,7 +1214,9 @@ function focusTask(id: string) {
 }
 
 async function api<T = unknown>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init?.body ? { ...init, headers: { "Content-Type": "application/json", ...init.headers } } : init);
+  let response: Response;
+  try { response = await fetch(url, init?.body ? { ...init, headers: { "Content-Type": "application/json", ...init.headers } } : init); }
+  catch { throw new Error("无法连接 OpenWorkshop 服务，请确认服务正在运行后重试。"); }
   if (response.ok) return response.status === 204 ? undefined as T : await response.json() as T;
   const result = await response.json().catch(() => ({})) as { message?: string; error?: string };
   throw new Error(result.message || result.error || `请求失败 (${response.status})`);

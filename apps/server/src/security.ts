@@ -7,8 +7,11 @@ const SENSITIVE_TEXT = [
   /\b(bearer\s+)[A-Za-z0-9._~+/=-]+/gi,
   /\b((?:[a-z0-9]+[_-])*(?:api[_-]?key|token|secret|password|pin)\s*[:=]\s*)('[^']*'|"[^"]*"|[^\s,;}]+)/gi,
   /\b((?:cookie|set-cookie)\s*[:=]\s*)[^\r\n]+/gi,
+  /(\b(?:spawn|exec(?:File)?)\s+)\/[^\s"'(),;]+/gi,
+  /(\b(?:spawn|exec(?:File)?)\s+)(?:[A-Za-z]:[\\/]|\\\\)[^\s"'(),;]+/gi,
   /(\b)(?:sk-(?:proj-)?[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|AKIA[0-9A-Z]{16})\b/g
 ];
+const EXECUTABLE_PATH = /(?:[A-Za-z]:[\\/]|\\\\)[^\r\n"']+\.(?:com|exe|cmd|bat|sh|bin)(?=$|[\s'"),;])/gi;
 
 export function redactSensitive<T>(value: T, explicitSecrets: readonly string[] = []): { value: T; redacted: boolean } {
   let redacted = false;
@@ -21,6 +24,7 @@ export function redactSensitive<T>(value: T, explicitSecrets: readonly string[] 
     if (typeof item === "string") {
       let output = item;
       for (const pattern of SENSITIVE_TEXT) output = output.replace(pattern, `$1${HIDDEN}`);
+      output = output.replace(EXECUTABLE_PATH, HIDDEN);
       for (const secret of explicitSecrets) if (secret) output = output.replaceAll(secret, HIDDEN);
       if (output !== item) redacted = true;
       return output;

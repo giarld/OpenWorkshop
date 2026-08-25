@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { familyHelp, formatWorkflowResult, parseWorkflowCommand, workflowHelp, workflowHttpError, WORKFLOW_COMMANDS } from "./workflow-cli.ts";
+import { familyHelp, formatAgentRows, formatWorkflowResult, parseWorkflowCommand, workflowHelp, workflowHttpError, WORKFLOW_COMMANDS } from "./workflow-cli.ts";
 
 test("workflow commands map agent input to API requests", async () => {
   assert.ok(Object.keys(WORKFLOW_COMMANDS).length >= 50);
@@ -28,6 +28,23 @@ test("maps direct approved requirement creation", async () => {
   assert.equal((await parseWorkflowCommand([
     "requirement", "create-approved", "commission-id", "--data", '{"contentMarkdown":"# Goal","acceptanceCriteria":[]}'
   ])).path, "/api/commissions/commission-id/requirements/approved");
+});
+
+test("maps Agent backend and health commands to the generic API", async () => {
+  assert.equal((await parseWorkflowCommand(["agent", "backends"])).path, "/api/agents/backends");
+  assert.equal((await parseWorkflowCommand(["agent", "health", "--output", "json"])).path, "/api/agents/health");
+  assert.equal(WORKFLOW_COMMANDS["runtime codex-health"], undefined);
+});
+
+test("formats Agent backend metadata and sanitized health failures", () => {
+  const backends = formatAgentRows("backends", [{ id: "fake", displayName: "Fake", capabilities: { continuation: true, approvals: false }, runtimeVersion: { min: "1.0.0", max: "2.0.0" }, executable: { defaultCommand: "fake", environmentKey: "WORKSHOP_FAKE_PATH", configured: true, valid: false } }]);
+  assert.match(backends, /capabilities: continuation/);
+  assert.match(backends, /runtime: >=1.0.0 <=2.0.0/);
+  assert.match(backends, /WORKSHOP_FAKE_PATH: configured, invalid/);
+  const health = formatAgentRows("health", [{ id: "codex", ok: false, error: "Codex CLI could not be started or queried: spawn codex ENOENT", capabilities: { ok: false, error: "Models unavailable" } }]);
+  assert.match(health, /unavailable codex/);
+  assert.match(health, /Codex CLI could not be started or queried: spawn codex ENOENT/);
+  assert.match(health, /Models unavailable/);
 });
 
 test("reads query JSON from a file for PowerShell-safe calls", async () => {

@@ -10,7 +10,7 @@ import { addTaskComment } from "./comments.ts";
 import { archiveCommission, reactivateCommission, recoverCommissionLifecycleOperations } from "./commission-archive.ts";
 import { MAX_COMMISSION_ATTACHMENT_BYTES, storeAttachment } from "./attachments.ts";
 import { extractAttachmentText, registerCommissionRoutes, type RequirementAnalyzer } from "./commissions.ts";
-import { openWorkshopDatabase } from "./database.ts";
+import { openWorkshopDatabase, SettingsStore } from "./database.ts";
 import type { TaskPlanner } from "./planner-agent.ts";
 
 test("deletes only commissions that are still in clarification", async () => {
@@ -79,6 +79,13 @@ test("compresses a clarified commission and restores its documents, tasks, histo
     database.prepare(`INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json)
       VALUES (?, ?, ?, ?, 'developer', 'manual', 'running', 1, '{}', '{}')`)
       .run(runId, projectId, commissionId, taskId);
+    const grantId = randomUUID();
+    database.prepare("INSERT INTO execution_grants (id, commission_id, root_task_id, scope, status, created_at) VALUES (?, ?, ?, 'commission_tree', 'active', ?)").run(grantId, commissionId, taskId, now);
+    new SettingsStore(database).set("pendingRunAdvances", [
+      { runId, kind: "terminal", createdAt: now },
+      { runId: grantId, kind: "wake", createdAt: now },
+      { runId: "keep-me", kind: "terminal", createdAt: now }
+    ]);
     database.prepare("UPDATE attachments SET task_id = ?, comment_id = ?, run_id = ? WHERE id = ?").run(taskId, commentId, runId, attachment.id);
     database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'result', 'done', '{}', 0, ?)").run(runId, now);
     const documentId = randomUUID();
@@ -120,6 +127,7 @@ test("compresses a clarified commission and restores its documents, tasks, histo
     await assert.rejects(access(attachment.storage_path));
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM tasks WHERE commission_id = ?").get(commissionId) as { count: number }).count, 0);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM documents WHERE commission_id = ?").get(commissionId) as { count: number }).count, 0);
+    assert.deepEqual(new SettingsStore(database).get("pendingRunAdvances"), [{ runId: "keep-me", kind: "terminal", createdAt: now }]);
     assert.equal(((await server.inject({ method: "GET", url: `/api/projects/${projectId}/commissions` })).json() as unknown[]).length, 1);
     assert.equal(((await server.inject({ method: "GET", url: `/api/projects/${projectId}/commissions?archived=true` })).json() as Array<{ id: string }>)[0]?.id, commissionId);
 
@@ -188,7 +196,7 @@ test("approving a requirement automatically writes the planning Agent task tree"
     assert.equal((await server.inject({ method: "POST", url: `/api/requirements/${requirementId}/approve` })).statusCode, 200);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM tasks WHERE commission_id = ? AND status = 'backlog'").get(commissionId) as { count: number }).count, 2);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM documents WHERE commission_id = ? AND type = 'plan'").get(commissionId) as { count: number }).count, 1);
-    assert.deepEqual(analyzedWith, { prompt: "", model: "supervisor-model", reasoningEffort: "high", customArgs: [], sandboxMode: "workspace-write", approvalPolicy: "on-request", networkAccess: true });
+    assert.deepEqual(analyzedWith, { prompt: "", model: "supervisor-model", reasoningEffort: "high", sandboxMode: "workspace-write", approvalPolicy: "on-request", networkAccess: true, agentBackend: "codex", pluginVersion: "0.3.15", backendOptions: { customArgs: [] } });
     assert.deepEqual(plannedWith, analyzedWith);
 
     const mainTaskId = (database.prepare("SELECT main_task_id FROM commissions WHERE id = ?").get(commissionId) as { main_task_id: string }).main_task_id;

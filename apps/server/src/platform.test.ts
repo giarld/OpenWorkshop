@@ -3,7 +3,7 @@ import { access, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { acquireInstanceLock, clearRuntimeState, consumeRuntimeStop, getWorkshopHome, prepareWorkshopHome, pruneLogFiles, readLatestLog, readRuntimeState, requestRuntimeStop, writeRuntimeState } from "./platform.ts";
+import { acquireInstanceLock, clearRuntimeState, consumeRuntimeStop, getWorkshopHome, prepareWorkshopHome, processIsAlive, pruneLogFiles, readLatestLog, readRuntimeState, requestRuntimeStop, writeRuntimeState } from "./platform.ts";
 
 test("uses the target platform's path rules", () => {
   assert.equal(getWorkshopHome({ APPDATA: "C:\\Users\\tester\\AppData\\Roaming" }, "win32", "C:\\Users\\tester"), "C:\\Users\\tester\\AppData\\Roaming\\OpenWorkshop");
@@ -26,6 +26,15 @@ test("recovers a stale instance lock and fails closed for active or concurrent l
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("treats permission-denied PID probes as alive", () => {
+  const fail = (code: string) => () => {
+    throw Object.assign(new Error(code), { code });
+  };
+  assert.equal(processIsAlive(1, () => undefined), true);
+  assert.equal(processIsAlive(1, fail("EPERM")), true);
+  assert.equal(processIsAlive(1, fail("ESRCH")), false);
 });
 
 test("recovers a stale or incomplete instance-lock recovery claim", async () => {

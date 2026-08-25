@@ -2,12 +2,13 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { type AgentApprovalKind, type AgentBackendHealth, type AgentCompletion, type AgentEvent, type AgentInput, type AgentSession, type AgentSessionOptions, type AgentStartOptions, type AgentTurn } from "./agent.ts";
 import { attachmentMessage, localImageInputs, materializeRunAttachments, runAttachmentCopies, selectedTaskAttachments, type AttachmentRow } from "./attachments.ts";
-import { APPROVAL_POLICIES, COMMAND_APPROVAL_POLICY, COMMAND_SANDBOX_MODE, SANDBOX_MODES, CodexAppServerClosedError, codexAppServerArgs, createRunContext, recoverRunContexts, validateCustomArgs, type ApprovalPolicy, type CodexAppServer, type CodexAppServerOptions, type CodexInput, type CodexRunHandle, type NormalizedCodexEvent, type SandboxMode } from "./codex.ts";
-import type { AgentMentionHandler } from "./comments.ts";
+import { createRunContext, recoverRunContexts } from "./run-context.ts";
+import { addRunCommentOnce, type AgentMentionHandler } from "./comments.ts";
 import { SettingsStore } from "./database.ts";
 import { notify } from "./notifications.ts";
-import { isReworkRun, ProjectLockManager, registerSchedulerRoutes, Scheduler } from "./scheduler.ts";
+import { isReworkRun, ProjectLockManager, registerSchedulerRoutes, RUN_HEALTH_TIMEOUT_FAILURE_CODE, Scheduler, type RunPreflight } from "./scheduler.ts";
 import { configuredSecrets, isHighRiskCommand, normalizeCommands, redactSensitive } from "./security.ts";
 
 type RunStatus = "queued" | "preparing" | "running" | "waiting_approval" | "waiting_input" | "succeeded" | "failed" | "cancelled" | "interrupted";
@@ -77,20 +78,25 @@ type TaskContext = {
 };
 type RunContextFiles = Parameters<typeof createRunContext>[2];
 
-type RunClient = Pick<CodexAppServer, "initialize" | "startRun" | "steer" | "interrupt" | "close">;
-export type RunClientLauncher = (options: CodexAppServerOptions) => RunClient;
+export type RunClientLauncher = (backend: string, options: AgentSessionOptions) => AgentSession;
 
-type ActiveRun = { client: RunClient; handle?: CodexRunHandle; contextDirectory: string; cleanupContext(): Promise<void> };
+type ActiveRun = { client: AgentSession; handle?: AgentTurn; turnOptions?: AgentStartOptions; contextDirectory: string; cleanupContext(): Promise<void> };
 type PendingSteer = { message: string; attachments: AttachmentRow[] };
 const DEFAULT_INACTIVITY_WARNING_MS = 30 * 60_000;
+const MAX_MODEL_CAPACITY_RETRIES = 3;
+const MODEL_CAPACITY_RETRY_DELAY_MS = 10_000;
+const REVIEWER_REWORK_CONTRACT = "In a rework review, first regress every unresolved blocking finding from the triggering review. Set repairAccepted to false when any previous finding remains; stop immediately, do not search for new issues, and return only the regressions. Set repairAccepted to true only after all previous findings pass; then continue this same review session to search for new issues. If a new fix reactivates any previously resolved finding, set reactivatedOldFinding to true, include the detailed blocking finding, stop the review immediately, and do not search for additional issues. Return JSON with repairAccepted, reactivatedOldFinding, passed, summary, checks, and findings. repairAccepted false means the service immediately sends the task back for fixing.";
 
-export class CodexRunController {
+export class AgentRunController {
   private readonly active = new Map<string, ActiveRun>();
   private readonly pendingCompletions = new Set<Promise<void>>();
   private readonly approvalResponders = new Map<string, (decision: unknown) => void>();
   private readonly inputResponders = new Map<string, { respond: (answers: unknown) => void; questionIds: Set<string> }>();
   private readonly interruptModes = new Map<string, "pause" | "cancel">();
   private readonly pendingSteers = new Map<string, PendingSteer[]>();
+  private readonly modelCapacityRetries = new Map<string, number>();
+  private readonly modelCapacitySignals = new Set<string>();
+  private readonly modelCapacityRetryWaiters = new Map<string, { timer: NodeJS.Timeout; resolve: (ready: boolean) => void }>();
   private readonly inactivityTimers = new Map<string, NodeJS.Timeout>();
   private readonly inactivityWarnings = new Set<string>();
   private readonly database: DatabaseSync;
@@ -99,15 +105,23 @@ export class CodexRunController {
   private readonly onTerminal: (runId: string) => Promise<void>;
   private readonly attachmentsRoot: string;
   private readonly inactivityWarningMs: number;
+  private readonly health: ((backend: string) => Promise<AgentBackendHealth>) | undefined;
+  private readonly sanitizeError: ((backend: string, error: unknown) => string) | undefined;
+  private readonly eventSecrets: ((backend: string) => readonly string[]) | undefined;
+  private readonly modelCapacityRetryDelayMs: number;
   private closing = false;
 
-  constructor(database: DatabaseSync, hub: EventHub, launch: RunClientLauncher, onTerminal: (runId: string) => Promise<void> = async () => undefined, attachmentsRoot = "attachments", inactivityWarningMs = DEFAULT_INACTIVITY_WARNING_MS) {
+  constructor(database: DatabaseSync, hub: EventHub, launch: RunClientLauncher, onTerminal: (runId: string) => Promise<void> = async () => undefined, attachmentsRoot = "attachments", inactivityWarningMs = DEFAULT_INACTIVITY_WARNING_MS, health?: (backend: string) => Promise<AgentBackendHealth>, sanitizeError?: (backend: string, error: unknown) => string, eventSecrets?: (backend: string) => readonly string[], modelCapacityRetryDelayMs = MODEL_CAPACITY_RETRY_DELAY_MS) {
     this.database = database;
     this.hub = hub;
     this.launch = launch;
     this.onTerminal = onTerminal;
     this.attachmentsRoot = attachmentsRoot;
     this.inactivityWarningMs = inactivityWarningMs;
+    this.health = health;
+    this.sanitizeError = sanitizeError;
+    this.eventSecrets = eventSecrets;
+    this.modelCapacityRetryDelayMs = modelCapacityRetryDelayMs;
   }
 
   async steer(runId: string, message: string, attachmentIds: readonly string[] = []): Promise<void> {
@@ -117,8 +131,8 @@ export class CodexRunController {
     claimRunAttachments(this.database, runId, runRow.task_id, attachments);
     try {
       const copies = await materializeRunAttachments(attachments, this.attachmentsRoot, run.contextDirectory);
-      const input: CodexInput[] = [{ type: "text", text: attachmentMessage(message, copies) }, ...localImageInputs(copies)];
-      await run.client.steer(run.handle!.threadId, run.handle!.turnId, attachments.length ? input : message);
+      const input: AgentInput[] = [{ type: "text", text: attachmentMessage(message, copies) }, ...localImageInputs(copies)];
+      await run.client.steer(attachments.length ? input : message);
       this.armInactivityWarning(runId);
     } catch (error) {
       releaseRunAttachments(this.database, runId, attachments);
@@ -140,7 +154,7 @@ export class CodexRunController {
     this.interruptModes.set(runId, mode);
     if (!run.handle) return;
     try {
-      await run.client.interrupt(run.handle!.threadId, run.handle!.turnId);
+      await run.client.interrupt();
     } catch (error) {
       this.interruptModes.delete(runId);
       throw error;
@@ -179,16 +193,28 @@ export class CodexRunController {
     }
     const contextIndex = Object.keys(contextFiles).map((name) => `- ${join(context.directory, name)}`).join("\n");
     const config = object(JSON.parse(run.config_snapshot_json), "config snapshot");
-    const customArgs = config.customArgs === undefined ? [] : stringArray(config.customArgs, "config customArgs");
-    const sandboxMode = SANDBOX_MODES.includes(config.sandboxMode as SandboxMode) ? config.sandboxMode as SandboxMode : COMMAND_SANDBOX_MODE;
-    const approvalPolicy = APPROVAL_POLICIES.includes(config.approvalPolicy as ApprovalPolicy) ? config.approvalPolicy as ApprovalPolicy : COMMAND_APPROVAL_POLICY;
-    const networkAccess = typeof config.networkAccess === "boolean" ? config.networkAccess : true;
-    validateCustomArgs(customArgs);
-    let client: RunClient;
+    const agentBackend = typeof config.agentBackend === "string" ? config.agentBackend : "codex";
     try {
-      client = this.launch({
+      if (this.health) {
+        const health = await this.health(agentBackend);
+        if (!health.ok) throw Object.assign(new Error(health.error ?? "Agent backend is unavailable"), { statusCode: 503 });
+      }
+    } catch (error) {
+      await context.cleanup();
+      releaseRunAttachments(this.database, runId, initialSourceAttachments);
+      await this.fail(runId, error);
+      throw error;
+    }
+    const sandboxMode = ["read-only", "workspace-write", "danger-full-access"].includes(String(config.sandboxMode)) ? config.sandboxMode as "read-only" | "workspace-write" | "danger-full-access" : "workspace-write";
+    const approvalPolicy = ["untrusted", "on-request", "never"].includes(String(config.approvalPolicy)) ? config.approvalPolicy as "untrusted" | "on-request" | "never" : "on-request";
+    const networkAccess = typeof config.networkAccess === "boolean" ? config.networkAccess : true;
+    const backendOptions = object(config.backendOptions ?? {}, "backendOptions");
+    if (agentBackend === "codex" && backendOptions.customArgs === undefined && config.customArgs !== undefined) backendOptions.customArgs = stringArray(config.customArgs, "config customArgs");
+    let client: AgentSession;
+    try {
+      client = this.launch(agentBackend, {
         cwd,
-        args: codexAppServerArgs(sandboxMode, networkAccess, customArgs),
+        backendOptions, sandboxMode, networkAccess,
         onEvent: (event) => this.onEvent(runId, event),
         onApproval: (event, respond) => this.onApproval(runId, event, respond),
         onInput: (event, respond) => this.onInput(runId, event, respond)
@@ -196,6 +222,7 @@ export class CodexRunController {
     } catch (error) {
       await context.cleanup();
       releaseRunAttachments(this.database, runId, initialSourceAttachments);
+      await this.fail(runId, error);
       throw error;
     }
     this.active.set(runId, { client, contextDirectory: context.directory, cleanupContext: context.cleanup });
@@ -215,33 +242,28 @@ export class CodexRunController {
           : isReworkRun(this.database, run.id)
             ? `You are the developer Agent handling review rework. Read every context file before acting and resolve every blocking finding from the triggering review. After each fix, self-review the affected behavior and checks. If you find any remaining or newly introduced problem, fix it and self-review again. Repeat until all findings are closed, with at most 3 self-review rounds. Do not hand work back to Reviewer while a known issue remains.\n\nCurrent objective: ${task.title}\nExecution boundary: work only inside the provided workspace.\nContext files:\n${contextIndex}\n\nReturn JSON only: {"resolved":boolean,"summary":"string","selfReviewRounds":1,"remainingFindings":["string"]}. Set resolved true only when all triggering findings and self-review findings are closed, with remainingFindings empty. If findings remain after 3 rounds, set resolved false, selfReviewRounds to 3, and list every remaining finding; the task will be blocked.`
             : `You are the developer Agent. Read every context file before acting.\n\nCurrent objective: ${task.title}\nExecution boundary: ${task.read_only ? "read-only analysis; do not modify project files" : "work only inside the provided workspace and complete the task acceptance criteria"}.\nContext files:\n${contextIndex}\n\nComplete the task and report the key result, checks, constraints, and remaining risks in the final message. The final message is saved to the task discussion; mention @负责人 when human attention or a decision is required.`;
-      const handle = await client.startRun({
+      const effectivePrompt = run.role === "reviewer" ? prompt + "\n\n" + REVIEWER_REWORK_CONTRACT : prompt;
+      const turnOptions: AgentStartOptions = {
         cwd,
         sandbox: sandboxMode,
         approvalPolicy,
-        prompt,
-        ...(initialAttachments.length ? { input: [{ type: "text" as const, text: prompt }, ...localImageInputs(initialAttachments)] } : {}),
+        prompt: effectivePrompt,
+        ...(initialAttachments.length ? { input: [{ type: "text" as const, text: effectivePrompt }, ...localImageInputs(initialAttachments)] } : {}),
         ...(typeof config.model === "string" ? { model: config.model } : {}),
-        ...(typeof config.reasoningEffort === "string" ? { effort: config.reasoningEffort } : {})
-      });
-      if (handle.model && config.model !== handle.model) {
-        config.model = handle.model;
-        this.database.prepare("UPDATE runs SET config_snapshot_json = ? WHERE id = ?").run(JSON.stringify(config), runId);
-      }
-      this.active.set(runId, { client, handle, contextDirectory: context.directory, cleanupContext: context.cleanup });
-      void handle.completed.then(
-        (event) => this.trackCompletion(this.complete(runId, event)),
-        (error) => this.trackCompletion(this.fail(runId, error))
-      );
+        ...(typeof config.reasoningEffort === "string" ? { reasoningEffort: config.reasoningEffort } : {})
+      };
+      const handle = await client.start(turnOptions);
+      this.active.set(runId, { client, handle, turnOptions, contextDirectory: context.directory, cleanupContext: context.cleanup });
+      this.trackTurn(runId, handle);
       if (this.interruptModes.has(runId)) {
-        try { await client.interrupt(handle.threadId, handle.turnId); }
+        try { await client.interrupt(); }
         catch { await this.release(runId); await this.onTerminal(runId); }
         return;
       }
       this.database.prepare("UPDATE runs SET status = 'running' WHERE id = ? AND status = 'preparing'").run(runId);
       appendRunEvent(this.database, this.hub, runId, "run.status", "Run running", { status: "running" });
       this.armInactivityWarning(runId);
-      await this.flushPendingSteers(runId, client, handle);
+      await this.flushPendingSteers(runId, client);
     } catch (error) {
       this.releasePendingSteers(runId);
       releaseRunAttachments(this.database, runId, initialSourceAttachments);
@@ -250,19 +272,19 @@ export class CodexRunController {
     }
   }
 
-  private async flushPendingSteers(runId: string, client: RunClient, handle: CodexRunHandle): Promise<void> {
+  private async flushPendingSteers(runId: string, client: AgentSession): Promise<void> {
     const pending = this.pendingSteers.get(runId) ?? [];
     this.pendingSteers.delete(runId);
     for (const item of pending) {
       try {
         const run = this.activeRun(runId);
         const copies = await materializeRunAttachments(item.attachments, this.attachmentsRoot, run.contextDirectory);
-        const input: CodexInput[] = [{ type: "text", text: attachmentMessage(item.message, copies) }, ...localImageInputs(copies)];
-        await client.steer(handle.threadId, handle.turnId, item.attachments.length ? input : item.message);
+        const input: AgentInput[] = [{ type: "text", text: attachmentMessage(item.message, copies) }, ...localImageInputs(copies)];
+        await client.steer(item.attachments.length ? input : item.message);
       }
       catch (error) {
         releaseRunAttachments(this.database, runId, item.attachments);
-        appendRunEvent(this.database, this.hub, runId, "human.message.failed", "Queued human message could not be delivered", { message: item.message, error: error instanceof Error ? error.message : String(error) });
+        appendRunEvent(this.database, this.hub, runId, "human.message.failed", "Queued human message could not be delivered", { message: item.message, error: this.safeError(runId, error) });
       }
     }
   }
@@ -304,30 +326,36 @@ export class CodexRunController {
     await Promise.allSettled([...this.pendingCompletions]);
   }
 
-  private activeRun(runId: string): ActiveRun & { handle: CodexRunHandle } {
+  private activeRun(runId: string): ActiveRun & { handle: AgentTurn } {
     const run = this.active.get(runId);
     if (!run?.handle) throw conflict("Run is not active in this server process");
-    return run as ActiveRun & { handle: CodexRunHandle };
+    return run as ActiveRun & { handle: AgentTurn };
   }
 
-  private onEvent(runId: string, event: NormalizedCodexEvent): void {
-    if (event.type === "token.usage") {
-      const usage = codexTokenUsage(event.payload);
-      if (usage) this.database.prepare("UPDATE runs SET token_input = ?, token_output = ?, token_cached = ? WHERE id = ?")
-        .run(usage.input, usage.output, usage.cached, runId);
-    }
-    appendRunEvent(this.database, this.hub, runId, event.type, event.summary, { method: event.method, ...(event.requestId === undefined ? {} : { requestId: event.requestId }), ...event.payload });
+  private onEvent(runId: string, event: AgentEvent): void {
+    if (isModelCapacityText(event.summary) || isModelCapacityText(JSON.stringify(event.payload)) || isModelCapacityText(event.text ?? "")) this.modelCapacitySignals.add(runId);
+    if (event.tokenUsage) this.database.prepare("UPDATE runs SET token_input = ?, token_output = ?, token_cached = ? WHERE id = ?")
+      .run(event.tokenUsage.input, event.tokenUsage.output, event.tokenUsage.cached, runId);
+    const explicitSecrets = this.explicitSecretsForRun(runById(this.database, runId));
+    appendRunEvent(this.database, this.hub, runId, event.type, event.summary, {
+      ...event.payload, sourceType: event.sourceType, ...(event.requestId === undefined ? {} : { requestId: event.requestId }),
+      ...(event.text !== undefined ? { text: event.text } : {}),
+      ...(event.type === "agent.message.delta" && event.text !== undefined ? { delta: event.text } : {})
+    }, false, explicitSecrets);
     this.armInactivityWarning(runId);
-    if (event.type === "request.resolved") this.resolveRequest(runId, String(event.payload.requestId ?? ""));
+    if (event.type === "request.resolved") this.resolveRequest(runId, String(event.requestId ?? event.payload.requestId ?? ""));
   }
 
-  private onApproval(runId: string, event: NormalizedCodexEvent, respond: (decision: unknown) => void): void {
+  private onApproval(runId: string, event: AgentEvent, respond: (decision: unknown) => void): void {
     const requestId = String(event.requestId ?? "");
-    if (!requestId) throw new Error("Codex approval is missing a request id");
+    if (!requestId) throw new Error("Agent approval is missing a request id");
     const approvalId = randomUUID();
-    const kind = approvalKind(event.method, event.payload);
+    if (!event.approvalKind) throw new Error("Agent approval is missing a standardized kind");
+    const kind = approvalKind(event.approvalKind, event.payload);
     const run = runById(this.database, runId);
-    const request = redactForDatabase(this.database, approvalRequest(kind, event.payload, run.workspace_path));
+    const explicitSecrets = this.explicitSecretsForRun(run);
+    const request = redactForDatabase(this.database, approvalRequest(kind, event.payload, run.workspace_path), explicitSecrets);
+    const summary = redactForDatabase(this.database, event.summary, explicitSecrets);
     const now = new Date().toISOString();
     const automatic = kind === "permission" && Boolean((this.database.prepare("SELECT auto_approve_permissions FROM tasks WHERE id = ?").get(run.task_id) as { auto_approve_permissions: number }).auto_approve_permissions);
     if (automatic) {
@@ -339,17 +367,21 @@ export class CodexRunController {
     }
     this.database.prepare("INSERT INTO approvals (id, run_id, codex_request_id, kind, request_json, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)")
       .run(approvalId, runId, requestId, kind, JSON.stringify({ ...request.value, redacted: request.redacted }), now);
-    notify(this.database, "approval", "等待人工审批", event.summary, "approval", approvalId);
+    notify(this.database, "approval", "等待人工审批", summary.value, "approval", approvalId);
     this.approvalResponders.set(approvalKey(runId, requestId), respond);
     this.refreshRunStatus(runId);
-    appendRunEvent(this.database, this.hub, runId, "approval.created", event.summary, { approvalId });
+    appendRunEvent(this.database, this.hub, runId, "approval.created", summary.value, { approvalId }, summary.redacted, explicitSecrets);
   }
 
-  private onInput(runId: string, event: NormalizedCodexEvent, respond: (answers: unknown) => void): void {
+  private explicitSecretsForRun(run: RunRow): readonly string[] {
+    const config = object(JSON.parse(run.config_snapshot_json), "config snapshot");
+    return this.eventSecrets?.(typeof config.agentBackend === "string" ? config.agentBackend : "codex") ?? [];
+  }
+
+  private onInput(runId: string, event: AgentEvent, respond: (answers: unknown) => void): void {
     const requestId = String(event.requestId ?? "");
-    if (!requestId) throw new Error("Codex user input request is missing a request id");
-    const questions = Array.isArray(event.payload.questions) ? event.payload.questions : [];
-    const questionIds = new Set(questions.flatMap((question) => question && typeof question === "object" && typeof (question as JsonObject).id === "string" && (question as JsonObject).id ? [String((question as JsonObject).id)] : []));
+    if (!requestId) throw new Error("Agent user input request is missing a request id");
+    const questionIds = new Set((event.questions ?? []).map(({ id }) => id));
     this.inputResponders.set(approvalKey(runId, requestId), { respond, questionIds });
     this.refreshRunStatus(runId);
   }
@@ -377,17 +409,35 @@ export class CodexRunController {
 
   private armInactivityWarning(runId: string): void {
     this.clearInactivityTimer(runId);
-    if (this.inactivityWarnings.has(runId) || this.inactivityWarningMs <= 0 || !this.active.has(runId)) return;
+    if (this.inactivityWarningMs <= 0 || !this.active.has(runId)) return;
+    const warned = this.inactivityWarnings.has(runId);
     const timer = setTimeout(() => {
       this.inactivityTimers.delete(runId);
       const run = this.database.prepare("SELECT status, task_id FROM runs WHERE id = ?").get(runId) as { status: RunStatus; task_id: string } | undefined;
       if (!run || run.status !== "running" || !this.active.has(runId)) return;
+      if (warned) {
+        this.trackCompletion(this.handleInactivityTimeout(runId));
+        return;
+      }
       this.inactivityWarnings.add(runId);
       appendRunEvent(this.database, this.hub, runId, "run.inactivity_warning", "Run has produced no events for an extended period", { inactivityMs: this.inactivityWarningMs });
       notify(this.database, "attention", "Run 长时间无事件", `Run 已连续 ${Math.round(this.inactivityWarningMs / 60_000)} 分钟没有产生新事件，请检查后决定暂停或继续等待。`, "task", run.task_id);
+      this.armInactivityWarning(runId);
     }, this.inactivityWarningMs);
     timer.unref();
     this.inactivityTimers.set(runId, timer);
+  }
+
+  private async handleInactivityTimeout(runId: string): Promise<void> {
+    const inactivityMs = this.inactivityWarningMs * 2;
+    const summary = `Run 连续 ${Math.round(inactivityMs / 60_000)} 分钟没有产生事件，健康检查已中断当前会话。`;
+    const interrupted = this.database.prepare(`UPDATE runs SET status = 'interrupted', finished_at = ?, failure_code = ?, failure_summary = ?
+      WHERE id = ? AND status = 'running'`).run(new Date().toISOString(), RUN_HEALTH_TIMEOUT_FAILURE_CODE, summary, runId);
+    if (!interrupted.changes || !this.active.has(runId)) return;
+    appendRunEvent(this.database, this.hub, runId, "run.health_check_timeout", "Run health check timed out", { inactivityMs, status: "interrupted" });
+    try { await this.interrupt(runId, "pause"); }
+    catch (error) { appendRunEvent(this.database, this.hub, runId, "run.health_check_interrupt_warning", "Run interrupt request failed; closing the Agent session", { warning: this.safeError(runId, error) }); }
+    await this.finishTerminal(runId);
   }
 
   private clearInactivityTimer(runId: string): void {
@@ -396,30 +446,44 @@ export class CodexRunController {
     this.inactivityTimers.delete(runId);
   }
 
-  private async complete(runId: string, event: NormalizedCodexEvent): Promise<void> {
-    const status = event.type === "turn.interrupted" ? "interrupted" : event.type === "turn.failed" ? "failed" : "succeeded";
-    if (!this.interruptModes.has(runId)) {
-      this.database.prepare("UPDATE runs SET status = ?, finished_at = ? WHERE id = ? AND status NOT IN ('cancelled', 'interrupted')").run(status, new Date().toISOString(), runId);
-      appendRunEvent(this.database, this.hub, runId, "run.status", `Run ${status}`, { status });
+  private async complete(runId: string, completion: AgentCompletion): Promise<void> {
+    if (!this.active.has(runId)) return;
+    const status = completion.status;
+    if (completion.event.text !== undefined) this.onEvent(runId, completion.event);
+    const capacityFailure = status === "failed" && (this.modelCapacitySignals.has(runId) || isModelCapacityEvent(completion.event));
+    if (!this.interruptModes.has(runId) && capacityFailure) {
+      if (await this.retryModelCapacity(runId)) return;
     }
-    await this.release(runId);
-    await this.onTerminal(runId);
+    if (!this.interruptModes.has(runId)) {
+      const summary = status === "failed" ? this.safeError(runId, completion.event.summary.trim() || "Agent turn failed") : null;
+      this.database.prepare("UPDATE runs SET status = ?, finished_at = ?, failure_code = ?, failure_summary = ? WHERE id = ? AND status NOT IN ('cancelled', 'interrupted')")
+        .run(status, new Date().toISOString(), capacityFailure ? "model_at_capacity" : null, summary, runId);
+      appendRunEvent(this.database, this.hub, runId, "run.status", `Run ${status}`, { status, ...(summary ? { summary } : {}) });
+    }
+    await this.finishTerminal(runId);
   }
 
   private async fail(runId: string, error: unknown): Promise<void> {
-    if (this.closing || error instanceof CodexAppServerClosedError) {
+    if (this.closing) {
       await this.release(runId);
       return;
     }
-    const summary = error instanceof Error ? error.message : String(error);
+    const summary = this.safeError(runId, error);
     const failed = this.database.prepare("UPDATE runs SET status = 'failed', finished_at = ?, failure_summary = ? WHERE id = ? AND status IN ('preparing', 'running', 'waiting_approval', 'waiting_input')")
       .run(new Date().toISOString(), summary, runId);
     if (failed.changes) appendRunEvent(this.database, this.hub, runId, "run.status", "Run failed", { status: "failed", summary });
+    if (!failed.changes && !this.active.has(runId)) return;
+    await this.finishTerminal(runId, true);
+  }
+
+  private async finishTerminal(runId: string, force = false): Promise<void> {
+    if (!force && !this.active.has(runId)) return;
     await this.release(runId);
     await this.onTerminal(runId);
   }
 
   private async release(runId: string): Promise<void> {
+    this.cancelModelCapacityRetry(runId);
     const run = this.active.get(runId);
     this.active.delete(runId);
     this.interruptModes.delete(runId);
@@ -428,7 +492,69 @@ export class CodexRunController {
     this.releasePendingSteers(runId);
     for (const key of this.approvalResponders.keys()) if (key.startsWith(`${runId}:`)) this.approvalResponders.delete(key);
     for (const key of this.inputResponders.keys()) if (key.startsWith(`${runId}:`)) this.inputResponders.delete(key);
-    if (run) await Promise.allSettled([run.client.close(), run.cleanupContext()]);
+    if (run) {
+      const results = await Promise.allSettled([run.client.close(), run.cleanupContext()]);
+      for (const result of results) if (result.status === "rejected") appendRunEvent(this.database, this.hub, runId, "run.cleanup.warning", "Run cleanup failed", { warning: this.safeError(runId, result.reason) });
+    }
+    this.modelCapacityRetries.delete(runId);
+    this.modelCapacitySignals.delete(runId);
+  }
+
+  private async retryModelCapacity(runId: string): Promise<boolean> {
+    const active = this.active.get(runId);
+    if (!active?.turnOptions) return false;
+    const retryNo = (this.modelCapacityRetries.get(runId) ?? 0) + 1;
+    if (retryNo > MAX_MODEL_CAPACITY_RETRIES) return false;
+    this.modelCapacityRetries.set(runId, retryNo);
+    const readyAt = new Date(Date.now() + this.modelCapacityRetryDelayMs).toISOString();
+    appendRunEvent(this.database, this.hub, runId, "run.model_capacity_retry", "Model capacity retry scheduled in the current Agent session", { retryNo, readyAt });
+    addRunCommentOnce(this.database, { taskId: runById(this.database, runId).task_id, runId, authorType: "system", content: `模型容量暂时不可用，将在当前 Agent 会话内延迟重试（第 ${retryNo}/${MAX_MODEL_CAPACITY_RETRIES} 次，约 ${Math.round(this.modelCapacityRetryDelayMs / 1000)} 秒后执行）。` });
+    if (!await this.waitForModelCapacityRetry(runId)) return true;
+    const current = this.active.get(runId);
+    if (this.closing || current !== active) return true;
+    this.modelCapacitySignals.delete(runId);
+    try {
+      const handle = await active.client.continue(active.turnOptions);
+      active.handle = handle;
+      this.trackTurn(runId, handle);
+      this.armInactivityWarning(runId);
+    } catch (error) {
+      if (isModelCapacityText(error instanceof Error ? error.message : String(error)) && await this.retryModelCapacity(runId)) return true;
+      if (isModelCapacityText(error instanceof Error ? error.message : String(error))) this.database.prepare("UPDATE runs SET failure_code = 'model_at_capacity' WHERE id = ?").run(runId);
+      await this.fail(runId, error);
+    }
+    return true;
+  }
+
+  private waitForModelCapacityRetry(runId: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => { this.modelCapacityRetryWaiters.delete(runId); resolve(true); }, this.modelCapacityRetryDelayMs);
+      timer.unref();
+      this.modelCapacityRetryWaiters.set(runId, { timer, resolve });
+    });
+  }
+
+  private cancelModelCapacityRetry(runId: string): void {
+    const waiter = this.modelCapacityRetryWaiters.get(runId);
+    if (!waiter) return;
+    clearTimeout(waiter.timer);
+    this.modelCapacityRetryWaiters.delete(runId);
+    waiter.resolve(false);
+  }
+
+  private trackTurn(runId: string, handle: AgentTurn): void {
+    void handle.completed.then(
+      (completion) => this.trackCompletion(this.complete(runId, completion)),
+      (error) => this.trackCompletion(this.fail(runId, error))
+    );
+  }
+
+  private safeError(runId: string, error: unknown): string {
+    const run = runById(this.database, runId);
+    const config = object(JSON.parse(run.config_snapshot_json), "config snapshot");
+    const backend = typeof config.agentBackend === "string" ? config.agentBackend : "codex";
+    const message = this.sanitizeError?.(backend, error) ?? (error instanceof Error ? error.message : String(error));
+    return redactForDatabase(this.database, message).value;
   }
 
   private trackCompletion(completion: Promise<void>): void {
@@ -436,6 +562,14 @@ export class CodexRunController {
     void completion.then(() => this.pendingCompletions.delete(completion), () => this.pendingCompletions.delete(completion));
   }
 };
+
+function isModelCapacityEvent(event: AgentEvent): boolean {
+  return isModelCapacityText(event.summary) || isModelCapacityText(JSON.stringify(event.payload)) || isModelCapacityText(event.text ?? "");
+}
+
+function isModelCapacityText(value: string): boolean {
+  return /(?:selected\s+)?model\s+is\s+at\s+capacity/i.test(value);
+}
 
 export class EventHub {
   private readonly listeners = new Set<(event: RunEvent) => void>();
@@ -450,11 +584,11 @@ export class EventHub {
   }
 }
 
-export function appendRunEvent(database: DatabaseSync, hub: EventHub, runId: string, eventType: string, summary: string, payload: JsonObject = {}, redacted = false): RunEvent {
+export function appendRunEvent(database: DatabaseSync, hub: EventHub, runId: string, eventType: string, summary: string, payload: JsonObject = {}, redacted = false, explicitSecrets: readonly string[] = []): RunEvent {
   runById(database, runId);
   const createdAt = new Date().toISOString();
-  const safeSummary = redactForDatabase(database, summary);
-  const safePayload = redactForDatabase(database, payload);
+  const safeSummary = redactForDatabase(database, summary, explicitSecrets);
+  const safePayload = redactForDatabase(database, payload, explicitSecrets);
   const result = database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, ?, ?, ?, ?, ?)")
     .run(runId, eventType, safeSummary.value, JSON.stringify(safePayload.value), redacted || safeSummary.redacted || safePayload.redacted ? 1 : 0, createdAt);
   const event = eventById(database, Number(result.lastInsertRowid));
@@ -642,13 +776,20 @@ function prettyJson(value: string): string {
   catch { return value; }
 }
 
-export async function registerProductionRunRoutes(server: FastifyInstance, database: DatabaseSync, launch: RunClientLauncher, attachmentsRoot = "attachments", projectLocks = new ProjectLockManager()): Promise<AgentMentionHandler> {
+export async function registerProductionRunRoutes(server: FastifyInstance, database: DatabaseSync, launch: RunClientLauncher, attachmentsRoot = "attachments", projectLocks = new ProjectLockManager(), health?: (backend: string) => Promise<AgentBackendHealth>, preflight?: RunPreflight, sanitizeError?: (backend: string, error: unknown) => string, eventSecrets?: (backend: string) => readonly string[]): Promise<AgentMentionHandler> {
   const hub = new EventHub();
   const projectRoots = database.prepare("SELECT real_path FROM projects WHERE archived_at IS NULL").all() as Array<{ real_path: string }>;
   await Promise.all(projectRoots.map(({ real_path }) => recoverRunContexts(real_path)));
   let scheduler!: Scheduler;
-  const controller = new CodexRunController(database, hub, launch, (runId) => scheduler.terminal(runId), attachmentsRoot);
-  scheduler = new Scheduler(database, controller, undefined, projectLocks);
+  const controller = new AgentRunController(database, hub, launch, (runId) => scheduler.terminal(runId), attachmentsRoot, DEFAULT_INACTIVITY_WARNING_MS, health, sanitizeError, eventSecrets);
+  scheduler = new Scheduler(database, controller, undefined, projectLocks, preflight);
+  const safeMessage = (error: unknown, runId?: string) => {
+    const run = runId ? database.prepare("SELECT config_snapshot_json FROM runs WHERE id = ?").get(runId) as { config_snapshot_json: string } | undefined : undefined;
+    const config = run ? object(JSON.parse(run.config_snapshot_json), "config snapshot") : {};
+    const backend = typeof config.agentBackend === "string" ? config.agentBackend : "codex";
+    const message = sanitizeError?.(backend, error) ?? (error instanceof Error ? error.message : String(error));
+    return redactForDatabase(database, message).value;
+  };
   const controls: RunController = {
     steer: (runId, message, attachmentIds) => controller.steer(runId, message, attachmentIds),
     interrupt: (runId, mode) => controller.interrupt(runId, mode),
@@ -667,7 +808,7 @@ export async function registerProductionRunRoutes(server: FastifyInstance, datab
         await controller.steer(reserved.id, message, attachmentIds);
         appendRunEvent(database, hub, reserved.id, "human.message", "Human mentioned Agent", { message, attachmentIds });
         return { action: "steered", runId: reserved.id };
-      } catch (error) { return { action: "unavailable", runId: reserved.id, message: error instanceof Error ? error.message : String(error) }; }
+      } catch (error) { return { action: "unavailable", runId: reserved.id, message: safeMessage(error, reserved.id) }; }
     }
     if (reserved?.status === "preparing") {
       try {
@@ -680,9 +821,9 @@ export async function registerProductionRunRoutes(server: FastifyInstance, datab
             await controller.steer(reserved.id, message, attachmentIds);
             appendRunEvent(database, hub, reserved.id, "human.message", "Human mentioned Agent", { message, attachmentIds });
             return { action: "steered", runId: reserved.id };
-          } catch (steerError) { return { action: "unavailable", runId: reserved.id, message: steerError instanceof Error ? steerError.message : String(steerError) }; }
+          } catch (steerError) { return { action: "unavailable", runId: reserved.id, message: safeMessage(steerError, reserved.id) }; }
         }
-        return { action: "unavailable", runId: reserved.id, message: error instanceof Error ? error.message : String(error) };
+        return { action: "unavailable", runId: reserved.id, message: safeMessage(error, reserved.id) };
       }
     }
     if (reserved) {
@@ -690,7 +831,7 @@ export async function registerProductionRunRoutes(server: FastifyInstance, datab
         const attachments = selectedTaskAttachments(database, taskId, attachmentIds, "not-run");
         claimRunAttachments(database, reserved.id, taskId, attachments);
         return { action: "queued", runId: reserved.id };
-      } catch (error) { return { action: "unavailable", runId: reserved.id, message: error instanceof Error ? error.message : String(error) }; }
+      } catch (error) { return { action: "unavailable", runId: reserved.id, message: safeMessage(error, reserved.id) }; }
     }
     const task = database.prepare("SELECT owner_type, status FROM tasks WHERE id = ? AND archived_at IS NULL").get(taskId) as { owner_type: string; status: string } | undefined;
     if (!task) return { action: "unavailable", message: "Task not found" };
@@ -717,7 +858,10 @@ export async function registerProductionRunRoutes(server: FastifyInstance, datab
         if (runId) claimRunAttachments(database, runId, taskId, attachments);
       }));
       return { action: "triggered", ...(result.runIds[0] ? { runId: result.runIds[0] } : {}) };
-    } catch (error) { return { action: "unavailable", message: error instanceof Error ? error.message : String(error) }; }
+    } catch (error) {
+      const latest = database.prepare("SELECT id FROM runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1").get(taskId) as { id: string } | undefined;
+      return { action: "unavailable", message: safeMessage(error, latest?.id) };
+    }
   };
   mentionAgent.cancelTaskRun = (taskId) => cancelActiveRunForTask(database, hub, controls, taskId);
   mentionAgent.coordinateTask = (taskId) => scheduler.coordinate(taskId);
@@ -766,12 +910,26 @@ export function registerRunRoutes(server: FastifyInstance, database: DatabaseSyn
       ? database.prepare(`WITH RECURSIVE tree(id) AS (
           SELECT id FROM tasks WHERE id = ? UNION ALL
           SELECT task.id FROM tasks AS task JOIN tree ON task.parent_id = tree.id
-        ) SELECT run.* FROM runs AS run JOIN tree ON tree.id = run.task_id ORDER BY run.rowid DESC`).all(request.params.id)
-      : database.prepare("SELECT * FROM runs WHERE task_id = ? ORDER BY attempt_no DESC, rowid DESC").all(request.params.id);
+        ) SELECT run.*, EXISTS(SELECT 1 FROM evidence WHERE evidence.run_id = run.id AND evidence.type = 'diff') AS has_diff
+          FROM runs AS run JOIN tree ON tree.id = run.task_id ORDER BY run.rowid DESC`).all(request.params.id)
+      : database.prepare("SELECT run.*, EXISTS(SELECT 1 FROM evidence WHERE evidence.run_id = run.id AND evidence.type = 'diff') AS has_diff FROM runs AS run WHERE task_id = ? ORDER BY attempt_no DESC, rowid DESC").all(request.params.id);
     return (rows as RunRow[]).map(decodeRun);
   });
 
   server.get<{ Params: { id: string } }>("/api/runs/:id", async (request) => runDetails(database, request.params.id));
+
+  server.get<{ Params: { id: string } }>("/api/runs/:id/diff", async (request) => {
+    runById(database, request.params.id);
+    const evidence = database.prepare("SELECT * FROM evidence WHERE run_id = ? AND type = 'diff'").get(request.params.id) as { payload_json: string } | undefined;
+    if (!evidence) throw notFound("Run modification record not found");
+    const event = database.prepare(`SELECT payload_json FROM run_events
+      WHERE run_id = ? AND event_type = 'codex.event' AND json_extract(payload_json, '$.sourceType') = 'turn/diff/updated'
+      ORDER BY id DESC LIMIT 1`).get(request.params.id) as { payload_json: string } | undefined;
+    if (!event) return evidence;
+    const payload = JSON.parse(evidence.payload_json) as Record<string, unknown>;
+    const patch = (JSON.parse(event.payload_json) as { diff?: unknown }).diff;
+    return typeof patch === "string" && patch ? { ...evidence, payload_json: JSON.stringify({ ...payload, patch }) } : evidence;
+  });
 
   server.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/runs/:id/events", async (request) =>
     eventsAfter(database, cursor(request.query.after), "run_id = ?", request.params.id));
@@ -932,9 +1090,10 @@ function decodeEvent(row: Record<string, unknown>): RunEvent {
   };
 }
 
-function decodeRun(run: RunRow) {
+function decodeRun(run: RunRow & { has_diff?: number }) {
   return {
     ...run,
+    has_diff: Boolean(run.has_diff),
     configSnapshot: JSON.parse(run.config_snapshot_json),
     contextSnapshot: JSON.parse(run.context_snapshot_json),
     config_snapshot_json: undefined,
@@ -1039,29 +1198,12 @@ function enumValue<T extends string>(value: unknown, choices: readonly T[], name
   return value as T;
 }
 
-export function approvalKind(method: string, payload: JsonObject = {}): "command" | "file_change" | "permission" | "high_risk" | "mcp_tool_call" {
-  if (method.includes("commandExecution")) return isHighRiskCommand(payload) ? "high_risk" : "command";
-  if (method.includes("fileChange")) return "file_change";
-  if (method.includes("permissions")) return "permission";
-  if (method === "mcpServer/elicitation/request") return "mcp_tool_call";
-  throw new TypeError(`Unsupported approval method: ${method}`);
-}
-
-export function codexTokenUsage(payload: JsonObject): { input: number; output: number; cached: number } | undefined {
-  const tokenUsage = record(payload.tokenUsage);
-  const total = record(tokenUsage?.total);
-  const input = tokenCount(total?.inputTokens);
-  const output = tokenCount(total?.outputTokens);
-  const cached = tokenCount(total?.cachedInputTokens);
-  return input === undefined || output === undefined || cached === undefined ? undefined : { input, output, cached };
+export function approvalKind(kind: AgentApprovalKind, payload: JsonObject = {}): "command" | "file_change" | "permission" | "high_risk" | "mcp_tool_call" {
+  return kind === "command" && isHighRiskCommand(payload) ? "high_risk" : kind;
 }
 
 function record(value: unknown): JsonObject | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : undefined;
-}
-
-function tokenCount(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 function userInputAnswers(value: unknown): UserInputAnswers {
@@ -1081,8 +1223,8 @@ export function pruneRawRunEvents(database: DatabaseSync, retentionDays = new Se
   return Number(database.prepare("DELETE FROM run_events WHERE event_type = 'command.output' AND created_at < ?").run(cutoff).changes);
 }
 
-function redactForDatabase<T>(database: DatabaseSync, value: T) {
-  return redactSensitive(value, configuredSecrets(new SettingsStore(database).all()));
+function redactForDatabase<T>(database: DatabaseSync, value: T, explicitSecrets: readonly string[] = []) {
+  return redactSensitive(value, [...configuredSecrets(new SettingsStore(database).all()), ...explicitSecrets]);
 }
 
 function approvalRequest(kind: ApprovalRow["kind"], payload: JsonObject, workspacePath: string | null): JsonObject {

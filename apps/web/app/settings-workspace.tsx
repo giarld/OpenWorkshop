@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState, type FormEvent, type KeyboardEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { defaultModelLabel, defaultReasoningLabel, manualModelChoice, pickerBlurCloses, reasoningValues, visibleModels } from "./agent-picker-state";
 import { AVATAR_SETTINGS_EVENT, DEFAULT_AVATARS, avatarSettings, isImageAvatar, type AvatarSettings } from "./avatar-settings";
 import { applyColorTheme, COLOR_THEME_STORAGE_KEY, DEFAULT_COLOR_THEME, storedColorTheme, type ColorTheme } from "./theme-settings";
 
@@ -15,11 +16,11 @@ type Settings = {
 
 type CodexModel = { id: string; displayName?: string; defaultReasoningEffort?: string; supportedReasoningEfforts?: Array<{ reasoningEffort: string; description?: string }>; isDefault?: boolean };
 type AgentRole = "supervisor" | "developer" | "reviewer";
-type AgentRolePresetConfig = { model: string | null; reasoningEffort: string | null; customArgs: string[] };
+type AgentRolePresetConfig = { model: string | null; reasoningEffort: string | null; backendOptions: { customArgs?: string[]; [key: string]: unknown } };
 type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 type ApprovalPolicy = "untrusted" | "on-request" | "never";
-type AgentPreset = { id: string; name: string; agentBackend: "codex"; model: string | null; reasoningEffort: string | null; customArgs: string[]; roleConfigs: Record<AgentRole, AgentRolePresetConfig>; sandboxMode: SandboxMode; approvalPolicy: ApprovalPolicy; networkAccess: boolean; isDefault: boolean };
-type AgentSettings = { health: { ok: boolean; version?: string; models?: CodexModel[]; error?: string }; activePresetId: string; presets: AgentPreset[] };
+type AgentPreset = { id: string; name: string; agentBackend: "codex"; model: string | null; reasoningEffort: string | null; backendOptions: AgentRolePresetConfig["backendOptions"]; roleConfigs: Record<AgentRole, AgentRolePresetConfig>; sandboxMode: SandboxMode; approvalPolicy: ApprovalPolicy; networkAccess: boolean; isDefault: boolean };
+type AgentSettings = { health: { ok: boolean; runtimeVersion?: string; capabilities: { ok: boolean; models: CodexModel[]; reasoningEfforts: string[]; error?: string }; error?: string }; activePresetId: string; presets: AgentPreset[] };
 const ROLE_LABELS: Record<AgentRole, string> = { supervisor: "项目主管 Agent", developer: "执行 Agent", reviewer: "审查 Agent" };
 const ROLE_DESCRIPTIONS: Record<AgentRole, string> = { supervisor: "负责需求澄清、任务规划与执行调度协调。", developer: "负责实现任务与处理返工。", reviewer: "负责独立验证任务结果。" };
 const COLOR_THEME_OPTIONS: Array<{ value: ColorTheme; label: string }> = [
@@ -68,7 +69,7 @@ export function SettingsWorkspace({ onLogout, onPinChanged }: { onLogout(): void
   }, []);
 
   useEffect(() => {
-    const refresh = () => void fetch("/api/settings/agents").then(async (response) => {
+    const refresh = () => void fetch("/api/agents/presets").then(async (response) => {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setAgentSettings(await response.json() as AgentSettings);
     }).catch((error: Error) => setAgentMessage(`加载 Agent 设置失败：${error.message}`));
@@ -163,9 +164,9 @@ export function SettingsWorkspace({ onLogout, onPinChanged }: { onLogout(): void
       </form>
 
       <section className="settings-group" aria-labelledby="agent-settings-title">
-        <header><p className="settings-level">Agent 级</p><h3 id="agent-settings-title">Agent 预设</h3><p>创建多个独立的 Agent 执行配置，并选择当前用于新 Run 的预设。</p>{agentSettings?.health.version && <p>当前版本：{agentSettings.health.version}</p>}{agentSettings && !agentSettings.health.ok && <aside>Codex 当前不可用：{agentSettings.health.error}</aside>}</header>
+        <header><p className="settings-level">Agent 级</p><h3 id="agent-settings-title">Agent 预设</h3><p>创建多个独立的 Agent 执行配置，并选择当前用于新 Run 的预设。</p>{agentSettings?.health.runtimeVersion && <p>当前版本：{agentSettings.health.runtimeVersion}</p>}{agentSettings && !agentSettings.health.ok && <aside>Codex 当前不可用：{agentSettings.health.error}</aside>}</header>
         <div className="agent-settings-editor">
-          {!agentSettings ? <p>{agentMessage || "正在读取本机 Codex 模型…"}</p> : <AgentPresetManager key={agentSettings.activePresetId} settings={agentSettings} busy={busy} onRefresh={async () => { const response = await fetch("/api/settings/agents"); if (!response.ok) throw new Error("加载预设失败"); setAgentSettings(await response.json() as AgentSettings); }} />}
+          {!agentSettings ? <section className="agent-preset-manager" aria-label="Agent 预设"><p>{agentMessage || "正在读取本机 Codex 模型…"}</p></section> : <AgentPresetManager key={agentSettings.activePresetId} settings={agentSettings} busy={busy} onRefresh={async () => { const response = await fetch("/api/agents/presets"); if (!response.ok) throw new Error("加载预设失败"); setAgentSettings(await response.json() as AgentSettings); }} />}
           {agentMessage && <p className="workspace-message" role="status">{agentMessage}</p>}
         </div>
       </section>
@@ -204,6 +205,41 @@ function AvatarSetting({ label, value, fallback, busy, onChange, onError }: { la
   </section>;
 }
 
+function ModelPicker({ value, models, capabilitiesOk, onChange, onRetry }: { value: string; models: CodexModel[]; capabilitiesOk: boolean; onChange(value: string): void; onRetry(): Promise<void> }) {
+  const listId = useId();
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(false);
+  const optionsPointerDown = useRef(false);
+  const selected = models.find((item) => item.id === value);
+  const filtered = visibleModels(models, value, query);
+  const manualChoice = manualModelChoice(query, filtered.length);
+  const label = selected?.displayName ?? (value || defaultModelLabel(models));
+  const choose = (model: string) => { onChange(model); setOpen(false); };
+  const preserveOptions = () => { optionsPointerDown.current = true; setTimeout(() => { optionsPointerDown.current = false; }); };
+
+  return <div className="agent-model-picker" onBlur={(event) => { if (pickerBlurCloses(event.currentTarget.contains(event.relatedTarget), optionsPointerDown.current)) setOpen(false); }}>
+    <input role="combobox" aria-haspopup="listbox" aria-expanded={open} aria-controls={listId} aria-autocomplete="list" value={open ? query : label} placeholder="搜索或输入模型 ID" onFocus={() => { setQuery(""); setOpen(true); }} onChange={(event) => { setQuery(event.target.value); setOpen(true); }} onKeyDown={(event) => { if (event.key === "Escape") setOpen(false); else if (event.key === "Enter" && query.trim()) { event.preventDefault(); choose(query.trim()); } }} />
+    {open && <div id={listId} role="listbox" className="agent-model-options" onPointerDownCapture={preserveOptions}>
+      {loading ? <small>正在加载…</small> : !capabilitiesOk ? <button type="button" className="secondary compact" onClick={() => { setLoading(true); void onRetry().finally(() => setLoading(false)); }}>重试</button> : <>{manualChoice && <button type="button" role="option" aria-selected={false} className="secondary compact agent-model-option" onClick={() => choose(manualChoice)}><span>使用 {manualChoice}</span></button>}{!value && <button type="button" role="option" aria-selected className="secondary compact agent-model-option" onClick={() => choose("")}><span>{defaultModelLabel(models)}</span><span aria-label="当前模型">✓</span></button>}{filtered.length ? filtered.map((item) => <button type="button" role="option" aria-selected={item.id === value} className="secondary compact agent-model-option" key={item.id} onClick={() => choose(item.id)}><span>{item.displayName ?? item.id}<small>{item.displayName ? item.id : ""}</small></span>{item.id === value ? <span aria-label="当前模型">✓</span> : null}</button>) : manualChoice ? null : <small>暂无可用模型，可输入模型 ID</small>}</>}
+    </div>}
+  </div>;
+}
+
+function ReasoningEffortPicker({ value, defaultValue, values, capabilitiesOk, onChange, onRetry }: { value: string; defaultValue: string | undefined; values: string[]; capabilitiesOk: boolean; onChange(value: string): void; onRetry(): Promise<void> }) {
+  const menuId = useId();
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const optionsPointerDown = useRef(false);
+  const choose = (effort: string) => { onChange(effort); setOpen(false); };
+  const preserveOptions = () => { optionsPointerDown.current = true; setTimeout(() => { optionsPointerDown.current = false; }); };
+  return <div className="agent-model-picker" onBlur={(event) => { if (pickerBlurCloses(event.currentTarget.contains(event.relatedTarget), optionsPointerDown.current)) setOpen(false); }}>
+    <button type="button" className="agent-picker-trigger" aria-haspopup="menu" aria-expanded={open} aria-controls={menuId} onClick={() => setOpen((current) => !current)}>{value || defaultReasoningLabel(defaultValue)}</button>
+    {open && <div id={menuId} role="menu" className="agent-model-options" onPointerDownCapture={preserveOptions}>
+      {loading ? <small>正在加载…</small> : !capabilitiesOk ? <button type="button" className="secondary compact" onClick={() => { setLoading(true); void onRetry().finally(() => setLoading(false)); }}>重试</button> : <><button type="button" role="menuitemradio" aria-checked={!value} className="secondary compact agent-model-option" onClick={() => choose("")}><span>{defaultReasoningLabel(defaultValue)}</span>{!value ? <span aria-label="当前思考强度">✓</span> : null}</button>{values.map((item) => <button type="button" role="menuitemradio" aria-checked={item === value} className="secondary compact agent-model-option" key={item} onClick={() => choose(item)}><span>{item}</span>{item === value ? <span aria-label="当前思考强度">✓</span> : null}</button>)}</>}
+    </div>}
+  </div>;
+}
 
 function AgentPresetManager({ settings, busy, onRefresh }: { settings: AgentSettings; busy: boolean; onRefresh(): Promise<void> }) {
   const active = settings.presets.find((item) => item.id === settings.activePresetId) ?? settings.presets[0]!;
@@ -215,21 +251,22 @@ function AgentPresetManager({ settings, busy, onRefresh }: { settings: AgentSett
   const [name, setName] = useState(active.name);
   const [model, setModel] = useState(active.roleConfigs.supervisor.model ?? "");
   const [reasoningEffort, setReasoningEffort] = useState(active.roleConfigs.supervisor.reasoningEffort ?? "");
-  const [customArgs, setCustomArgs] = useState(active.roleConfigs.supervisor.customArgs.join("\n"));
+  const [customArgs, setCustomArgs] = useState((active.roleConfigs.supervisor.backendOptions.customArgs ?? []).join("\n"));
   const [sandboxMode, setSandboxMode] = useState(active.sandboxMode);
   const [approvalPolicy, setApprovalPolicy] = useState(active.approvalPolicy);
   const [networkAccess, setNetworkAccess] = useState(active.networkAccess);
-  const models = settings.health.models ?? [];
-  const selectedModel = models.find((item) => item.id === model) ?? models.find((item) => item.isDefault);
+  const models = settings.health.capabilities.models;
+  const selectedModel = model ? models.find((item) => item.id === model) : models.find((item) => item.isDefault);
+  const efforts = selectedModel ? reasoningValues(selectedModel) : settings.health.capabilities.reasoningEfforts;
   const unavailableModel = Boolean(model && !models.some((item) => item.id === model));
-  const unavailableEffort = Boolean(reasoningEffort && !selectedModel?.supportedReasoningEfforts?.some((item) => item.reasoningEffort === reasoningEffort));
+  const unavailableEffort = Boolean(reasoningEffort && !efforts.includes(reasoningEffort));
 
   function currentRoleDraft(): AgentRolePresetConfig {
-    return { model: model || null, reasoningEffort: reasoningEffort || null, customArgs: customArgs.split("\n").map((item) => item.trim()).filter(Boolean) };
+    return { model: model || null, reasoningEffort: reasoningEffort || null, backendOptions: { customArgs: customArgs.split("\n").map((item) => item.trim()).filter(Boolean) } };
   }
 
   function loadRoleFields(config: AgentRolePresetConfig) {
-    setModel(config.model ?? ""); setReasoningEffort(config.reasoningEffort ?? ""); setCustomArgs(config.customArgs.join("\n"));
+    setModel(config.model ?? ""); setReasoningEffort(config.reasoningEffort ?? ""); setCustomArgs((config.backendOptions.customArgs ?? []).join("\n"));
   }
 
   function load(id: string) {
@@ -263,14 +300,16 @@ function AgentPresetManager({ settings, busy, onRefresh }: { settings: AgentSett
     const preset = settings.presets.find((item) => item.id === selectedId) ?? active;
     const roleConfig = currentRoleDraft();
     const roleConfigs = { ...roleDrafts, [role]: roleConfig };
+    const primary = roleConfigs.supervisor;
     setRoleDrafts(roleConfigs);
-    await request("/api/settings/agents/presets/" + selectedId, "PUT", { name, agentBackend: "codex", model: roleConfig.model, reasoningEffort: roleConfig.reasoningEffort, customArgs: roleConfig.customArgs, roleConfigs, sandboxMode, approvalPolicy, networkAccess });
+    await request("/api/agents/presets/" + selectedId, "PUT", { name, agentBackend: "codex", model: primary.model, reasoningEffort: primary.reasoningEffort, backendOptions: primary.backendOptions, roleConfigs, sandboxMode, approvalPolicy, networkAccess });
   }
 
   async function create() {
     const roleConfig = currentRoleDraft();
     const roleConfigs = { ...roleDrafts, [role]: roleConfig };
-    const created = await request("/api/settings/agents/presets", "POST", { name: "新预设", agentBackend: "codex", model: roleConfig.model, reasoningEffort: roleConfig.reasoningEffort, customArgs: roleConfig.customArgs, roleConfigs, sandboxMode, approvalPolicy, networkAccess }) as AgentPreset;
+    const primary = roleConfigs.supervisor;
+    const created = await request("/api/agents/presets", "POST", { name: "新预设", agentBackend: "codex", model: primary.model, reasoningEffort: primary.reasoningEffort, backendOptions: primary.backendOptions, roleConfigs, sandboxMode, approvalPolicy, networkAccess }) as AgentPreset;
     const createdRoleConfig = created.roleConfigs[role];
     setSelectedId(created.id); setRoleDrafts(created.roleConfigs); setName(created.name); loadRoleFields(createdRoleConfig); setSandboxMode(created.sandboxMode); setApprovalPolicy(created.approvalPolicy); setNetworkAccess(created.networkAccess);
   }
@@ -278,11 +317,11 @@ function AgentPresetManager({ settings, busy, onRefresh }: { settings: AgentSett
   async function remove() {
     const index = settings.presets.findIndex((item) => item.id === selectedId);
     const next = settings.presets[index + 1] ?? settings.presets[index - 1];
-    await request("/api/settings/agents/presets/" + selectedId, "DELETE");
+    await request("/api/agents/presets/" + selectedId, "DELETE");
     if (next) load(next.id);
   }
 
-  async function activate(id: string) { await request("/api/settings/agents/active", "PUT", { presetId: id }); load(id); }
+  async function activate(id: string) { await request("/api/agents/active", "PUT", { presetId: id }); load(id); }
 
   return <section className="agent-preset-manager" aria-label="Agent 预设">
     <div className="preset-toolbar"><select value={selectedId} onChange={(event) => load(event.target.value)} aria-label="选择 Agent 预设">{settings.presets.map((item) => <option key={item.id} value={item.id}>{item.name}{item.id === settings.activePresetId ? "（当前）" : ""}</option>)}</select><button type="button" className="secondary" disabled={busy} onClick={() => void run(create, "预设已创建。")}>新建预设</button><button type="button" className="danger" disabled={busy || settings.presets.length === 1 || settings.presets.find((item) => item.id === selectedId)?.isDefault} onClick={() => void run(remove, "预设已删除。")}>删除预设</button></div>
@@ -290,8 +329,8 @@ function AgentPresetManager({ settings, busy, onRefresh }: { settings: AgentSett
       <label>预设名称<input value={name} maxLength={80} onChange={(event) => setName(event.target.value)} required /></label>
       <label>Agent 后端<select value="codex" disabled><option value="codex">Codex</option></select><small>当前仅支持 Codex。</small></label>
       <label>Agent 角色<select value={role} onChange={(event) => loadRole(event.target.value as AgentRole)}>{Object.entries(ROLE_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><small>{ROLE_DESCRIPTIONS[role]}</small></label>
-      <label>模型<select value={model} onChange={(event) => { setModel(event.target.value); setReasoningEffort(""); }}><option value="">跟随 Codex 默认</option>{unavailableModel && <option value={model}>当前配置不可用 · {model}</option>}{models.map((item) => <option key={item.id} value={item.id}>{item.displayName ? item.displayName + " · " + item.id : item.id}</option>)}</select></label>
-      <label>思考强度<select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value)}><option value="">模型默认{selectedModel?.defaultReasoningEffort ? "（" + selectedModel.defaultReasoningEffort + "）" : ""}</option>{unavailableEffort && <option value={reasoningEffort}>当前配置不可用 · {reasoningEffort}</option>}{(selectedModel?.supportedReasoningEfforts ?? []).map((item) => <option key={item.reasoningEffort} value={item.reasoningEffort}>{item.reasoningEffort}</option>)}</select></label>
+      <label className="agent-model-field">模型<ModelPicker value={model} models={models} capabilitiesOk={settings.health.capabilities.ok} onChange={(value) => { setModel(value); setReasoningEffort(""); }} onRetry={onRefresh} />{unavailableModel && settings.health.capabilities.ok && <small>自定义或当前不可发现</small>}</label>
+      <label>思考强度<ReasoningEffortPicker value={reasoningEffort} defaultValue={selectedModel?.defaultReasoningEffort} values={efforts} capabilitiesOk={settings.health.capabilities.ok} onChange={setReasoningEffort} onRetry={onRefresh} />{unavailableEffort && settings.health.capabilities.ok && <small>当前不可发现</small>}</label>
       <label className="agent-custom-args">Codex 额外参数<textarea value={customArgs} onChange={(event) => setCustomArgs(event.target.value)} rows={4} placeholder={"--enable\nfeature_name"} /><small>每行一个参数；安全边界使用上方专用字段。</small></label>
       <label>沙箱<select value={sandboxMode} onChange={(event) => setSandboxMode(event.target.value as SandboxMode)}><option value="read-only">read-only</option><option value="workspace-write">workspace-write</option><option value="danger-full-access">danger-full-access</option></select></label>
       <label>审批策略<select value={approvalPolicy} onChange={(event) => setApprovalPolicy(event.target.value as ApprovalPolicy)}><option value="untrusted">untrusted</option><option value="on-request">on-request</option><option value="never">never</option></select></label>

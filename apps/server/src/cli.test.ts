@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test from "node:test";
 import { checkPort, doctorFailed, doctorLabel } from "./doctor.ts";
+import { buildPreflightResult, isAgentHealthResponse, sameServerOrigin } from "./preflight.ts";
 import { updateOpenWorkshop } from "./update-command.ts";
 import { isVersionCommand, WORKSHOP_VERSION } from "./version.ts";
 
@@ -57,4 +58,50 @@ test("doctor reports missing Git as a warning without failing", () => {
   assert.equal(doctorLabel(git), "WARN");
   assert.equal(doctorFailed([git]), false);
   assert.equal(doctorFailed([{ name: "database", ok: false }]), true);
+});
+
+test("preflight exposes independent capabilities", () => {
+  const result = buildPreflightResult({
+    service: { status: "ok" },
+    auth: { status: "ok" },
+    projectRoots: { status: "unavailable", detail: "permission denied" },
+    agent: { status: "unavailable", detail: "agent unavailable" }
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.capabilities, { readOnly: true, project: false, agent: false });
+});
+
+test("preflight blocks every capability when authentication is unavailable", () => {
+  const result = buildPreflightResult({
+    service: { status: "ok" },
+    auth: { status: "blocked", detail: "需要登录" },
+    projectRoots: { status: "blocked" },
+    agent: { status: "blocked" }
+  });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.capabilities, { readOnly: false, project: false, agent: false });
+});
+
+test("preflight does not expose project capability without an enabled root", () => {
+  const result = buildPreflightResult({
+    service: { status: "ok" },
+    auth: { status: "ok" },
+    projectRoots: { status: "blocked", detail: "没有启用的项目根目录" },
+    agent: { status: "ok" }
+  });
+  assert.deepEqual(result.capabilities, { readOnly: true, project: false, agent: false });
+});
+
+test("preflight rejects empty or malformed Agent health responses", () => {
+  assert.equal(isAgentHealthResponse([]), false);
+  assert.equal(isAgentHealthResponse({ data: [] }), false);
+  assert.equal(isAgentHealthResponse([null]), false);
+  assert.equal(isAgentHealthResponse([{ id: "codex", ok: true }]), true);
+});
+
+test("session server matching accepts only loopback aliases", () => {
+  assert.equal(sameServerOrigin("http://localhost:8787", "http://127.0.0.1:8787"), true);
+  assert.equal(sameServerOrigin("http://[::1]:8787", "http://localhost:8787"), true);
+  assert.equal(sameServerOrigin("http://example.test:8787", "http://127.0.0.1:8787"), false);
+  assert.equal(sameServerOrigin("https://localhost:8787", "http://127.0.0.1:8787"), false);
 });

@@ -255,9 +255,11 @@ export function registerTaskRoutes(server: FastifyInstance, database: DatabaseSy
     return commentsWithAttachments(database, request.params.id);
   });
 
-  server.get<{ Params: { id: string } }>("/api/tasks/:id/evidence", async (request) => {
+  server.get<{ Params: { id: string }; Querystring: { excludeDiff?: string } }>("/api/tasks/:id/evidence", async (request) => {
     taskById(database, request.params.id);
-    return database.prepare("SELECT * FROM evidence WHERE task_id = ? ORDER BY created_at, rowid").all(request.params.id);
+    return request.query.excludeDiff === "true"
+      ? database.prepare("SELECT * FROM evidence WHERE task_id = ? AND type <> 'diff' ORDER BY created_at, rowid").all(request.params.id)
+      : database.prepare("SELECT * FROM evidence WHERE task_id = ? ORDER BY created_at, rowid").all(request.params.id);
   });
 
   server.post<{ Params: { id: string }; Body: Record<string, unknown> }>("/api/tasks/:id/comments", async (request, reply) => {

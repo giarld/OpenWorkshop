@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { promisify } from "node:util";
 import { gzip as gzipCallback, gunzip as gunzipCallback } from "node:zlib";
+import { SettingsStore } from "./database.ts";
 
 const gzip = promisify(gzipCallback);
 const gunzip = promisify(gunzipCallback);
@@ -236,6 +237,14 @@ async function restoreAttachments(snapshot: ArchiveSnapshot, archivePath: string
 }
 
 function clearCommissionRows(database: DatabaseSync, commissionId: string, notifications: Row[]): void {
+  const settings = new SettingsStore(database);
+  const pendingAdvances = settings.get<Array<{ runId: string }>>("pendingRunAdvances", []) ?? [];
+  const deletedAdvanceIds = new Set([
+    ...rows(database, "SELECT id FROM runs WHERE commission_id = ?", commissionId),
+    ...rows(database, "SELECT id FROM execution_grants WHERE commission_id = ?", commissionId)
+  ].map((row) => String(row.id)));
+  const retainedAdvances = pendingAdvances.filter(({ runId }) => !deletedAdvanceIds.has(runId));
+  if (retainedAdvances.length !== pendingAdvances.length) settings.set("pendingRunAdvances", retainedAdvances);
   database.prepare("UPDATE commissions SET active_requirement_version_id = NULL, main_task_id = NULL WHERE id = ?").run(commissionId);
   deleteByIds(database, "notifications", ids(notifications));
   database.prepare("DELETE FROM approvals WHERE run_id IN (SELECT id FROM runs WHERE commission_id = ?)").run(commissionId);

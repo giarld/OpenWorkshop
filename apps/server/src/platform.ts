@@ -233,12 +233,12 @@ export async function readLatestLog(directory: string, lines = 100): Promise<{ p
   }
 }
 
-function processIsAlive(pid: number): boolean {
+export function processIsAlive(pid: number, sendSignal: (pid: number, signal: 0) => unknown = process.kill): boolean {
   try {
-    process.kill(pid, 0);
+    sendSignal(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return !hasCode(error, "ESRCH");
   }
 }
 

@@ -166,8 +166,11 @@ PIN 是面向可信局域网的基础访问控制，不等同于互联网级身�
 ```bash
 workshop login
 workshop status --output json
-workshop runtime codex-health --output json
+workshop agent backends --output json
+workshop agent health --output json
 ```
+
+OpenWorkshop 默认使用服务进程 `PATH` 中的 `codex`。如需固定 Codex 运行时，可将 `WORKSHOP_CODEX_PATH` 设置为绝对可执行文件路径；配置路径无效时后端会判定为不可用，不会回退到 `PATH`。
 
 创建委托并推进需求：
 
@@ -269,6 +272,7 @@ workshop task list <project-id> --query-file query.json --output json
 
 ```bash
 workshop api GET /api/health --output json
+workshop preflight [--server-url URL] [--output json]
 ```
 
 远程服务可使用 `--server-url` 或 `WORKSHOP_SERVER_URL` 指定，CLI 会将本地会话与服务 Origin 绑定。

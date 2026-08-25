@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { openWorkshopDatabase } from "./database.ts";
-import { captureWorkspaceSnapshot, commissionAttributionSnapshot, diffWorkspaceSnapshots } from "./workspace-changes.ts";
+import { captureWorkspaceSnapshot, commissionAttributionSnapshot, diffWorkspaceSnapshots, trackNewGitFiles } from "./workspace-changes.ts";
 
 const command = promisify(execFile);
 
@@ -184,6 +184,56 @@ test("SVN snapshots record exclusive-workspace deltas conservatively", async () 
     assert.equal(diff.changes.find(({ path }) => path === "base.txt")?.safe, false);
     assert.equal(diff.changes.find(({ path }) => path === "feature.txt")?.safe, true);
   } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("Git snapshots keep existing untracked directories opaque and intent-track only new paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "project-workshop-git-opaque-"));
+  try {
+    await writeFile(join(root, "base.txt"), "base\n");
+    await git(root, "init");
+    await git(root, "config", "user.email", "test@example.com");
+    await git(root, "config", "user.name", "Test");
+    await git(root, "add", "base.txt");
+    await git(root, "commit", "-m", "base");
+    await mkdir(join(root, "existing"));
+    await writeFile(join(root, "existing", "before.txt"), "before\n");
+    const baseline = await captureWorkspaceSnapshot(root, "git", run);
+    assert.deepEqual(baseline.changes, [{ path: "existing", changeType: "added", hash: null, kind: "directory" }]);
+
+    await writeFile(join(root, "existing", "during.txt"), "not attributable\n");
+    await mkdir(join(root, "fresh"));
+    await writeFile(join(root, "fresh", "nested.txt"), "nested\n");
+    await writeFile(join(root, "root-new.txt"), "root\n");
+    await trackNewGitFiles(root, baseline, run);
+    const after = await captureWorkspaceSnapshot(root, "git", run);
+    const diff = diffWorkspaceSnapshots(baseline, after, new Map());
+
+    assert.deepEqual(after.changes.map(({ path, kind }) => [path, kind ?? "file"]), [["existing", "directory"], ["fresh/nested.txt", "file"], ["root-new.txt", "file"]]);
+    assert.deepEqual(diff.changes.map(({ path, safe }) => [path, safe]), [["fresh/nested.txt", true], ["root-new.txt", true]]);
+    const patch = await run("git", ["diff", "--binary", "HEAD"], root);
+    assert.match(patch, /fresh\/nested\.txt/);
+    assert.match(patch, /root-new\.txt/);
+    assert.doesNotMatch(patch, /existing\/(?:before|during)\.txt/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("SVN snapshots keep existing unversioned directories opaque and exclude internal metadata", async () => {
+  const root = await mkdtemp(join(tmpdir(), "project-workshop-svn-opaque-"));
+  try {
+    await mkdir(join(root, "generated"));
+    await mkdir(join(root, ".openworkshop"));
+    await mkdir(join(root, ".git"));
+    await writeFile(join(root, "generated", "busy.bin"), "generated");
+    const xml = `<?xml version="1.0"?><status><target path=".">
+      <entry path="generated"><wc-status item="unversioned"/></entry>
+      <entry path=".openworkshop"><wc-status item="unversioned"/></entry>
+      <entry path=".git"><wc-status item="unversioned"/></entry>
+    </target></status>`;
+    const snapshot = await captureWorkspaceSnapshot(root, "svn", async () => xml, [], () => false);
+
+    assert.deepEqual(snapshot.changes, [{ path: "generated", changeType: "added", hash: null, kind: "directory" }]);
+    assert.equal(diffWorkspaceSnapshots({ version: 1, vcs: "svn", changes: [] }, snapshot, new Map()).changes[0]!.safe, false);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 async function git(cwd: string, ...args: string[]): Promise<void> { await command("git", args, { cwd, windowsHide: true }); }

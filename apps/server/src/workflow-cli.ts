@@ -5,6 +5,22 @@ import { parseArgs } from "node:util";
 type Method = "GET" | "POST" | "PUT" | "DELETE";
 type Command = { method: Method; path: (args: string[]) => string; args: number; body?: boolean; file?: boolean; text?: boolean };
 
+export function formatAgentRows(action: string, rows: Array<Record<string, unknown>>): string {
+  if (action === "backends") return rows.map((row) => {
+    const capabilities = row.capabilities && typeof row.capabilities === "object" ? Object.entries(row.capabilities as Record<string, unknown>).filter(([, enabled]) => enabled === true).map(([name]) => name) : [];
+    const runtime = row.runtimeVersion && typeof row.runtimeVersion === "object" ? row.runtimeVersion as { min?: unknown; max?: unknown } : {};
+    const executable = row.executable && typeof row.executable === "object" ? row.executable as Record<string, unknown> : {};
+    const range = `${typeof runtime.min === "string" ? `>=${runtime.min}` : "unknown"}${typeof runtime.max === "string" ? ` <=${runtime.max}` : ""}`;
+    const source = executable.configured === true ? executable.valid === true ? "configured, valid" : "configured, invalid" : "PATH";
+    return `${row.id} — ${row.displayName}\n  capabilities: ${capabilities.join(", ") || "none"}\n  runtime: ${range}\n  executable: ${executable.defaultCommand} (${executable.environmentKey}: ${source})`;
+  }).join("\n");
+  return rows.map((row) => {
+    const capabilities = row.capabilities && typeof row.capabilities === "object" ? row.capabilities as Record<string, unknown> : {};
+    const details = [row.error, capabilities.ok === false ? capabilities.error ?? "capability discovery unavailable" : undefined].filter((value): value is string => typeof value === "string" && Boolean(value));
+    return `${row.ok === false ? "unavailable" : "ok"} ${row.id}${row.runtimeVersion ? ` (${row.runtimeVersion})` : ""}${details.map((detail) => `\n  ${detail}`).join("")}`;
+  }).join("\n");
+}
+
 const id = (resource: string, suffix = "") => (args: string[]) => `/api/${resource}/${encodeURIComponent(args[0]!)}${suffix}`;
 const nested = (resource: string, suffix: string) => (args: string[]) => `/api/${resource}/${encodeURIComponent(args[0]!)}/${suffix.replace(":id", encodeURIComponent(args[1]!))}`;
 const taskNumber = (args: string[]) => `/api/projects/${encodeURIComponent(args[0]!)}/tasks/by-number/${encodeURIComponent(args[1]!)}`;
@@ -80,7 +96,8 @@ export const WORKFLOW_COMMANDS: Record<string, Command> = {
   "notification read": { method: "POST", path: id("notifications", "/read"), args: 1 },
   "notification clear": { method: "DELETE", path: () => "/api/notifications/history", args: 0 },
   "runtime status": { method: "GET", path: () => "/api/runtime/run-status", args: 0 },
-  "runtime codex-health": { method: "GET", path: () => "/api/runtime/codex-health", args: 0 }
+  "agent backends": { method: "GET", path: () => "/api/agents/backends", args: 0 },
+  "agent health": { method: "GET", path: () => "/api/agents/health", args: 0 }
 };
 
 export type WorkflowRequest = { method: Method; path: string; query: Record<string, unknown>; body?: string | Uint8Array; contentType?: string; headers?: Record<string, string>; text?: boolean; output: string; serverUrl?: string };

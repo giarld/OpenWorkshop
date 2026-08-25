@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { notificationEntityHash, notificationHashTarget, notificationNavigation, pushBrowserNotifications, type AppNotification, type BrowserNotificationRuntime } from "./browser-notifications.ts";
+import { notificationEntityHash, notificationHashTarget, notificationHashTargetsOtherProject, notificationNavigation, pushBrowserNotifications, type AppNotification, type BrowserNotificationRuntime } from "./browser-notifications.ts";
 
 function item(overrides: Partial<AppNotification> = {}): AppNotification {
   return { id: "notification-1", kind: "blocked", title: "Task blocked", body: "Needs attention", entity_type: "task", entity_id: "task-1", project_id: "project-1", read_at: null, system_notified_at: null, ...overrides };
@@ -57,6 +57,10 @@ test("does not repeat shown, read, or currently open notifications", async () =>
   assert.equal(notificationEntityHash(item({ entity_type: "delivery", entity_id: "delivery-1" })), "#delivery-delivery-1?project=project-1");
   assert.deepEqual(notificationHashTarget("#task-task-1?project=project-2"), { entityType: "task", entityId: "task-1", projectId: "project-2" });
   assert.deepEqual(notificationHashTarget("#delivery-delivery-1?project=project-2"), { entityType: "delivery", entityId: "delivery-1", projectId: "project-2" });
+  assert.equal(notificationHashTargetsOtherProject("#task-task-1?project=project-2", "project-1"), true);
+  assert.equal(notificationHashTargetsOtherProject("#task-task-1?project=project-1", "project-1"), false);
+  assert.equal(notificationHashTargetsOtherProject("#task-task-1", "project-1"), true);
+  assert.equal(notificationHashTargetsOtherProject("#unrelated", "project-1"), false);
   assert.deepEqual(notificationNavigation(item({ project_id: "project-2" }), "#task-task-1?project=project-2", "project-1"), { hash: "#task-task-1?project=project-2", updateHash: false, switchProject: true, view: "board", projectId: "project-2", entityType: "task", entityId: "task-1" });
   assert.deepEqual(notificationNavigation(item({ entity_type: "delivery", entity_id: "delivery-1", project_id: "project-2" }), "", "project-1"), { hash: "#delivery-delivery-1?project=project-2", updateHash: true, switchProject: true, view: "delivery", projectId: "project-2", entityType: "delivery", entityId: "delivery-1" });
 });

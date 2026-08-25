@@ -5,11 +5,12 @@ import type { FastifyInstance } from "fastify";
 import { registerAttachmentParsers, storeAttachment } from "./attachments.ts";
 import { resolvedRoleConfig } from "./agent-settings.ts";
 import { archiveCommission, deleteClarifyingCommission, reactivateCommission } from "./commission-archive.ts";
-import type { CodexRoleConfig } from "./codex.ts";
+import type { AgentRoleConfig } from "./agent.ts";
 import type { TaskPlanner } from "./planner-agent.js";
 import { beginPlanRevision } from "./plan-revisions.ts";
 import type { RequirementTokenUsage } from "./requirement-token-usage.js";
 import { createTaskPlan } from "./tasks.ts";
+import { redactSensitive } from "./security.ts";
 
 const CLARIFICATION_COMPLETION_QUESTION = "需求信息已经足够。是否确认结束需求澄清并生成需求文档？";
 // ponytail: cap in-process extraction at 5 MiB; move parsing to isolated streaming workers if larger documents become required.
@@ -46,7 +47,7 @@ export type RequirementAnalysis = (
 export type RequirementAnalyzer = (input: {
   commission: CommissionRow;
   projectRoot: string;
-  agentConfig: Readonly<CodexRoleConfig>;
+  agentConfig: Readonly<AgentRoleConfig>;
   messages: Array<{ role: string; content: string }>;
   attachments: Array<{ original_name: string; extracted_text: string | null }>;
   activeRequirement: { content_markdown: string; acceptance_json: string } | null;
@@ -476,7 +477,8 @@ function errorStatus(error: unknown): number | undefined {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error && error.message ? error.message : "需求分析失败，请重试。";
+  const message = error instanceof Error && error.message ? error.message : "需求分析失败，请重试。";
+  return redactSensitive(message).value;
 }
 
 const badRequest = (message: string, cause?: unknown) => statusError(message, 400, cause);

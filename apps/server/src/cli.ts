@@ -7,18 +7,20 @@ import { promisify } from "node:util";
 import { join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { createServer } from "./app.js";
+import { AgentRegistry } from "./agent.js";
 import { setPin } from "./auth.js";
-import { checkCodexHealth } from "./codex.js";
+import { createCodexPlugin } from "./codex.js";
 import { backupDatabase, openWorkshopDatabase, restoreDatabase, SettingsStore } from "./database.js";
 import { checkPort, doctorFailed, doctorLabel, type DoctorResult } from "./doctor.js";
 import { pruneRawRunEvents } from "./runs.js";
+import { buildPreflightResult, isAgentHealthResponse, sameServerOrigin, type PreflightCheck, type PreflightCheckName } from "./preflight.js";
 import { startSystemNotificationWorker } from "./notifications.js";
 import { acquireInstanceLock, clearRuntimeState, consumeRuntimeStop, prepareWorkshopHome, pruneLogFiles, readLatestLog, readRuntimeState, requestRuntimeStop, writeRuntimeState, type RuntimeState } from "./platform.js";
 import { browserCommand, ensureBackgroundService, startBackgroundService, waitForServiceStop } from "./service-control.js";
 import { installWorkshopSkill } from "./skill-installer.js";
 import { updateOpenWorkshop } from "./update-command.js";
 import { isVersionCommand, WORKSHOP_VERSION } from "./version.js";
-import { familyHelp, formatWorkflowResult, parseWorkflowCommand, workflowHttpError, WORKFLOW_COMMANDS, workflowHelp, type WorkflowRequest } from "./workflow-cli.js";
+import { familyHelp, formatAgentRows, formatWorkflowResult, parseWorkflowCommand, workflowHttpError, WORKFLOW_COMMANDS, workflowHelp, type WorkflowRequest } from "./workflow-cli.js";
 
 const runFile = promisify(execFile);
 
@@ -65,7 +67,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       port: { type: "string", default: "8787" },
       foreground: { type: "boolean", default: false },
       lines: { type: "string", short: "n", default: "100" },
-      output: { type: "string", default: "pretty" }
+      output: { type: "string", default: "pretty" },
+      "server-url": { type: "string" }
     }
   });
   if (command === "log") {
@@ -105,6 +108,13 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     if (values.output === "json") printResult(results, "json");
     else for (const result of results) console.log(`${doctorLabel(result)} ${result.name}${result.detail ? `: ${result.detail}` : ""}`);
     if (doctorFailed(results)) process.exitCode = 1;
+    return;
+  }
+  if (command === "preflight") {
+    const result = await preflight(home, values["server-url"]);
+    if (values.output === "json") printResult(result, "json");
+    else printPreflight(result);
+    if (!result.ok) process.exitCode = 1;
     return;
   }
   if (command === "backup") {
@@ -234,7 +244,10 @@ async function skillCommand(argv: string[]): Promise<void> {
 async function executeWorkflow(home: string, argv: string[]): Promise<void> {
   const request = await parseWorkflowCommand(argv);
   const { data } = await apiRequest(home, request);
-  printResult(data, request.output, request.text);
+  if (argv[0] === "agent" && Array.isArray(data) && request.output !== "json") {
+    console.log(formatAgentRows(argv[1] ?? "", data as Array<Record<string, unknown>>));
+  } else printResult(data, request.output, request.text);
+  if (argv[0] === "agent" && argv[1] === "health" && Array.isArray(data) && data.some((item) => item && typeof item === "object" && (item as { ok?: unknown }).ok === false)) process.exitCode = 1;
 }
 
 async function authenticationCommand(home: string, argv: string[]): Promise<void> {
@@ -287,7 +300,7 @@ async function apiRequest(home: string, request: WorkflowRequest, authenticated 
   for (const [name, value] of Object.entries(request.headers ?? {})) headers.set(name, value);
   if (authenticated) {
     const session: { server?: unknown; cookie?: unknown } = await readFile(join(home, "runtime", "session.json"), "utf8").then((value) => JSON.parse(value) as { server?: unknown; cookie?: unknown }).catch(() => ({}));
-    if (session.server === base && typeof session.cookie === "string") headers.set("Cookie", session.cookie);
+    if (sameServerOrigin(session.server, base) && typeof session.cookie === "string") headers.set("Cookie", session.cookie);
   }
   const response = await fetch(url, { method: request.method, headers, redirect: "error", ...(request.body === undefined ? {} : { body: typeof request.body === "string" ? request.body : Buffer.from(request.body) }) });
   const text = await response.text();
@@ -321,7 +334,69 @@ function printResult(data: unknown, output: string, text = false): void {
 }
 
 function help(): string {
-  return `OpenWorkshop ${WORKSHOP_VERSION}\n\nService commands:\n  start [--foreground] [--host HOST] [--port PORT]\n  stop, restart, status, gui, log [-n LINES], doctor, backup, restore, pin, update, version\n\nAgent integration:\n  skill install [--agent codex] [--force]\n\nAuthentication:\n  auth status|initialize|login|logout\n  login (alias for auth login)\n\n${workflowHelp()}\n\nEnvironment:\n  WORKSHOP_HOME, WORKSHOP_SERVER_URL`;
+  return `OpenWorkshop ${WORKSHOP_VERSION}\n\nService commands:\n  start [--foreground] [--host HOST] [--port PORT]\n  stop, restart, status, gui, log [-n LINES], doctor, preflight, backup, restore, pin, update, version\n\nAgent integration:\n  skill install [--agent codex] [--force]\n  agent backends|health [--output json]\n\nAuthentication:\n  auth status|initialize|login|logout\n  login (alias for auth login)\n\n${workflowHelp()}\n\nEnvironment:\n  WORKSHOP_HOME, WORKSHOP_SERVER_URL, WORKSHOP_CODEX_PATH`;
+}
+
+async function preflight(home: string, serverUrl?: string) {
+  const checks = {} as Record<PreflightCheckName, PreflightCheck>;
+  let status: { initialized?: unknown; authenticated?: unknown } | undefined;
+  try {
+    const result = await apiRequest(home, { method: "GET", path: "/api/system/status", query: {}, output: "json", ...(serverUrl ? { serverUrl } : {}) });
+    status = result.data && typeof result.data === "object" ? result.data as typeof status : undefined;
+    checks.service = { status: "ok" };
+  } catch (error) {
+    checks.service = { status: "unavailable", detail: preflightError(error) };
+    checks.auth = { status: "blocked", detail: "Workshop 服务不可用" };
+    checks.projectRoots = { status: "blocked", detail: "Workshop 服务不可用" };
+    checks.agent = { status: "blocked", detail: "Workshop 服务不可用" };
+    return buildPreflightResult(checks);
+  }
+
+  if (status?.initialized !== true) checks.auth = { status: "blocked", detail: "尚未初始化 PIN" };
+  else if (status.authenticated !== true) checks.auth = { status: "blocked", detail: "需要先运行 workshop login" };
+  else checks.auth = { status: "ok" };
+  if (checks.auth.status !== "ok") {
+    checks.projectRoots = { status: "blocked", detail: "需要 Workshop 登录会话" };
+    checks.agent = { status: "blocked", detail: "需要 Workshop 登录会话" };
+    return buildPreflightResult(checks);
+  }
+
+  try {
+    const result = await apiRequest(home, { method: "GET", path: "/api/roots", query: {}, output: "json", ...(serverUrl ? { serverUrl } : {}) });
+    const roots = Array.isArray(result.data) ? result.data as Array<{ id?: unknown; enabled?: unknown }> : [];
+    const enabled = roots.filter((root) => root.enabled === 1 || root.enabled === true);
+    for (const root of enabled) {
+      if (typeof root.id !== "string") throw new Error("root response has no id");
+      await apiRequest(home, { method: "GET", path: "/api/roots/" + encodeURIComponent(root.id) + "/browse", query: { path: "." }, output: "json", ...(serverUrl ? { serverUrl } : {}) });
+    }
+    checks.projectRoots = enabled.length ? { status: "ok" } : { status: "blocked", detail: "没有启用的项目根目录" };
+  } catch (error) {
+    checks.projectRoots = { status: "unavailable", detail: preflightError(error) };
+  }
+
+  try {
+    const result = await apiRequest(home, { method: "GET", path: "/api/agents/health", query: {}, output: "json", ...(serverUrl ? { serverUrl } : {}) });
+    if (!isAgentHealthResponse(result.data)) {
+      checks.agent = { status: "unavailable", detail: "Agent 健康检查未返回有效后端列表" };
+    } else {
+      const agents = result.data;
+      const failed = agents.filter((agent) => agent.ok !== true);
+      checks.agent = failed.length ? { status: "unavailable", detail: failed.map((agent) => String(agent.id ?? "agent") + ": " + String(agent.error ?? "unavailable")).join("; ") } : { status: "ok" };
+    }
+  } catch (error) {
+    checks.agent = { status: "unavailable", detail: preflightError(error) };
+  }
+  return buildPreflightResult(checks);
+}
+
+function preflightError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/(Bearer|Cookie|token|pin|password)[^;\n]*/gi, "$1 <redacted>").slice(0, 240);
+}
+
+function printPreflight(result: ReturnType<typeof buildPreflightResult>): void {
+  for (const [name, check] of Object.entries(result.checks)) console.log(check.status.padEnd(11) + " " + name + (check.detail ? ": " + check.detail : ""));
+  console.log("capabilities: read-only=" + result.capabilities.readOnly + ", project=" + result.capabilities.project + ", agent=" + result.capabilities.agent);
 }
 
 async function doctor(home: string, host: string, port: number): Promise<DoctorResult[]> {
@@ -341,8 +416,8 @@ async function doctor(home: string, host: string, port: number): Promise<DoctorR
     database?.close();
   }
   results.push(await check("git", async () => void await runFile("git", ["--version"], { windowsHide: true }), true));
-  const codex = await checkCodexHealth();
-  results.push({ name: "codex app-server", ok: codex.ok, ...(codex.version ?? codex.error ? { detail: codex.version ?? codex.error } : {}) });
+  const agents = await new AgentRegistry([createCodexPlugin()]).healthAll();
+  results.push(...agents.map((agent) => ({ name: `agent ${agent.id}`, ok: agent.ok, ...(agent.runtimeVersion ?? agent.error ? { detail: agent.runtimeVersion ?? agent.error } : {}) })));
   results.push(await check(`port ${host}:${port}`, async () => checkPort(host, port, await readRuntimeState(home))));
   return results;
 }

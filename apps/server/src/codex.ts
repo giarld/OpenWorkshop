@@ -1,20 +1,14 @@
 import { spawn, execFile, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
-import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
-import { delimiter, isAbsolute, join } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
-import type { FastifyInstance } from "fastify";
+import { AgentError, APPROVAL_POLICIES, capabilityError, COMMAND_APPROVAL_POLICY, COMMAND_SANDBOX_MODE, normalizeSemver, SANDBOX_MODES, semverInRange, type AgentBackendHealth, type AgentCompletion, type AgentEvent, type AgentPlugin, type AgentPluginConfig, type AgentSession, type AgentSessionOptions, type AgentStartOptions, type AgentTurn, type ApprovalPolicy, type SandboxMode } from "./agent.ts";
+import { WORKSHOP_VERSION } from "./version.ts";
 
 const runFile = promisify(execFile);
-const CONTEXT_FILES = ["execution-policy.md", "requirement.md", "task.md", "task-tree.md", "dependencies.md", "plan-revision.md", "review-scope.md", "previous-runs.md", "project-profile.md", "messages.md"] as const;
 const RESERVED_ARGS = new Set(["--listen", "--cwd", "-C", "--model", "-m", "--sandbox", "-s", "--ask-for-approval", "-a", "--output-schema", "--json"]);
-export const COMMAND_APPROVAL_POLICY = "on-request";
-export const COMMAND_SANDBOX_MODE = "workspace-write" as const;
-export const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
-export const APPROVAL_POLICIES = ["untrusted", "on-request", "never"] as const;
-export type SandboxMode = typeof SANDBOX_MODES[number];
-export type ApprovalPolicy = typeof APPROVAL_POLICIES[number];
+export { APPROVAL_POLICIES, COMMAND_APPROVAL_POLICY, COMMAND_SANDBOX_MODE, SANDBOX_MODES, snapshotRoleConfig, type ApprovalPolicy, type SandboxMode } from "./agent.ts";
 export function codexAppServerArgs(sandboxMode: SandboxMode = COMMAND_SANDBOX_MODE, networkAccess = true, customArgs: readonly string[] = []): string[] {
   return ["app-server", "-c", `sandbox_mode=${JSON.stringify(sandboxMode)}`, "-c", 'approval_policy="never"', ...(sandboxMode === "workspace-write" ? ["-c", `sandbox_workspace_write.network_access=${networkAccess}`] : []), ...customArgs];
 }
@@ -22,7 +16,6 @@ export const CODEX_APP_SERVER_ARGS = codexAppServerArgs();
 
 type JsonObject = Record<string, unknown>;
 type RequestId = string | number;
-type ContextFile = typeof CONTEXT_FILES[number];
 
 export type NormalizedCodexEvent = {
   type: string;
@@ -119,7 +112,8 @@ export class CodexAppServer {
       cwd: options.cwd,
       env: options.env,
       stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true
+      windowsHide: true,
+      detached: process.platform !== "win32"
     });
     return new CodexAppServer(child, options);
   }
@@ -130,12 +124,12 @@ export class CodexAppServer {
   }
 
   async models(): Promise<CodexModel[]> {
-    const result = asObject(await this.request("model/list", { includeHidden: false }));
+    const result = asObject(await this.request("model/list", { includeHidden: true }));
     return Array.isArray(result.data) ? result.data.filter(isObject).map((model) => model as CodexModel) : [];
   }
 
   async startRun(options: CodexRunOptions): Promise<CodexRunHandle> {
-    let model = options.model ?? (options.threadId ? this.threadModels.get(options.threadId) : (await this.models()).find((item) => item.isDefault)?.id);
+    let model = options.model ?? (options.threadId ? this.threadModels.get(options.threadId) : undefined);
     const started = options.threadId ? undefined : asObject(await this.request("thread/start", compact({
       cwd: options.cwd,
       model,
@@ -162,17 +156,43 @@ export class CodexAppServer {
   }
 
   async interrupt(threadId: string, turnId: string, timeoutMs = 5_000): Promise<void> {
+    await this.interruptTurn(threadId, turnId, timeoutMs, true);
+  }
+
+  async requestInterrupt(threadId: string, turnId: string, timeoutMs = 5_000): Promise<void> {
+    await this.interruptTurn(threadId, turnId, timeoutMs, false);
+  }
+
+  private async interruptTurn(threadId: string, turnId: string, timeoutMs: number, waitForCompletion: boolean): Promise<void> {
     const completed = this.createTurnWaiter(turnId);
+    const deadline = Date.now() + timeoutMs;
     let timer: NodeJS.Timeout | undefined;
     try {
-      const stopped = await Promise.race([
-        Promise.all([this.request("turn/interrupt", { threadId, turnId }), completed.promise]).then(() => true),
+      const accepted = await Promise.race([
+        this.request("turn/interrupt", { threadId, turnId }).then(() => true),
         new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); })
       ]);
-      if (!stopped) throw new Error(`Codex turn ${turnId} did not stop within ${timeoutMs}ms`);
+      if (!accepted) throw new Error(`Codex turn ${turnId} did not stop within ${timeoutMs}ms`);
     } catch (error) {
-      if (!this.exited) this.process.kill();
+      completed.cancel();
+      await terminateProcessTree(this.process);
       throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    const stopping = this.waitForInterruptCompletion(turnId, completed, timeoutMs, deadline);
+    if (waitForCompletion) await stopping;
+    else void stopping.catch(() => undefined);
+  }
+
+  private async waitForInterruptCompletion(turnId: string, completed: { promise: Promise<NormalizedCodexEvent>; cancel: () => void }, timeoutMs: number, deadline: number): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const stopped = await Promise.race([completed.promise.then(() => true), new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now())); })]);
+      if (!stopped) {
+        await terminateProcessTree(this.process);
+        throw new Error(`Codex turn ${turnId} did not stop within ${timeoutMs}ms`);
+      }
     } finally {
       if (timer) clearTimeout(timer);
       completed.cancel();
@@ -200,8 +220,7 @@ export class CodexAppServer {
     if (this.exited) return;
     this.closing = true;
     this.process.stdin.end();
-    this.process.kill();
-    await new Promise<void>((resolve) => this.process.once("exit", () => resolve()));
+    if (!await waitForExit(this.process, 1_000)) await terminateProcessTree(this.process);
   }
 
   private notify(method: string, params: JsonObject): void {
@@ -309,7 +328,7 @@ export function normalizeCodexEvent(method: string, payload: JsonObject, request
   const turnStatus = String(turn.status ?? "");
   const mapped = method === "thread/started" ? ["thread.started", "Thread started"]
     : method === "turn/started" ? ["turn.started", "Turn started"]
-    : method === "turn/completed" ? [turnStatus === "interrupted" ? "turn.interrupted" : turnStatus === "failed" ? "turn.failed" : "turn.completed", `Turn ${turnStatus || "completed"}`]
+    : method === "turn/completed" ? normalizeTurnCompletion(turnStatus)
     : method === "item/agentMessage/delta" ? ["agent.message.delta", "Agent message"]
     : method === "item/commandExecution/outputDelta" ? ["command.output", "Command output"]
     : method === "item/started" ? [`${snake(itemType)}.started`, `${itemType} started`]
@@ -323,18 +342,11 @@ export function normalizeCodexEvent(method: string, payload: JsonObject, request
   return { type: mapped[0]!, summary: mapped[1]!, method, payload, ...(requestId === undefined ? {} : { requestId }) };
 }
 
-export function snapshotRoleConfig(globalConfig: CodexRoleConfig, projectConfig?: Partial<CodexRoleConfig>): Readonly<CodexRoleConfig> {
-  const customArgs = [...(projectConfig?.customArgs ?? globalConfig.customArgs ?? [])];
-  validateCustomArgs(customArgs);
-  return Object.freeze(compact({
-    prompt: projectConfig?.prompt ?? globalConfig.prompt,
-    model: projectConfig?.model ?? globalConfig.model,
-    reasoningEffort: projectConfig?.reasoningEffort ?? globalConfig.reasoningEffort,
-    customArgs: Object.freeze(customArgs),
-    sandboxMode: projectConfig?.sandboxMode ?? globalConfig.sandboxMode,
-    approvalPolicy: projectConfig?.approvalPolicy ?? globalConfig.approvalPolicy,
-    networkAccess: projectConfig?.networkAccess ?? globalConfig.networkAccess
-  })) as Readonly<CodexRoleConfig>;
+function normalizeTurnCompletion(status: string): [string, string] {
+  if (status === "completed") return ["turn.completed", "Turn completed"];
+  if (status === "interrupted") return ["turn.interrupted", "Turn interrupted"];
+  if (status === "failed") return ["turn.failed", "Turn failed"];
+  return ["turn.failed", `Turn failed: unexpected status ${status || "<missing>"}`];
 }
 
 export function validateCustomArgs(args: readonly string[]): void {
@@ -349,74 +361,270 @@ export function validateCustomArgs(args: readonly string[]): void {
   if (conflict) throw new TypeError(`Custom Codex argument conflicts with managed settings: ${conflict}`);
 }
 
-export async function createRunContext(projectRoot: string, runId: string, files: Partial<Record<ContextFile, string>>) {
-  if (!/^[A-Za-z0-9_-]+$/.test(runId)) throw new TypeError("runId contains unsupported characters");
-  const runsRoot = join(projectRoot, ".openworkshop", "runs");
-  const directory = join(runsRoot, runId);
-  await mkdir(runsRoot, { recursive: true });
-  await mkdir(directory);
+export type CodexHealth = AgentBackendHealth & { version?: string; models?: CodexModel[] };
+
+function mergeModels(primary: CodexModel[], extra: CodexModel[]): CodexModel[] {
+  const models = new Map(primary.map((model) => [model.id, model]));
+  for (const model of extra) if (!models.has(model.id)) models.set(model.id, model);
+  return [...models.values()];
+}
+
+async function discoverExternalModels(options: { runModelCommand?: (file: string, args: string[]) => Promise<string>; env?: NodeJS.ProcessEnv }, deadline: number): Promise<CodexModel[]> {
   try {
-    const names = CONTEXT_FILES.filter((name) => files[name] !== undefined);
-    await Promise.all(names.map((name) => writeFile(join(directory, name), files[name]!, { flag: "wx" })));
-    await writeFile(join(directory, "context-manifest.json"), `${JSON.stringify({ runId, files: names })}\n`, { flag: "wx" });
-    return { directory, cleanup: () => rm(directory, { recursive: true, force: true }) };
-  } catch (error) {
-    await rm(directory, { recursive: true, force: true });
-    throw error;
+    const raw = options.runModelCommand
+      ? await withTimeout(options.runModelCommand("ocx", ["access", "models", "--json"]), remaining(deadline))
+      : await fetchExternalModels(deadline).catch(() => execute("ocx", ["access", "models", "--json"], remaining(deadline), options.env));
+    return parseExternalModels(raw);
+  } catch {
+    return [];
   }
 }
 
-export async function recoverRunContexts(projectRoot: string): Promise<number> {
-  const runsRoot = join(projectRoot, ".openworkshop", "runs");
-  const entries = await readdir(runsRoot, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] : Promise.reject(error));
-  const stale = entries.filter((entry) => entry.isDirectory());
-  await Promise.all(stale.map((entry) => rm(join(runsRoot, entry.name), { recursive: true, force: true })));
-  return stale.length;
+async function fetchExternalModels(deadline: number): Promise<string> {
+  const response = await fetch("http://127.0.0.1:10100/v1/models", { signal: AbortSignal.timeout(Math.min(2_000, remaining(deadline))) });
+  if (!response.ok) throw new Error(`External model catalog returned HTTP ${response.status}`);
+  return response.text();
 }
 
-export type CodexHealth = { ok: boolean; version?: string; models?: CodexModel[]; error?: string };
+function parseExternalModels(raw: string): CodexModel[] {
+  const data = asObject(JSON.parse(raw)).data;
+  if (!Array.isArray(data)) return [];
+  return data.filter(isObject).flatMap((model) => {
+    if (typeof model.id !== "string" || !model.id.trim()) return [];
+    const efforts = Array.isArray(model.reasoning_efforts) ? model.reasoning_efforts.map((item) => typeof item === "string" ? item : asObject(item).value).filter((item): item is string => typeof item === "string" && Boolean(item)) : [];
+    return [{ id: model.id, ...(typeof model.reasoning_effort === "string" ? { defaultReasoningEffort: model.reasoning_effort } : {}), ...(efforts.length ? { supportedReasoningEfforts: efforts.map((reasoningEffort) => ({ reasoningEffort })) } : {}) }];
+  });
+}
 
 export async function checkCodexHealth(options: {
   command?: string;
   runCommand?: (file: string, args: string[]) => Promise<string>;
+  runModelCommand?: (file: string, args: string[]) => Promise<string>;
   launch?: () => CodexAppServer;
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+  includeExternalModels?: boolean;
 } = {}): Promise<CodexHealth> {
   let client: CodexAppServer | undefined;
+  let stage: "cli" | "app-server" = "cli";
+  const emptyCapabilities = { ok: false, models: [] as CodexModel[], reasoningEfforts: [] as string[] };
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  const deadline = Date.now() + timeoutMs;
   try {
-    const command = options.command ?? "codex";
-    const version = (await (options.runCommand ?? execute)(command, ["--version"])).trim();
-    client = options.launch?.() ?? CodexAppServer.launch({ command });
-    await client.initialize();
-    const models = await client.models();
-    return { ok: true, version, models };
+    const command = options.command ?? resolveCodexCommand(options.env ?? process.env);
+    const rawVersion = options.runCommand ? await withTimeout(options.runCommand(command, ["--version"]), remaining(deadline)) : await execute(command, ["--version"], remaining(deadline), options.env);
+    const version = normalizeSemver(rawVersion);
+    if (!version) return healthFailure("Codex runtime version could not be parsed", emptyCapabilities);
+    if (!semverInRange(version, CODEX_MIN_VERSION)) return healthFailure(`Codex runtime ${version} is incompatible; requires >= ${CODEX_MIN_VERSION}`, emptyCapabilities, version);
+    const externalModels = options.includeExternalModels ? discoverExternalModels(options, deadline) : Promise.resolve([] as CodexModel[]);
+    stage = "app-server";
+    client = options.launch?.() ?? CodexAppServer.launch({ command, ...(options.env ? { env: options.env } : {}), requestTimeoutMs: remaining(deadline) });
+    await withTimeout(client.initialize(), remaining(deadline));
+    try {
+      const models = await withTimeout(client.models(), remaining(deadline));
+      const allModels = mergeModels(models, await externalModels);
+      const reasoningEfforts = [...new Set(allModels.flatMap((model) => model.supportedReasoningEfforts?.map((item) => item.reasoningEffort) ?? []))];
+      return { id: "codex", ok: true, pluginVersion: WORKSHOP_VERSION, runtimeVersion: version, version, models: allModels, capabilities: { ok: true, models: allModels, reasoningEfforts } };
+    } catch {
+      return { id: "codex", ok: true, pluginVersion: WORKSHOP_VERSION, runtimeVersion: version, version, models: [], capabilities: { ...emptyCapabilities, error: "Codex model capabilities are unavailable" } };
+    }
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    return healthFailure(safeHealthError(error, stage, timeoutMs), emptyCapabilities);
   } finally {
-    await client?.close();
+    await client?.close().catch(() => undefined);
   }
 }
 
-export function registerCodexRoutes(server: FastifyInstance, health = checkCodexHealth): void {
-  server.get("/api/runtime/codex-health", async () => health());
+export function validateCodexConfig(config: AgentPluginConfig): void {
+  if (config.model !== undefined && config.model !== null && !config.model.trim()) throw new TypeError("Codex model must not be empty");
+  if (config.reasoningEffort !== undefined && config.reasoningEffort !== null && !config.reasoningEffort.trim()) throw new TypeError("Codex reasoning effort must not be empty");
+  const backend = config.backendOptions ?? {};
+  const unknown = Object.keys(backend).find((key) => key !== "customArgs");
+  if (unknown) throw new TypeError(`Unsupported Codex backend option: ${unknown}`);
+  if (backend.customArgs !== undefined && (!Array.isArray(backend.customArgs) || backend.customArgs.length > 32 || backend.customArgs.some((item) => typeof item !== "string" || !item || item.length > 256))) throw new TypeError("Codex backend customArgs must contain at most 32 non-empty strings of 256 characters");
+  validateCustomArgs(backend.customArgs as string[] | undefined ?? []);
 }
 
-async function execute(file: string, args: string[]): Promise<string> {
-  const invocation = resolveInvocation(file, args);
-  const { stdout } = await runFile(invocation.file, invocation.args, { encoding: "utf8", windowsHide: true });
+async function execute(file: string, args: string[], timeout = 5_000, env = process.env): Promise<string> {
+  const invocation = resolveInvocation(file, args, env);
+  const { stdout } = await runFile(invocation.file, invocation.args, { encoding: "utf8", windowsHide: true, timeout, env });
   return stdout;
 }
 
-function resolveInvocation(file: string, args: string[], env = process.env): { file: string; args: string[] } {
-  if (process.platform !== "win32" || isAbsolute(file) || file.includes("\\") || file.includes("/")) return { file, args };
-  for (const directory of (env.PATH ?? "").split(delimiter).filter(Boolean)) {
-    const executable = join(directory, `${file}.exe`);
-    if (existsSync(executable)) return { file: executable, args };
-    if (file.toLowerCase() === "codex") {
-      const script = join(directory, "node_modules", "@openai", "codex", "bin", "codex.js");
-      if (existsSync(script)) return { file: process.execPath, args: [script, ...args] };
+export function resolveInvocation(file: string, args: string[], env = process.env, platform = process.platform): { file: string; args: string[] } {
+  let resolved = file;
+  if (platform === "win32" && !isAbsolute(file) && !file.includes("\\") && !file.includes("/")) {
+    const extensions = (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
+    const suffixes = /\.[^\\/]+$/.test(file) ? [""] : extensions;
+    resolved = (env.PATH ?? "").split(";").filter(Boolean).flatMap((directory) => suffixes.map((extension) => join(directory, file + extension))).find(existsSync) ?? file;
+  }
+  if (platform === "win32" && /^(?:codex)\.(?:cmd|bat)$/i.test(basename(resolved))) {
+    const script = join(dirname(resolved), "node_modules", "@openai", "codex", "bin", "codex.js");
+    if (existsSync(script)) return { file: process.execPath, args: [script, ...args] };
+  }
+  if (platform === "win32" && /\.(?:cmd|bat)$/i.test(resolved)) return { file: env.ComSpec ?? "cmd.exe", args: ["/d", "/s", "/c", [resolved, ...args].map(cmdQuote).join(" ")] };
+  return { file: resolved, args };
+}
+
+export const CODEX_MIN_VERSION = "0.147.0";
+
+export function resolveCodexCommand(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.WORKSHOP_CODEX_PATH?.trim();
+  if (!configured) return "codex";
+  if (!isAbsolute(configured) || !existsSync(configured) || !statSync(configured).isFile()) throw new Error("WORKSHOP_CODEX_PATH must name an existing absolute executable path");
+  return configured;
+}
+
+class CodexAgentSession implements AgentSession {
+  private readonly client: CodexAppServer;
+  private threadId?: string;
+  private active: CodexRunHandle | undefined;
+  private busy = false;
+
+  constructor(options: AgentSessionOptions) {
+    const backend = options.backendOptions ?? {};
+    const customArgs = Array.isArray(backend.customArgs) ? backend.customArgs.filter((item): item is string => typeof item === "string") : [];
+    validateCustomArgs(customArgs);
+    const sandboxMode = options.sandboxMode ?? COMMAND_SANDBOX_MODE;
+    const networkAccess = options.networkAccess ?? true;
+    const command = resolveCodexCommand();
+    this.client = CodexAppServer.launch({
+      command, ...(options.cwd ? { cwd: options.cwd } : {}), args: codexAppServerArgs(sandboxMode, networkAccess, customArgs),
+      ...(options.onEvent ? { onEvent: (event) => options.onEvent?.(codexAgentEvent(event)) } : {}),
+      ...(options.onApproval ? { onApproval: (event, respond) => options.onApproval?.(codexAgentEvent(event), respond) } : {}),
+      ...(options.onInput ? { onInput: (event, respond) => options.onInput?.(codexAgentEvent(event), respond) } : {})
+    });
+  }
+
+  initialize(): Promise<void> { return this.client.initialize(); }
+  start(options: AgentStartOptions): Promise<AgentTurn> { return this.run(options, false); }
+  continue(options: AgentStartOptions): Promise<AgentTurn> {
+    if (!this.threadId) throw capabilityError();
+    return this.run(options, true);
+  }
+  async steer(input: string | CodexInput[]): Promise<void> {
+    if (!this.active) throw new AgentError("agent_session_busy", "Agent session has no active turn");
+    await this.client.steer(this.active.threadId, this.active.turnId, input);
+  }
+  async interrupt(): Promise<void> {
+    if (!this.active) throw new AgentError("agent_session_busy", "Agent session has no active turn");
+    const active = this.active;
+    await this.client.requestInterrupt(active.threadId, active.turnId);
+  }
+  close(): Promise<void> { return this.client.close(); }
+
+  private async run(options: AgentStartOptions, continuation: boolean): Promise<AgentTurn> {
+    if (this.busy) throw new AgentError("agent_session_busy", "Agent session is already running");
+    this.busy = true;
+    try {
+      const handle = await this.client.startRun({
+        cwd: options.cwd, prompt: options.prompt, ...(options.input ? { input: options.input } : {}),
+        ...(continuation && this.threadId ? { threadId: this.threadId } : {}), ...(options.model ? { model: options.model } : {}),
+        ...(options.reasoningEffort ? { effort: options.reasoningEffort } : {}), ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
+        ...(options.sandbox ? { sandbox: options.sandbox } : {})
+      });
+      this.threadId = handle.threadId;
+      this.active = handle;
+      const completed = handle.completed.then((event) => codexAgentCompletion(event));
+      void completed.then(() => this.finish(handle), () => this.finish(handle));
+      return { ...(handle.model ? { model: handle.model } : {}), completed };
+    } catch (error) {
+      this.busy = false;
+      throw error;
     }
   }
-  return { file, args };
+
+  private finish(handle: CodexRunHandle): void { if (this.active === handle) { this.active = undefined; this.busy = false; } }
+}
+
+const defaultCodexHealth = () => checkCodexHealth({ includeExternalModels: true });
+
+export function createCodexPlugin(health = defaultCodexHealth): AgentPlugin {
+  return {
+    id: "codex", displayName: "Codex", pluginVersion: WORKSHOP_VERSION, defaultCommand: "codex", executableEnvKey: "WORKSHOP_CODEX_PATH",
+    runtimeVersion: { min: CODEX_MIN_VERSION }, capabilities: { continuation: true, steering: true, interruption: true, approvals: true, userInput: true, tokenUsage: true, structuredFileEvents: true },
+    description: "Codex App Server", backendOptions: { customArgs: { type: "string[]" } }, healthTimeoutMs: 7_500, validateConfig: validateCodexConfig, health, createSession: (options) => new CodexAgentSession(options)
+  };
+}
+
+export function codexAgentEvent(event: NormalizedCodexEvent): AgentEvent {
+  const item = asObject(event.payload.item);
+  const text = event.type === "agent.message.delta" ? event.payload.delta : event.type === "agent_message.completed" ? agentMessageText(item.text ?? item.content) : undefined;
+  const usage = event.type === "token.usage" ? codexTokenUsage(event.payload) : undefined;
+  const questions = event.type === "input.requested" && Array.isArray(event.payload.questions) ? event.payload.questions.filter(isObject).filter((question): question is JsonObject & { id: string } => typeof question.id === "string" && Boolean(question.id)) : undefined;
+  return {
+    type: event.type, summary: event.summary, sourceType: event.method, payload: event.payload, ...(event.requestId === undefined ? {} : { requestId: event.requestId }),
+    ...(typeof text === "string" ? { text } : {}), ...(usage ? { tokenUsage: usage } : {}), ...(questions ? { questions } : {}),
+    ...(event.type === "approval.requested" ? { approvalKind: codexApprovalKind(event.method) } : {})
+  };
+}
+
+function agentMessageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  return Array.isArray(content) ? content.map((part) => isObject(part) && typeof part.text === "string" ? part.text : "").join("") : "";
+}
+
+function codexApprovalKind(method: string): NonNullable<AgentEvent["approvalKind"]> {
+  if (method.includes("commandExecution")) return "command";
+  if (method.includes("fileChange")) return "file_change";
+  if (method.includes("permissions")) return "permission";
+  return "mcp_tool_call";
+}
+
+function codexTokenUsage(payload: JsonObject) {
+  const total = asObject(asObject(payload.tokenUsage).total);
+  const input = tokenCount(total.inputTokens); const output = tokenCount(total.outputTokens); const cached = tokenCount(total.cachedInputTokens);
+  return input === undefined || output === undefined || cached === undefined ? undefined : { input, output, cached };
+}
+
+function tokenCount(value: unknown): number | undefined { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined; }
+
+export function codexAgentCompletion(event: NormalizedCodexEvent): AgentCompletion {
+  const status = event.type === "turn.completed" ? "succeeded" : event.type === "turn.interrupted" ? "interrupted" : "failed";
+  return { status, event: codexAgentEvent(event) };
+}
+
+function healthFailure(error: string, capabilities: AgentBackendHealth["capabilities"], runtimeVersion?: string): CodexHealth {
+  return { id: "codex", ok: false, pluginVersion: WORKSHOP_VERSION, ...(runtimeVersion ? { runtimeVersion, version: runtimeVersion } : {}), capabilities, error };
+}
+
+function safeHealthError(error: unknown, stage: "cli" | "app-server", timeoutMs: number): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message === "Timed out") return `Codex health check timed out after ${timeoutMs} ms`;
+  return stage === "cli" ? `Codex CLI could not be started or queried: ${message}` : `Codex App Server initialization or protocol check failed: ${message}`;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try { return await Promise.race([promise, new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error("Timed out")), timeoutMs); })]); }
+  finally { if (timer) clearTimeout(timer); }
+}
+
+function remaining(deadline: number): number {
+  const timeout = deadline - Date.now();
+  if (timeout <= 0) throw new Error("Timed out");
+  return timeout;
+}
+
+function cmdQuote(value: string): string { return `"${value.replaceAll('\"', '\"\"')}"`; }
+
+async function terminateProcessTree(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === "win32" && child.pid) {
+    await runFile("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true }).catch(() => { child.kill("SIGKILL"); });
+  } else if (child.pid) {
+    try { process.kill(-child.pid, "SIGKILL"); }
+    catch { child.kill("SIGKILL"); }
+  }
+  await waitForExit(child, 1_000);
+}
+
+async function waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([new Promise<true>((resolve) => child.once("exit", () => resolve(true))), new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); })]);
+  } finally { if (timer) clearTimeout(timer); }
 }
 
 function isApprovalMethod(method: string, payload: JsonObject = {}): boolean {

@@ -6,17 +6,21 @@ import { promisify } from "node:util";
 import type { DatabaseSync } from "node:sqlite";
 import type { FastifyInstance } from "fastify";
 import { resolvedRoleConfig } from "./agent-settings.ts";
+import { SettingsStore } from "./database.ts";
 import { addMainTaskComment, addRunCommentOnce } from "./comments.ts";
 import { notify } from "./notifications.ts";
 import { REVISION_INTERACTIONS, beginPlanRevision, createRevisionCard, parseRevisionProposal, publishRevisionConfirmation, revisionForRun, saveRevisionProposal, type RevisionProposal, type RevisionQuestion } from "./plan-revisions.ts";
 import type { CommandRunner, VcsInfo } from "./projects.ts";
 import { updateCommissionAcceptance } from "./tasks.ts";
-import { captureWorkspaceSnapshot, diffWorkspaceSnapshots, latestCommissionHashes, type WorkspaceSnapshot } from "./workspace-changes.ts";
+import { captureWorkspaceSnapshot, diffWorkspaceSnapshots, latestCommissionHashes, trackNewGitFiles, type WorkspaceSnapshot } from "./workspace-changes.ts";
 
 const runFile = promisify(execFile);
 const ACTIVE_RUN_STATUSES = ["preparing", "running", "waiting_approval", "waiting_input"] as const;
 const RESERVED_RUN_STATUSES = ["queued", ...ACTIVE_RUN_STATUSES] as const;
 const MAX_CONSECUTIVE_FAILED_REVIEWS = 3;
+const PENDING_ADVANCES_KEY = "pendingRunAdvances";
+export const RUN_HEALTH_TIMEOUT_FAILURE_CODE = "health_check_timeout";
+type PendingAdvance = { runId: string; kind: "terminal" | "recover" | "wake"; createdAt: string };
 type GrantScope = "commission_tree" | "target_closure";
 export type ProjectLockMode = "read" | "worktree" | "exclusive";
 type LockMode = ProjectLockMode;
@@ -24,31 +28,41 @@ type LockMode = ProjectLockMode;
 type GrantRow = { id: string; commission_id: string; root_task_id: string; scope: GrantScope; status: "active" | "exhausted" | "revoked" };
 type RunRow = {
   id: string; project_id: string; commission_id: string; task_id: string; role: string; trigger_type: string; trigger_ref_id: string | null;
-  execution_grant_id: string | null; retry_root_run_id: string | null; status: string; attempt_no: number; config_snapshot_json: string;
+  execution_grant_id: string | null; retry_root_run_id: string | null; status: string; attempt_no: number; config_snapshot_json: string; failure_code: string | null; failure_summary: string | null;
   context_snapshot_json: string; workspace_path: string | null; workspace_mode: LockMode | null; coordination_revision: number | null;
   workspace_baseline_json: string | null;
 };
 export type RunnableTask = { id: string; projectId: string; commissionId: string; readOnly: boolean };
 export type WorkspacePlan = { cwd: string; lock: LockMode; worktree: boolean };
 export type RunStarter = { start(runId: string, cwd: string): Promise<void> };
+export type RunPreflight = (configSnapshotJson?: string) => Promise<void>;
 
 export class Scheduler {
-  private readonly workspaces = new Map<string, { plan: WorkspacePlan; projectRoot: string; vcs: VcsInfo["type"]; release: () => void }>();
+  private readonly workspaces = new Map<string, { plan: WorkspacePlan; projectId: string; projectRoot: string; vcs: VcsInfo["type"]; release: () => void }>();
+  private readonly lockWaiters = new Map<string, () => void>();
+  private readonly recoveryProjects = new Set<string>();
+  private readonly recoveryRunIds = new Set<string>();
   private drain: Promise<void> | null = null;
   private drainRequested = false;
+  private draining = false;
   private readonly database: DatabaseSync;
   private readonly starter: RunStarter;
   private readonly runner: CommandRunner;
   private readonly locks: ProjectLockManager;
+  private readonly preflight: RunPreflight | undefined;
+  private resumingPending = false;
 
-  constructor(database: DatabaseSync, starter: RunStarter, runner: CommandRunner = execute, locks = new ProjectLockManager()) {
+  constructor(database: DatabaseSync, starter: RunStarter, runner: CommandRunner = execute, locks = new ProjectLockManager(), preflight?: RunPreflight) {
     this.database = database;
     this.starter = starter;
     this.runner = runner;
     this.locks = locks;
+    this.preflight = preflight;
+    this.refreshRecoveryBarriers();
   }
 
   async trigger(taskId: string, beforeStart?: (runIds: readonly string[]) => void) {
+    await this.preflight?.();
     const { grant, runIds } = transaction(this.database, () => {
       const grant = createExecutionGrantUnsafe(this.database, taskId);
       if (grant.scope === "commission_tree") {
@@ -71,6 +85,7 @@ export class Scheduler {
   }
 
   async coordinate(taskId: string, beforeStart?: (runIds: readonly string[]) => void) {
+    await this.preflight?.();
     const { grant, runId } = transaction(this.database, () => {
       const task = this.database.prepare("SELECT task.commission_id, commission.status FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id WHERE task.id = ? AND task.archived_at IS NULL AND task.id = commission.main_task_id").get(taskId) as { commission_id: string; status: string } | undefined;
       if (!task) throw conflict("Coordination is only available for the main task");
@@ -106,6 +121,7 @@ export class Scheduler {
   }
 
   async revise(revisionId: string): Promise<string> {
+    await this.preflight?.();
     const runId = transaction(this.database, () => {
       const revision = revisionForRun(this.database, revisionId);
       if (!["collecting", "reviewing"].includes(revision.status)) throw conflict("Plan revision is not ready for supervisor work");
@@ -133,6 +149,7 @@ export class Scheduler {
     const reviewBlocked = previous.task_id === taskId && previous.status === "succeeded" && previous.role === "reviewer" && task?.status === "blocked"
       && Boolean(this.database.prepare("SELECT 1 FROM evidence WHERE run_id = ? AND type = 'review' AND status = 'failed'").get(previous.id));
     if (!interrupted && !reviewBlocked) throw conflict("Only an interrupted task or a task blocked after review can be resumed");
+    await this.preflight?.(interrupted ? previous.config_snapshot_json : undefined);
     const runId = transaction(this.database, () => {
       this.database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ? AND status IN ('in_progress', 'blocked')").run(new Date().toISOString(), taskId);
       const grant = createExecutionGrantUnsafe(this.database, taskId);
@@ -147,19 +164,32 @@ export class Scheduler {
 
   async recover(): Promise<string[]> {
     const blocked: string[] = [];
-    const retries = await recoverInterruptedRuns(this.database, blocked, this.runner);
+    const deferred = new Set<string>();
+    const retries = await recoverInterruptedRuns(this.database, blocked, this.runner, this.preflight);
+    this.refreshRecoveryBarriers();
+    await this.resumePendingAdvances(false);
+    this.refreshRecoveryBarriers();
     const commissions = this.database.prepare("SELECT id FROM commissions WHERE status IN ('active', 'blocked') AND archived_at IS NULL AND NOT EXISTS (SELECT 1 FROM plan_revisions WHERE plan_revisions.commission_id = commissions.id AND plan_revisions.status IN ('collecting', 'reviewing', 'awaiting_confirmation'))").all() as Array<{ id: string }>;
     for (const { id } of commissions) {
-      if (!blocked.includes(id)) await this.coordinateFinal(id);
+      if (blocked.includes(id)) continue;
+      try { await this.coordinateFinal(id); }
+      catch (error) { if ((error as { statusCode?: unknown }).statusCode === 503) deferred.add(id); else throw error; }
     }
-    const pending = this.database.prepare("SELECT main_task_id FROM commissions WHERE coordination_pending = 1 AND status IN ('active', 'blocked') AND archived_at IS NULL AND main_task_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM plan_revisions WHERE plan_revisions.commission_id = commissions.id AND plan_revisions.status IN ('collecting', 'reviewing', 'awaiting_confirmation'))").all() as Array<{ main_task_id: string }>;
-    for (const { main_task_id } of pending) await this.coordinate(main_task_id);
+    const pending = this.database.prepare("SELECT id, main_task_id FROM commissions WHERE coordination_pending = 1 AND status IN ('active', 'blocked') AND archived_at IS NULL AND main_task_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM plan_revisions WHERE plan_revisions.commission_id = commissions.id AND plan_revisions.status IN ('collecting', 'reviewing', 'awaiting_confirmation'))").all() as Array<{ id: string; main_task_id: string }>;
+    for (const { id, main_task_id } of pending) {
+      if (deferred.has(id)) continue;
+      try { await this.coordinate(main_task_id); }
+      catch (error) { if ((error as { statusCode?: unknown }).statusCode !== 503) throw error; }
+    }
     await this.startQueued();
     return retries;
   }
 
   async wake(grantId?: string): Promise<string[]> {
+    await this.resumePendingAdvances();
     const grants = grantId ? [grantById(this.database, grantId)] : this.database.prepare("SELECT * FROM execution_grants WHERE status = 'active' ORDER BY created_at").all() as GrantRow[];
+    const runnable = grants.filter((grant) => runnableTasks(this.database, grant.id).length);
+    if (runnable.length && !await this.canReserveRun()) { for (const grant of runnable) addPendingAdvance(this.database, grant.id, "wake"); return []; }
     const reserved: string[] = [];
     for (const grant of grants) {
       reserved.push(...transaction(this.database, () => {
@@ -167,6 +197,7 @@ export class Scheduler {
         settleBlockedCommissionTree(this.database, grant);
         return runIds;
       }));
+      deletePendingAdvance(this.database, grant.id, "wake");
     }
     await this.startQueued();
     return reserved;
@@ -186,13 +217,19 @@ export class Scheduler {
         if (pending) await this.coordinate(run.task_id); else await this.startQueued();
         return;
       }
-      this.database.prepare("UPDATE commissions SET coordination_pending = 0 WHERE id = ? AND coordination_revision = ?").run(run.commission_id, coordination.coordination_revision);
+      if (!(run.status === "interrupted" && run.failure_code === RUN_HEALTH_TIMEOUT_FAILURE_CODE))
+        this.database.prepare("UPDATE commissions SET coordination_pending = 0 WHERE id = ? AND coordination_revision = ?").run(run.commission_id, coordination.coordination_revision);
     }
     if (["interrupted", "cancelled"].includes(run.status)) {
       await this.cleanup(run.id, run.status === "cancelled");
+      if (run.status === "interrupted" && run.failure_code === RUN_HEALTH_TIMEOUT_FAILURE_CODE) {
+        await this.handleHealthTimeout(run);
+        return;
+      }
       await this.startQueued();
       return;
     }
+    if (await this.handleModelCapacityFailure(run)) return;
     if (["plan_revision", "plan_revision_review"].includes(run.trigger_type)) {
       if (run.status !== "succeeded") {
         await this.cleanup(run.id);
@@ -274,6 +311,10 @@ export class Scheduler {
       try { decision = parseCoordinatorDecision(runAgentOutput(this.database, run.id)); }
       catch (error) { decision = { action: "wait_human", summary: error instanceof Error ? error.message : "调度 Agent 返回了无效结果" }; }
       let outcome: "queued" | "settled" | "blocked" | "revision";
+      if (decision.action === "proceed" && !await this.canReserveTerminalAdvance(run.id)) {
+        this.deferAdvance(run.id, "terminal");
+        return;
+      }
       try { outcome = transaction(this.database, () => applyCoordinatorDecision(this.database, run, decision)); }
       catch (error) {
         decision = { action: "wait_human", summary: error instanceof Error ? error.message : "调度决策无法执行" };
@@ -294,6 +335,10 @@ export class Scheduler {
       try { decision = parseSupervisorDecision(runAgentOutput(this.database, run.id)); }
       catch (error) {
         decision = { action: "wait_human", summary: error instanceof Error ? error.message : "主管 Agent 返回了无效结果" };
+      }
+      if (!["wait_human", "replan"].includes(decision.action) && !await this.canReserveTerminalAdvance(run.id)) {
+        this.deferAdvance(run.id, "terminal");
+        return;
       }
       const outcome = transaction(this.database, () => applySupervisorDecision(this.database, run, decision));
       await this.cleanup(run.id, decision.action === "restart_developer");
@@ -325,10 +370,15 @@ export class Scheduler {
           return;
         }
       }
+      const existingReview = databaseRunTriggeredBy(this.database, run.id, "reviewer");
+      if (!existingReview && !await this.canReserveTerminalAdvance(run.id)) {
+        this.deferAdvance(run.id, "terminal");
+        return;
+      }
       transaction(this.database, () => {
         if (result) addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "agent", agentRole: "developer", content: result.slice(0, 12000) });
         addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "system", content: "开发执行已完成，已触发独立代码审查。" });
-        return databaseRunTriggeredBy(this.database, run.id, "reviewer") ?? reserveRun(this.database, run.execution_grant_id!, run.task_id, "review", run.id, null, undefined, "{}", "reviewer");
+        return existingReview ?? reserveRun(this.database, run.execution_grant_id!, run.task_id, "review", run.id, null, undefined, "{}", "reviewer");
       });
       await this.startQueued();
       return;
@@ -344,8 +394,12 @@ export class Scheduler {
       let review: ReviewResult;
       try { review = reviewResult(this.database, run.id); }
       catch (error) {
-        review = { passed: false, summary: error instanceof Error ? error.message : "Reviewer returned invalid output", checks: [], findings: [{ severity: "blocking", file: null, line: null, message: "Reviewer output did not match the JSON contract" }] };
+        review = { repairAccepted: false, reactivatedOldFinding: false, passed: false, summary: error instanceof Error ? error.message : "Reviewer returned invalid output", checks: [], findings: [{ severity: "blocking", file: null, line: null, message: "Reviewer output did not match the JSON contract" }] };
       }
+      const reworkReview = isReworkReview(this.database, run.id);
+      const reactivatedOldFinding = reworkReview && review.reactivatedOldFinding;
+      review = { ...review, reactivatedOldFinding };
+      if (reworkReview && (!review.repairAccepted || reactivatedOldFinding)) review = { ...review, passed: false };
       const now = new Date().toISOString();
       const task = this.database.prepare("SELECT review_round_limit, review_round_used FROM tasks WHERE id = ?").get(run.task_id) as { review_round_limit: number; review_round_used: number };
       const successful = task.review_round_used + (review.passed ? 1 : 0);
@@ -355,6 +409,8 @@ export class Scheduler {
         catch (error) {
           const message = error instanceof Error ? error.message : "Worktree delivery failed";
           review = {
+            repairAccepted: review.repairAccepted,
+            reactivatedOldFinding: review.reactivatedOldFinding,
             passed: false,
             summary: `Reviewer 通过，但 Worktree 变更未能安全应用：${message}`,
             checks: review.checks,
@@ -363,10 +419,16 @@ export class Scheduler {
           complete = false;
         }
       }
+      const failedReviews = review.passed ? 0 : reactivatedOldFinding ? MAX_CONSECUTIVE_FAILED_REVIEWS : reworkReview && review.repairAccepted ? 1 : consecutiveFailedReviewCount(this.database, run.task_id) + 1;
+      const needsNextRun = review.passed ? !complete : failedReviews < MAX_CONSECUTIVE_FAILED_REVIEWS;
+      if (needsNextRun && !await this.canReserveTerminalAdvance(run.id)) {
+        this.deferAdvance(run.id, "terminal");
+        return;
+      }
       const outcome = transaction(this.database, () => {
         this.database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'review', ?, ?, ?, ?)")
           .run(randomUUID(), run.task_id, run.id, review.passed ? "passed" : "failed", review.summary, JSON.stringify(review), now);
-        addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "agent", agentRole: "reviewer", content: reviewComment(review) });
+        addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "agent", agentRole: "reviewer", content: reviewComment(review, reworkReview) });
         if (review.passed) {
           this.database.prepare("UPDATE tasks SET review_round_used = ?, updated_at = ? WHERE id = ?").run(successful, now, run.task_id);
           if (!complete) {
@@ -381,13 +443,13 @@ export class Scheduler {
           notify(this.database, "completed", `任务完成：${completedTask.title}`, review.summary, "task", run.task_id);
           return "passed" as const;
         }
-        const failedReviews = consecutiveFailedReviewCount(this.database, run.task_id);
         if (failedReviews >= MAX_CONSECUTIVE_FAILED_REVIEWS) {
-          const reason = `连续 ${failedReviews} 轮代码审查未通过：${review.summary}`;
+          const findingDetails = review.findings.map((finding) => `- ${typeof finding === "string" ? finding : JSON.stringify(finding)}`).join("\n");
+          const reason = reactivatedOldFinding ? `返工导致已修复的旧问题重新激活，审查失败计数已记满：${review.summary}` : `连续 ${failedReviews} 轮代码审查未通过：${review.summary}`;
           this.database.prepare("UPDATE tasks SET status = 'blocked', blocked_reason = ?, updated_at = ? WHERE id = ?").run(reason, now, run.task_id);
           const blockedTask = this.database.prepare("SELECT title FROM tasks WHERE id = ?").get(run.task_id) as { title: string };
-          addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "system", kind: "blocker", content: `${reason}\n\n已停止自动返工，请人工处理阻塞原因后重新执行。` });
-          addMainTaskComment(this.database, { sourceTaskId: run.task_id, runId: run.id, kind: "blocker", content: `子任务连续 ${failedReviews} 轮代码审查未通过，已停止自动返工。\n\n${review.summary}` });
+          addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "system", kind: "blocker", content: `${reason}${findingDetails ? `\n\n### 详细原因\n\n${findingDetails}` : ""}\n\n已停止自动返工，请人工处理阻塞原因后重新执行。` });
+          addMainTaskComment(this.database, { sourceTaskId: run.task_id, runId: run.id, kind: "blocker", content: reactivatedOldFinding ? `子任务返工重新激活了已修复的旧问题，已直接阻塞。\n\n${review.summary}${findingDetails ? `\n\n${findingDetails}` : ""}` : `子任务连续 ${failedReviews} 轮代码审查未通过，已停止自动返工。\n\n${review.summary}` });
           notify(this.database, "blocked", `任务阻塞：${blockedTask.title}`, reason, "task", run.task_id);
           return "blocked" as const;
         }
@@ -407,16 +469,74 @@ export class Scheduler {
 
   private async startQueued(): Promise<void> {
     this.drainRequested = true;
-    return this.drain ??= this.drainLoop();
+    if (this.draining) return;
+    return this.drain ??= Promise.resolve().then(() => this.drainLoop());
+  }
+
+  private async canReserveRun(): Promise<boolean> {
+    try { await this.preflight?.(); return true; }
+    catch (error) {
+      if ((error as { statusCode?: unknown }).statusCode === 503) return false;
+      throw error;
+    }
+  }
+
+  private async canReserveTerminalAdvance(runId: string): Promise<boolean> {
+    try { return await this.canReserveRun(); }
+    catch (error) {
+      if ((error as { statusCode?: unknown }).statusCode !== 503) await this.cleanup(runId, false);
+      throw error;
+    }
+  }
+
+  private deferAdvance(runId: string, kind: PendingAdvance["kind"]): void {
+    const pending = readPendingAdvances(this.database).filter((item) => item.runId !== runId || item.kind !== kind);
+    pending.push({ runId, kind, createdAt: new Date().toISOString() });
+    new SettingsStore(this.database).set(PENDING_ADVANCES_KEY, pending);
+  }
+
+  private async resumePendingAdvances(includeRecover = true): Promise<void> {
+    if (this.resumingPending) return;
+    this.resumingPending = true;
+    try {
+      if (includeRecover && readPendingAdvances(this.database).some((item) => item.kind === "recover")) {
+        await recoverInterruptedRuns(this.database, [], this.runner, this.preflight);
+        this.refreshRecoveryBarriers();
+      }
+      const pending = readPendingAdvances(this.database).filter((item) => item.kind === "terminal");
+      if (pending.length) {
+        try {
+          if (!await this.canReserveRun()) return;
+        } catch (error) {
+          if ((error as { statusCode?: unknown }).statusCode !== 503) {
+            for (const { runId } of pending) deletePendingAdvance(this.database, runId, "terminal");
+            await Promise.all(pending.map(({ runId }) => this.cleanup(runId, false)));
+          }
+          throw error;
+        }
+        for (const { runId } of pending) {
+          deletePendingAdvance(this.database, runId, "terminal");
+          try { await this.terminal(runId); }
+          catch (error) {
+            if ((error as { statusCode?: unknown }).statusCode === 503) this.deferAdvance(runId, "terminal");
+            throw error;
+          }
+        }
+      }
+      for (const { runId } of readPendingAdvances(this.database).filter((item) => item.kind === "wake")) await this.wake(runId);
+      this.refreshRecoveryBarriers();
+    } finally { this.resumingPending = false; }
   }
 
   private async drainLoop(): Promise<void> {
+    this.draining = true;
     try {
       do {
         this.drainRequested = false;
         await this.drainQueued();
       } while (this.drainRequested);
     } finally {
+      this.draining = false;
       this.drain = null;
       if (this.drainRequested) await this.startQueued();
     }
@@ -426,13 +546,32 @@ export class Scheduler {
     const queued = this.database.prepare("SELECT * FROM runs WHERE status = 'queued' ORDER BY rowid").all() as RunRow[];
     for (const run of queued) {
       if (!canStartRun(this.database, run)) continue;
-      const workspace = await this.prepareWorkspace(run);
+      let workspace: { plan: WorkspacePlan } | undefined;
+      try { workspace = await this.prepareWorkspace(run); }
+      catch (error) {
+        const summary = `Workspace preparation failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2000);
+        const failed = this.database.prepare("UPDATE runs SET status = 'failed', finished_at = ?, failure_code = 'workspace_prepare_failed', failure_summary = ? WHERE id = ? AND status = 'queued'")
+          .run(new Date().toISOString(), summary, run.id).changes;
+        if (failed) { try { await this.terminal(run.id); } catch { await this.cleanup(run.id); } }
+        continue;
+      }
       if (!workspace) continue;
       const claimed = this.database.prepare("UPDATE runs SET status = 'preparing', workspace_path = ?, workspace_mode = ?, started_at = ? WHERE id = ? AND status = 'queued'")
         .run(workspace.plan.cwd, workspace.plan.lock, new Date().toISOString(), run.id).changes;
       if (!claimed) { await this.cleanup(run.id); continue; }
       this.database.prepare("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?").run(new Date().toISOString(), run.task_id);
-      await this.starter.start(run.id, workspace.plan.cwd);
+      try {
+        await this.starter.start(run.id, workspace.plan.cwd);
+      } catch {
+        const current = runById(this.database, run.id);
+        if (current.status === "preparing") {
+          this.database.prepare("UPDATE runs SET status = 'failed', finished_at = ?, failure_code = 'start_failed', failure_summary = 'Run failed to start' WHERE id = ? AND status = 'preparing'")
+            .run(new Date().toISOString(), run.id);
+          try { await this.terminal(run.id); } catch { await this.cleanup(run.id); }
+        } else {
+          await this.cleanup(run.id);
+        }
+      }
     }
   }
 
@@ -442,20 +581,21 @@ export class Scheduler {
       WHERE project.id = ? AND project.archived_at IS NULL AND root.enabled = 1`).get(run.project_id) as { real_path: string; vcs_type: VcsInfo["type"] } | undefined;
     const task = this.database.prepare("SELECT read_only FROM tasks WHERE id = ? AND archived_at IS NULL").get(run.task_id) as { read_only: number } | undefined;
     if (!project || !task) throw new Error("Reserved Run lost its project or task");
+    const readOnly = run.role === "supervisor" || Boolean(task.read_only);
+    if (!readOnly && this.recoveryProjects.has(run.project_id) && !this.recoveryRunIds.has(run.id)) return undefined;
     const continued = await this.continueWorkspace(run, project.real_path);
     if (continued) return { plan: continued.plan };
     let clean = false;
-    const readOnly = run.role === "supervisor" || Boolean(task.read_only);
     if (project.vcs_type === "git" && !readOnly) clean = !(await this.runner("git", ["status", "--porcelain=v2"], project.real_path)).trim();
     const plan = workspacePlan(project.real_path, project.vcs_type, readOnly, clean, run.id);
     const release = this.locks.tryAcquire(run.project_id, plan.lock);
-    if (!release) return undefined;
+    if (!release) { this.waitForProjectLock(run.project_id); return undefined; }
     try {
       if (plan.worktree) {
         await mkdir(join(project.real_path, ".openworkshop", "worktrees"), { recursive: true });
         await this.runner("git", ["worktree", "add", "--detach", plan.cwd, "HEAD"], project.real_path);
       }
-      const workspace = { plan, projectRoot: project.real_path, vcs: project.vcs_type, release };
+      const workspace = { plan, projectId: run.project_id, projectRoot: project.real_path, vcs: project.vcs_type, release };
       await this.saveWorkspaceBaseline(run, workspace);
       this.workspaces.set(run.id, workspace);
       return { plan };
@@ -480,8 +620,8 @@ export class Scheduler {
       const previous = this.database.prepare("SELECT workspace_path, workspace_mode FROM runs WHERE id = ?").get(sourceId) as { workspace_path: string | null; workspace_mode: LockMode | null } | undefined;
       if (previous?.workspace_mode !== "worktree" || !previous.workspace_path || !await access(previous.workspace_path).then(() => true, () => false)) continue;
       const release = this.locks.tryAcquire(run.project_id, "worktree");
-      if (!release) return undefined;
-      const workspace = { plan: { cwd: previous.workspace_path, lock: "worktree" as const, worktree: true }, projectRoot, vcs: "git" as const, release };
+      if (!release) { this.waitForProjectLock(run.project_id); return undefined; }
+      const workspace = { plan: { cwd: previous.workspace_path, lock: "worktree" as const, worktree: true }, projectId: run.project_id, projectRoot, vcs: "git" as const, release };
       try { await this.saveWorkspaceBaseline(run, workspace); } catch (error) { release(); throw error; }
       this.workspaces.set(run.id, workspace);
       return workspace;
@@ -524,8 +664,8 @@ export class Scheduler {
 
   private async saveWorkspaceBaseline(run: RunRow, workspace: { plan: WorkspacePlan; vcs: VcsInfo["type"] }): Promise<void> {
     if (workspace.plan.lock === "read") return;
-    const snapshot = await captureWorkspaceSnapshot(workspace.plan.cwd, workspace.vcs, this.runner);
     const owned = Object.fromEntries(latestCommissionHashes(this.database, run.commission_id));
+    const snapshot = await captureWorkspaceSnapshot(workspace.plan.cwd, workspace.vcs, this.runner, [], (path) => Object.hasOwn(owned, path));
     this.database.prepare("UPDATE runs SET workspace_baseline_json = ? WHERE id = ?").run(JSON.stringify({ snapshot, owned }), run.id);
   }
 
@@ -537,10 +677,117 @@ export class Scheduler {
 
   private async cleanup(runId: string, removeWorktree = true): Promise<void> {
     const workspace = this.workspaces.get(runId);
-    if (!workspace) return;
-    this.workspaces.delete(runId);
-    try { if (removeWorktree && workspace.plan.worktree) await this.runner("git", ["worktree", "remove", "--force", workspace.plan.cwd], workspace.projectRoot); }
-    catch {} finally { workspace.release(); }
+    if (workspace) {
+      this.workspaces.delete(runId);
+      this.lockWaiters.get(workspace.projectId)?.();
+      this.lockWaiters.delete(workspace.projectId);
+      try { if (removeWorktree && workspace.plan.worktree) await this.runner("git", ["worktree", "remove", "--force", workspace.plan.cwd], workspace.projectRoot); }
+      catch {} finally { workspace.release(); }
+    }
+    this.refreshRecoveryBarriers();
+  }
+
+  private waitForProjectLock(projectId: string): void {
+    if (this.lockWaiters.has(projectId)) return;
+    const cancel = this.locks.onAvailable(projectId, () => {
+      this.lockWaiters.delete(projectId);
+      void this.startQueued();
+    });
+    this.lockWaiters.set(projectId, cancel);
+  }
+
+  private async handleModelCapacityFailure(run: RunRow): Promise<boolean> {
+    if (run.status !== "failed" || !isModelCapacityFailure(run)) return false;
+    const retries = modelCapacityRetryCount(this.database, run.id);
+    const reason = `模型容量错误在当前 Agent 会话内自动重试 ${retries} 次仍失败：${run.failure_summary ?? "Selected model is at capacity"}`;
+    await this.cleanup(run.id);
+    transaction(this.database, () => {
+      const task = this.database.prepare("SELECT tasks.title, tasks.commission_id, commissions.main_task_id FROM tasks JOIN commissions ON commissions.id = tasks.commission_id WHERE tasks.id = ?").get(run.task_id) as { title: string; commission_id: string; main_task_id: string | null };
+      const now = new Date().toISOString();
+      if (task.main_task_id === run.task_id) {
+        this.database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(now, run.task_id);
+        this.database.prepare("UPDATE commissions SET status = 'blocked', coordination_pending = 0, updated_at = ? WHERE id = ?").run(now, task.commission_id);
+        if (run.execution_grant_id) this.database.prepare("UPDATE execution_grants SET status = 'exhausted' WHERE id = ? AND status = 'active'").run(run.execution_grant_id);
+      } else {
+        this.database.prepare("UPDATE tasks SET status = 'blocked', blocked_reason = ?, updated_at = ? WHERE id = ?").run(reason, now, run.task_id);
+      }
+      addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "system", kind: "blocker", content: `${reason}\n\n已停止自动重试，请人工处理。` });
+      addMainTaskComment(this.database, { sourceTaskId: run.task_id, runId: run.id, kind: "blocker", content: `子任务因模型容量错误连续自动重试失败，已阻塞。\n\n${reason}` });
+      notify(this.database, "blocked", `任务阻塞：${task.title}`, reason, "task", run.task_id);
+    });
+    if (run.execution_grant_id) await this.wake(run.execution_grant_id);
+    return true;
+  }
+
+  private async handleHealthTimeout(run: RunRow): Promise<void> {
+    const rootRunId = run.retry_root_run_id ?? run.id;
+    const existing = this.database.prepare("SELECT id FROM runs WHERE retry_root_run_id = ? ORDER BY rowid DESC LIMIT 1").get(rootRunId) as { id: string } | undefined;
+    if (existing && !run.retry_root_run_id) {
+      await this.startQueued();
+      return;
+    }
+    if (run.retry_root_run_id) {
+      this.blockHealthTimeout(run, "Run 自动恢复后再次因健康检查超时，已停止自动恢复。");
+      await this.startQueued();
+      return;
+    }
+    let retryRunId: string;
+    try { retryRunId = await this.resumeHealthTimeout(run, rootRunId); }
+    catch {
+      this.blockHealthTimeout(run, "Run 健康检查超时，且自动恢复启动失败，已转人工处理。");
+      await this.startQueued();
+      return;
+    }
+    this.database.prepare("UPDATE runs SET retry_root_run_id = ? WHERE id = ?").run(rootRunId, retryRunId);
+    addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "system", content: "Run 因健康检查超时被中断，已自动恢复一次。再次超时将停止自动恢复并转人工处理。" });
+    notify(this.database, "attention", "Run 已自动恢复", "检测到 Run 长时间无事件，已中断原会话并自动启动一次恢复。", "task", run.task_id);
+  }
+
+  private async resumeHealthTimeout(run: RunRow, rootRunId: string): Promise<string> {
+    const grantId = run.execution_grant_id;
+    if (!grantId) throw new Error("Run execution grant is unavailable");
+    await this.preflight?.(run.config_snapshot_json);
+    const retryRunId = transaction(this.database, () => {
+      if (grantById(this.database, grantId).status !== "active") throw new Error("Run execution grant is no longer active");
+      const controlRun = ["coordinate", "plan_revision", "plan_revision_review"].includes(run.trigger_type);
+      this.database.prepare("UPDATE tasks SET status = ?, blocked_reason = NULL, updated_at = ? WHERE id = ? AND status IN ('todo', 'in_progress', 'blocked')")
+        .run(controlRun ? "in_progress" : "todo", new Date().toISOString(), run.task_id);
+      return reserveRun(this.database, grantId, run.task_id, controlRun ? run.trigger_type : "resume", controlRun ? run.trigger_ref_id! : run.id, rootRunId, run.config_snapshot_json, run.context_snapshot_json, run.role, run.coordination_revision);
+    });
+    await this.startQueued();
+    return retryRunId;
+  }
+
+  private blockHealthTimeout(run: RunRow, reason: string): void {
+    transaction(this.database, () => {
+      const task = this.database.prepare("SELECT task.title, commission.main_task_id FROM tasks AS task JOIN commissions AS commission ON commission.id = task.commission_id WHERE task.id = ?").get(run.task_id) as { title: string; main_task_id: string | null };
+      const now = new Date().toISOString();
+      if (task.main_task_id === run.task_id) {
+        this.database.prepare("UPDATE tasks SET status = 'todo', blocked_reason = NULL, updated_at = ? WHERE id = ?").run(now, run.task_id);
+        this.database.prepare("UPDATE commissions SET status = 'blocked', coordination_pending = 0, updated_at = ? WHERE id = ?").run(now, run.commission_id);
+        if (run.execution_grant_id) this.database.prepare("UPDATE execution_grants SET status = 'exhausted' WHERE id = ? AND status = 'active'").run(run.execution_grant_id);
+      } else {
+        this.database.prepare("UPDATE tasks SET status = 'blocked', blocked_reason = ?, updated_at = ? WHERE id = ?").run(reason, now, run.task_id);
+      }
+      addRunCommentOnce(this.database, { taskId: run.task_id, runId: run.id, authorType: "system", kind: "blocker", content: reason });
+      notify(this.database, "blocked", `任务阻塞：${task.title}`, reason, "task", run.task_id);
+    });
+  }
+
+  private refreshRecoveryBarriers(): void {
+    const pendingIds = readPendingAdvances(this.database).filter((item) => item.kind === "recover").map((item) => item.runId);
+    const pendingProjects = pendingIds.length
+      ? this.database.prepare(`SELECT DISTINCT project_id FROM runs WHERE id IN (${pendingIds.map(() => "?").join(", ")}) AND workspace_mode IS NOT NULL AND workspace_mode <> 'read'`).all(...pendingIds) as Array<{ project_id: string }>
+      : [];
+    const recoveryRuns = this.database.prepare(`SELECT retry.id, retry.project_id
+      FROM runs AS retry JOIN runs AS root ON root.id = retry.retry_root_run_id
+      WHERE retry.status IN (${RESERVED_RUN_STATUSES.map(() => "?").join(", ")})
+        AND (root.workspace_mode = 'exclusive' OR (root.failure_code = 'server_restart' AND root.workspace_mode IS NOT NULL AND root.workspace_mode <> 'read'))`)
+      .all(...RESERVED_RUN_STATUSES) as Array<{ id: string; project_id: string }>;
+    this.recoveryProjects.clear();
+    this.recoveryRunIds.clear();
+    for (const { project_id } of pendingProjects) this.recoveryProjects.add(project_id);
+    for (const { id, project_id } of recoveryRuns) { this.recoveryProjects.add(project_id); this.recoveryRunIds.add(id); }
   }
 }
 
@@ -640,12 +887,28 @@ function settleBlockedCommissionTree(database: DatabaseSync, grant: GrantRow): b
 
 export class ProjectLockManager {
   private readonly locks = new Map<string, { shared: number; exclusive: boolean }>();
+  private readonly waiters = new Map<string, Set<() => void>>();
+  onAvailable(projectId: string, callback: () => void): () => void {
+    const callbacks = this.waiters.get(projectId) ?? new Set<() => void>();
+    callbacks.add(callback);
+    this.waiters.set(projectId, callbacks);
+    return () => { callbacks.delete(callback); if (!callbacks.size) this.waiters.delete(projectId); };
+  }
   tryAcquire(projectId: string, mode: LockMode): (() => void) | undefined {
     const current = this.locks.get(projectId) ?? { shared: 0, exclusive: false };
     if (mode === "exclusive" ? current.exclusive || current.shared > 0 : current.exclusive) return undefined;
     if (mode === "exclusive") current.exclusive = true; else current.shared += 1;
     this.locks.set(projectId, current); let released = false;
-    return () => { if (released) return; released = true; if (mode === "exclusive") current.exclusive = false; else current.shared -= 1; if (!current.exclusive && current.shared === 0) this.locks.delete(projectId); };
+    return () => {
+      if (released) return;
+      released = true;
+      if (mode === "exclusive") current.exclusive = false; else current.shared -= 1;
+      if (current.exclusive || current.shared > 0) return;
+      this.locks.delete(projectId);
+      const callbacks = this.waiters.get(projectId);
+      this.waiters.delete(projectId);
+      for (const callback of callbacks ?? []) callback();
+    };
   }
 }
 
@@ -661,26 +924,35 @@ export function workspacePlan(projectRoot: string, vcs: VcsInfo["type"], readOnl
   return { cwd: projectRoot, lock: "exclusive", worktree: false };
 }
 
-export async function recoverInterruptedRuns(database: DatabaseSync, blockedCommissions: string[] = [], runner: CommandRunner = execute): Promise<string[]> {
-  const interrupted = database.prepare(`SELECT * FROM runs WHERE status IN (${ACTIVE_RUN_STATUSES.map(() => "?").join(", ")})`).all(...ACTIVE_RUN_STATUSES) as RunRow[];
+export async function recoverInterruptedRuns(database: DatabaseSync, blockedCommissions: string[] = [], runner: CommandRunner = execute, preflight?: RunPreflight): Promise<string[]> {
+  const pendingRecoveries = readPendingAdvances(database).filter((item) => item.kind === "recover");
+  const pendingRecoveryIds = new Set(pendingRecoveries.map((item) => item.runId));
+  const pendingIds = pendingRecoveries.map((item) => item.runId);
+  const interrupted = database.prepare(`SELECT * FROM runs WHERE status IN (${ACTIVE_RUN_STATUSES.map(() => "?").join(", ")})${pendingIds.length ? ` OR id IN (${pendingIds.map(() => "?").join(", ")})` : ""}`).all(...ACTIVE_RUN_STATUSES, ...pendingIds) as RunRow[];
   for (const run of interrupted) {
     if (!run.workspace_path || !run.workspace_mode || run.workspace_mode === "read") continue;
     const project = database.prepare("SELECT vcs_type FROM projects WHERE id = ?").get(run.project_id) as { vcs_type: VcsInfo["type"] };
     await recordRunDiffEvidenceOrUnavailable(database, runner, run, run.workspace_path, project.vcs_type, run.workspace_mode);
   }
-  return transaction(database, () => {
-    const now = new Date().toISOString(); const retries: string[] = [];
+  const retries = transaction(database, () => {
+    const now = new Date().toISOString();
+    const pending: Array<{ run: RunRow; triggerType: string; triggerRefId: string; retryRootRunId: string | null; context: string; role: string; taskStatus: string }> = [];
     for (const run of interrupted) {
       database.prepare("UPDATE runs SET status = 'interrupted', finished_at = ?, failure_code = 'server_restart' WHERE id = ?").run(now, run.id);
       if (["plan_revision", "plan_revision_review"].includes(run.trigger_type)) {
-        if (!run.execution_grant_id || grantById(database, run.execution_grant_id).status !== "active") continue;
-        database.prepare("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?").run(now, run.task_id);
-        retries.push(reserveRun(database, run.execution_grant_id, run.task_id, run.trigger_type, run.trigger_ref_id ?? "", run.id, run.config_snapshot_json, run.context_snapshot_json, "supervisor"));
+        if (!run.execution_grant_id || grantById(database, run.execution_grant_id).status !== "active") {
+          if (pendingRecoveryIds.has(run.id)) deletePendingAdvance(database, run.id, "recover");
+          continue;
+        }
+        pending.push({ run, triggerType: run.trigger_type, triggerRefId: run.trigger_ref_id ?? "", retryRootRunId: run.id, context: run.context_snapshot_json, role: "supervisor", taskStatus: "in_progress" });
         continue;
       }
       if (run.trigger_type === "coordinate") {
         const revision = (database.prepare("SELECT coordination_revision FROM commissions WHERE id = ?").get(run.commission_id) as { coordination_revision: number }).coordination_revision;
-        if (run.coordination_revision !== revision) continue;
+        if (run.coordination_revision !== revision) {
+          if (pendingRecoveryIds.has(run.id)) deletePendingAdvance(database, run.id, "recover");
+          continue;
+        }
       }
       const root = run.retry_root_run_id ?? run.id;
       if (run.trigger_type === "coordinate" && run.retry_root_run_id) {
@@ -690,21 +962,65 @@ export async function recoverInterruptedRuns(database: DatabaseSync, blockedComm
         addRunCommentOnce(database, { taskId: run.task_id, runId: run.id, authorType: "system", kind: "blocker", content: "调度 Run 连续两次因服务重启中断，已停止自动恢复，请人工检查后重新触发调度。" });
         notify(database, "blocked", "调度需要人工处理", "调度 Run 连续两次因服务重启中断。", "task", run.task_id);
         blockedCommissions.push(run.commission_id);
+        if (pendingRecoveryIds.has(run.id)) deletePendingAdvance(database, run.id, "recover");
         continue;
       }
-      if (run.retry_root_run_id || database.prepare("SELECT 1 FROM runs WHERE retry_root_run_id = ?").get(root)) continue;
-      if (!run.execution_grant_id || grantById(database, run.execution_grant_id).status !== "active") continue;
-      database.prepare("UPDATE tasks SET status = ?, blocked_reason = NULL, updated_at = ? WHERE id = ?").run(run.trigger_type === "coordinate" ? "in_progress" : "todo", now, run.task_id);
-      retries.push(reserveRun(database, run.execution_grant_id, run.task_id, run.trigger_type === "coordinate" ? "coordinate" : "auto_retry", run.id, root, run.config_snapshot_json, run.trigger_type === "coordinate" ? "{}" : run.context_snapshot_json, run.role, run.coordination_revision));
+      if (run.retry_root_run_id || database.prepare("SELECT 1 FROM runs WHERE retry_root_run_id = ?").get(root)) {
+        if (pendingRecoveryIds.has(run.id)) deletePendingAdvance(database, run.id, "recover");
+        continue;
+      }
+      if (!run.execution_grant_id || grantById(database, run.execution_grant_id).status !== "active") {
+        if (pendingRecoveryIds.has(run.id)) deletePendingAdvance(database, run.id, "recover");
+        continue;
+      }
+      pending.push({ run, triggerType: run.trigger_type === "coordinate" ? "coordinate" : "auto_retry", triggerRefId: run.id, retryRootRunId: root, context: run.trigger_type === "coordinate" ? "{}" : run.context_snapshot_json, role: run.role, taskStatus: run.trigger_type === "coordinate" ? "in_progress" : "todo" });
     }
-    return retries;
+    return pending;
   });
+  const ready: typeof retries = [];
+  for (const retry of retries) {
+    try { await preflight?.(retry.run.config_snapshot_json); ready.push(retry); }
+    catch (error) {
+      if ((error as { statusCode?: unknown }).statusCode !== 503) throw error;
+      addPendingAdvance(database, retry.run.id, "recover");
+    }
+  }
+  return transaction(database, () => ready.flatMap(({ run, triggerType, triggerRefId, retryRootRunId, context, role, taskStatus }) => {
+    if (!run.execution_grant_id || grantById(database, run.execution_grant_id).status !== "active") return [];
+    database.prepare("UPDATE tasks SET status = ?, blocked_reason = NULL, updated_at = ? WHERE id = ?").run(taskStatus, new Date().toISOString(), run.task_id);
+    const retry = reserveRun(database, run.execution_grant_id, run.task_id, triggerType, triggerRefId, retryRootRunId, run.config_snapshot_json, context, role, run.coordination_revision);
+    deletePendingAdvance(database, run.id, "recover");
+    return [retry];
+  }));
+}
+
+function readPendingAdvances(database: DatabaseSync): PendingAdvance[] {
+  const value = new SettingsStore(database).get<unknown>(PENDING_ADVANCES_KEY, []);
+  return Array.isArray(value) ? value.filter((item): item is PendingAdvance => {
+    if (!item || typeof item !== "object") return false;
+    const record = item as Record<string, unknown>;
+    return typeof record.runId === "string" && (record.kind === "terminal" || record.kind === "recover" || record.kind === "wake") && typeof record.createdAt === "string";
+  }) : [];
+}
+
+function addPendingAdvance(database: DatabaseSync, runId: string, kind: PendingAdvance["kind"]): void {
+  const pending = readPendingAdvances(database).filter((item) => item.runId !== runId || item.kind !== kind);
+  pending.push({ runId, kind, createdAt: new Date().toISOString() });
+  new SettingsStore(database).set(PENDING_ADVANCES_KEY, pending);
+}
+
+function deletePendingAdvance(database: DatabaseSync, runId: string, kind: PendingAdvance["kind"]): void {
+  const pending = readPendingAdvances(database).filter((item) => item.runId !== runId || item.kind !== kind);
+  if (pending.length) new SettingsStore(database).set(PENDING_ADVANCES_KEY, pending);
+  else new SettingsStore(database).delete(PENDING_ADVANCES_KEY);
 }
 
 async function recordRunDiffEvidence(database: DatabaseSync, runner: CommandRunner, run: RunRow, cwd: string, vcs: VcsInfo["type"], workspaceMode: LockMode): Promise<void> {
   if (workspaceMode === "read" || database.prepare("SELECT 1 FROM evidence WHERE run_id = ? AND type = 'diff'").get(run.id)) return;
   const baseline = parseWorkspaceBaseline(run.workspace_baseline_json);
-  const after = await captureWorkspaceSnapshot(cwd, vcs, runner, baseline?.snapshot.changes.map(({ path }) => path));
+  if (vcs === "git" && baseline) await trackNewGitFiles(cwd, baseline.snapshot, runner);
+  const opaqueDirectories = new Set(baseline?.snapshot.changes.filter((change) => change.kind === "directory" && change.hash === null).map(({ path }) => path));
+  const after = await captureWorkspaceSnapshot(cwd, vcs, runner, baseline?.snapshot.changes.map(({ path }) => path), (path) => !opaqueDirectories.has(path));
   const diff = baseline ? diffWorkspaceSnapshots(baseline.snapshot, after, new Map(Object.entries(baseline.owned))) : {
     changes: after.changes.map((change) => ({ ...change, baselineHash: null, safe: false, reason: "preexisting_change" as const })),
     unownedPaths: after.changes.map(({ path }) => path)
@@ -928,7 +1244,7 @@ function finalCoordinationMainTask(database: DatabaseSync, commissionId: string)
   return state.total > 0 && !state.unfinished ? main.main_task_id : undefined;
 }
 
-export type ReviewResult = { passed: boolean; summary: string; checks: unknown[]; findings: unknown[] };
+export type ReviewResult = { repairAccepted: boolean; reactivatedOldFinding: boolean; passed: boolean; summary: string; checks: unknown[]; findings: unknown[] };
 export type ReworkResult = { resolved: boolean; summary: string; selfReviewRounds: number; remainingFindings: string[] };
 
 export function isReworkRun(database: DatabaseSync, runId: string): boolean {
@@ -937,6 +1253,20 @@ export function isReworkRun(database: DatabaseSync, runId: string): boolean {
     UNION ALL
     SELECT parent.id, parent.trigger_type, parent.trigger_ref_id FROM runs AS parent JOIN lineage ON parent.id = lineage.trigger_ref_id
   ) SELECT 1 FROM lineage WHERE trigger_type = 'rework' LIMIT 1`).get(runId));
+}
+
+function isModelCapacityFailure(run: Pick<RunRow, "failure_code">): boolean {
+  return run.failure_code === "model_at_capacity";
+}
+
+function modelCapacityRetryCount(database: DatabaseSync, rootRunId: string): number {
+  return count(database, "SELECT COUNT(*) AS count FROM run_events WHERE run_id = ? AND event_type = 'run.model_capacity_retry'", rootRunId);
+}
+
+function isReworkReview(database: DatabaseSync, runId: string): boolean {
+  const run = database.prepare("SELECT role, trigger_ref_id FROM runs WHERE id = ?").get(runId) as { role: string; trigger_ref_id: string | null } | undefined;
+  if (run?.role !== "reviewer" || !run.trigger_ref_id) return false;
+  return isReworkRun(database, run.trigger_ref_id);
 }
 
 export function parseReworkResult(output: string): ReworkResult {
@@ -954,9 +1284,11 @@ export function parseReviewResult(output: string): ReviewResult {
   try { value = JSON.parse(json); } catch { throw new Error("Reviewer returned invalid JSON"); }
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Reviewer returned invalid result");
   const result = value as Record<string, unknown>;
-  if (typeof result.passed !== "boolean" || typeof result.summary !== "string" || !Array.isArray(result.checks) || !Array.isArray(result.findings)) throw new Error("Reviewer returned invalid result");
+  if (typeof result.passed !== "boolean" || typeof result.summary !== "string" || !Array.isArray(result.checks) || !Array.isArray(result.findings) || (result.repairAccepted !== undefined && typeof result.repairAccepted !== "boolean") || (result.reactivatedOldFinding !== undefined && typeof result.reactivatedOldFinding !== "boolean")) throw new Error("Reviewer returned invalid result");
   const blocking = result.findings.some((finding) => finding && typeof finding === "object" && (finding as Record<string, unknown>).severity === "blocking");
-  return { passed: !blocking, summary: result.summary, checks: result.checks, findings: result.findings };
+  const reactivatedOldFinding = result.reactivatedOldFinding === true;
+  if (reactivatedOldFinding && !blocking) throw new Error("Reactivated old finding requires a blocking finding");
+  return { repairAccepted: result.repairAccepted === true, reactivatedOldFinding, passed: !blocking, summary: result.summary, checks: result.checks, findings: result.findings };
 }
 
 function reviewResult(database: DatabaseSync, runId: string): ReviewResult {
@@ -974,11 +1306,18 @@ function consecutiveFailedReviewCount(database: DatabaseSync, taskId: string): n
 }
 
 function runAgentOutput(database: DatabaseSync, runId: string): string {
-  const rows = database.prepare("SELECT payload_json FROM run_events WHERE run_id = ? AND event_type IN ('agent.message.delta', 'item.completed') ORDER BY id").all(runId) as Array<{ payload_json: string }>;
+  const rows = database.prepare("SELECT event_type, payload_json FROM run_events WHERE run_id = ? ORDER BY id").all(runId) as Array<{ event_type: string; payload_json: string }>;
   let output = "";
+  let standardText = false;
   let itemId: string | undefined;
   for (const row of rows) {
     const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+    if (typeof payload.text === "string") {
+      if (!standardText) { output = ""; standardText = true; }
+      output = row.event_type === "agent.message.delta" ? output + payload.text : payload.text;
+      continue;
+    }
+    if (standardText) continue;
     if (typeof payload.delta === "string") {
       if (typeof payload.itemId === "string" && payload.itemId !== itemId) {
         itemId = payload.itemId;
@@ -995,9 +1334,23 @@ function runAgentOutput(database: DatabaseSync, runId: string): string {
   return output;
 }
 
-function reviewComment(review: ReviewResult): string {
+function reviewComment(review: ReviewResult, reworkReview = false): string {
   const findings = review.findings.map((finding) => typeof finding === "string" ? finding : JSON.stringify(finding));
-  return `## 代码审查结果：${review.passed ? "通过" : "未通过"}\n\n${review.summary}${findings.length ? `\n\n### 发现\n\n${findings.map((finding) => `- ${finding}`).join("\n")}` : ""}${review.passed ? "" : "\n\n@负责人 请关注审查结论与后续返工。"}`;
+  const title = review.reactivatedOldFinding
+    ? "旧问题重新激活，任务阻塞"
+    : review.passed
+      ? "通过"
+      : reworkReview && review.repairAccepted
+        ? "复核通过，继续审查未通过"
+        : reworkReview
+          ? "复核未通过，已打回返工"
+          : "未通过";
+  const footer = review.passed
+    ? ""
+    : review.reactivatedOldFinding
+      ? "\n\n任务已阻塞，请人工处理阻塞原因。"
+      : "\n\n@负责人 请关注审查结论与后续返工。";
+  return `## 代码审查结果：${title}\n\n${review.summary}${findings.length ? `\n\n### 发现\n\n${findings.map((finding) => `- ${finding}`).join("\n")}` : ""}${footer}`;
 }
 
 function canStartRun(database: DatabaseSync, run: RunRow): boolean {

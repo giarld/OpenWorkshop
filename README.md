@@ -166,8 +166,11 @@ Sign in and verify the runtime first:
 ```bash
 workshop login
 workshop status --output json
-workshop runtime codex-health --output json
+workshop agent backends --output json
+workshop agent health --output json
 ```
+
+OpenWorkshop uses `codex` from the service `PATH` by default. Set `WORKSHOP_CODEX_PATH` to an absolute executable path to pin the Codex runtime; an invalid configured path makes the backend unavailable and does not fall back to `PATH`.
 
 Create a request and advance its requirements:
 
@@ -285,6 +288,7 @@ Set a remote service with `--server-url` or `WORKSHOP_SERVER_URL`. The CLI binds
 | `workshop restart` | Gracefully restart the service |
 | `workshop stop` | Gracefully stop the service |
 | `workshop doctor` | Check the database, project roots, Git, Codex, and port; missing Git is a warning, and the current OpenWorkshop listener is accepted |
+| `workshop preflight [--server-url URL] [--output json]` | Check service, authentication, project-root, and Agent capabilities before workflow calls |
 | `workshop backup [path]` | Back up the SQLite database |
 | `workshop restore <path>` | Restore the database after backing up the current database |
 | `workshop pin set` | Change the PIN and revoke active sessions |

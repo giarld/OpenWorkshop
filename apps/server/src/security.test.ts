@@ -9,6 +9,14 @@ test("redacts common credentials in objects, text, and configured environment va
   assert.doesNotMatch(JSON.stringify(result.value), /sk-test|ghp_test|plain|sk-text|marked-secret/);
 });
 
+test("redacts Windows executable paths in process errors", () => {
+  for (const message of ["spawn C:\\private\\codex.COM EACCES", "execFile \\\\server\\private\\agent.custom EACCES"]) {
+    const result = redactSensitive(message);
+    assert.equal(result.redacted, true);
+    assert.doesNotMatch(result.value, /private/i);
+  }
+});
+
 test("classifies separated and platform-specific destructive commands as high risk", () => {
   assert.equal(isHighRiskCommand({ command: ["rm", "-r", "-f", "target"] }), true);
   assert.equal(isHighRiskCommand({ command: "powershell Remove-Item target -Recurse" }), true);

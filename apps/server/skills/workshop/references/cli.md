@@ -19,6 +19,7 @@ workshop task list <project-id> --query-file query.json --output json
 
 ```bash
 workshop start
+workshop preflight --output json
 workshop status --output json
 workshop gui
 workshop log -n 100
@@ -28,7 +29,7 @@ workshop doctor --output json
 workshop auth status --output json
 ```
 
-`workshop login` and PIN initialization require human interaction. Check `runtime codex-health` only before requirement analysis/planning or task execution; ordinary reads do not require it.
+`workshop login` and PIN initialization require human interaction. Check `agent health` only before requirement analysis/planning or task execution; ordinary reads do not require it.
 
 Read-only requests must not call write commands. Run create, update, move, delete, archive, clear, trigger, decide, approve, accept, reject, interrupt, cancel, resume, waive, or lock only when explicitly requested.
 
@@ -213,7 +214,7 @@ workshop notification list --query '{"unread":"true"}' --output json
 workshop notification read <notification-id> --output json
 workshop notification clear --output json
 workshop runtime status --output json
-workshop runtime codex-health --output json
+workshop agent health --output json
 ```
 
 ## Generic API fallback

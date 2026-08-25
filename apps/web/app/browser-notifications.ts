@@ -38,6 +38,11 @@ export function notificationHashTarget(hash: string): NotificationTarget | null 
   return { entityType: match[1] as NotificationTarget["entityType"], entityId: match[2]!, projectId: match[3] ? decodeURIComponent(match[3]) : null };
 }
 
+export function notificationHashTargetsOtherProject(hash: string, projectId: string): boolean {
+  const target = notificationHashTarget(hash);
+  return target !== null && target.projectId !== projectId;
+}
+
 export function notificationNavigation(item: Pick<AppNotification, "entity_type" | "entity_id" | "project_id">, currentHash = "", currentProjectId = ""): { hash: string; updateHash: boolean; switchProject: boolean; view: "board" | "notifications" | "delivery"; projectId: string | null; entityType: NotificationTarget["entityType"]; entityId: string } {
   const hash = notificationEntityHash(item);
   return { hash, updateHash: currentHash !== hash, switchProject: Boolean(item.project_id && item.project_id !== currentProjectId), view: item.entity_type === "task" ? "board" : item.entity_type === "delivery" ? "delivery" : "notifications", projectId: item.project_id, entityType: item.entity_type, entityId: item.entity_id };

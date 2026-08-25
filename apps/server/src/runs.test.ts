@@ -5,21 +5,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import Fastify from "fastify";
+import { AgentRegistry, type AgentCompletion, type AgentEvent, type AgentPlugin, type AgentSessionOptions, type AgentStartOptions, type AgentTurn } from "./agent.ts";
 import { storeAttachment } from "./attachments.ts";
 import { registerAuthentication } from "./auth.ts";
 import { addTaskComment } from "./comments.ts";
-import type { CodexAppServerOptions, CodexRunHandle, CodexRunOptions, NormalizedCodexEvent } from "./codex.ts";
 import { registerAgentSettingsRoutes } from "./agent-settings.ts";
+import { codexAgentCompletion, normalizeCodexEvent } from "./codex.ts";
 import { openWorkshopDatabase, SettingsStore } from "./database.ts";
+import { registerNotificationRoutes } from "./notifications.ts";
 import { answerRevisionCard, beginPlanRevision, saveRevisionProposal } from "./plan-revisions.ts";
-import { appendRunEvent, approvalKind, codexTokenUsage, CodexRunController, EventHub, pruneRawRunEvents, registerProductionRunRoutes, registerRunRoutes, type RunClientLauncher, type RunController } from "./runs.ts";
+import { appendRunEvent, approvalKind, AgentRunController, EventHub, pruneRawRunEvents, registerProductionRunRoutes, registerRunRoutes, type RunClientLauncher, type RunController } from "./runs.ts";
 import { createExecutionGrant } from "./scheduler.ts";
 import { registerTaskRoutes } from "./tasks.ts";
-
-test("reads cumulative Codex token usage without double-counting cache", () => {
-  assert.deepEqual(codexTokenUsage({ tokenUsage: { total: { totalTokens: 140, inputTokens: 100, cachedInputTokens: 80, cacheWriteInputTokens: 0, outputTokens: 40, reasoningOutputTokens: 10 } } }), { input: 100, output: 40, cached: 80 });
-  assert.equal(codexTokenUsage({ tokenUsage: { total: { inputTokens: -1, outputTokens: 2, cachedInputTokens: 0 } } }), undefined);
-});
 
 test("replays persisted SSE events after Last-Event-ID and continues live", async () => {
   const fixture = await runFixture();
@@ -52,15 +49,57 @@ test("redacts secrets before persistence and only prunes expired raw command out
     const event = appendRunEvent(fixture.database, fixture.hub, fixture.runId, "command.output", "Authorization: Bearer top-secret", { pin: "123456", output: "api_key=abc123" });
     assert.equal(event.redacted, true);
     assert.doesNotMatch(JSON.stringify(event), /top-secret|123456|abc123/);
+    const pathEvent = appendRunEvent(fixture.database, fixture.hub, fixture.runId, "process.error", "spawn /opt/private/codex EACCES", { output: "failed /resolved/private/codex" }, false, ["/resolved/private/codex"]);
+    assert.equal(pathEvent.redacted, true);
+    assert.doesNotMatch(JSON.stringify(pathEvent), /\/opt\/private|\/resolved\/private/);
     fixture.database.prepare("UPDATE run_events SET created_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(event.id);
     appendRunEvent(fixture.database, fixture.hub, fixture.runId, "run.status", "Permanent audit", { status: "running" });
     assert.equal(pruneRawRunEvents(fixture.database, 90), 1);
-    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM run_events").get() as { count: number }).count, 1);
-    assert.equal(approvalKind("item/commandExecution/requestApproval", { command: "git reset --hard" }), "high_risk");
-    assert.equal(approvalKind("item/commandExecution/requestApproval", { command: ["npm", "test"] }), "command");
-    assert.equal(approvalKind("mcpServer/elicitation/request"), "mcp_tool_call");
+    assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM run_events").get() as { count: number }).count, 2);
+    assert.equal(approvalKind("command", { command: "git reset --hard" }), "high_risk");
+    assert.equal(approvalKind("command", { command: ["npm", "test"] }), "command");
+    assert.equal(approvalKind("mcp_tool_call"), "mcp_tool_call");
   } finally {
     await fixture.close();
+  }
+});
+
+test("redacts plugin executable secrets from approval APIs, notifications, and events", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-approval-redaction-"));
+  const database = await openWorkshopDatabase(home);
+  const { taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET config_snapshot_json = ? WHERE id = ?").run(JSON.stringify({ agentBackend: "fake" }), runId);
+  const secret = "/private/fake-agent";
+  const hub = new EventHub();
+  const published: Array<{ event_type: string; redacted: boolean }> = [];
+  hub.subscribe((event) => published.push(event));
+  let options!: AgentSessionOptions;
+  const completed = new Promise<AgentCompletion>(() => undefined);
+  const controller = new AgentRunController(database, hub, (_backend, value) => {
+    options = value;
+    const start = async () => ({ completed });
+    return { initialize: async () => undefined, start, continue: start, steer: async () => undefined, interrupt: async () => undefined, close: async () => undefined };
+  }, async () => undefined, "attachments", 0, undefined, undefined, () => [secret]);
+  const server = Fastify();
+  registerRunRoutes(server, database, controller, hub);
+  registerNotificationRoutes(server, database);
+  try {
+    await controller.start(runId, process.cwd());
+    const approval = codexEvent("approval.requested", `Approve ${secret}`, "fake/approval", { command: [secret, "--version"] }, "secret-approval", { approvalKind: "command" });
+    options.onEvent?.(approval);
+    await options.onApproval?.(approval, () => undefined);
+    const approvals = (await server.inject({ method: "GET", url: `/api/approvals?runId=${runId}` })).json();
+    const notifications = (await server.inject({ method: "GET", url: "/api/notifications" })).json();
+    const created = published.find((event) => event.event_type === "approval.created");
+    assert.ok(created);
+    assert.equal(created.redacted, true);
+    assert.equal(JSON.stringify({ approvals, notifications, created }).includes(secret), false);
+  } finally {
+    await controller.close();
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
   }
 });
 
@@ -74,7 +113,7 @@ test("production assembly wires Codex controls, approvals, and live events", asy
     const previousRunId = seedRun(database, taskId, 1);
     database.prepare("UPDATE runs SET status = 'interrupted', finished_at = ? WHERE id = ?").run(new Date().toISOString(), previousRunId);
     registerAuthentication(server, database);
-    registerAgentSettingsRoutes(server, database);
+    registerAgentSettingsRoutes(server, database, fakeAgentRegistry());
     await registerProductionRunRoutes(server, database, fakeRunClientLauncher(database, calls));
     const address = await server.listen({ host: "127.0.0.1", port: 0 });
     const initialized = await fetch(`${address}/api/auth/initialize`, {
@@ -114,13 +153,15 @@ test("production assembly wires Codex controls, approvals, and live events", asy
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE entity_type = 'approval' AND entity_id IN (SELECT id FROM approvals WHERE run_id = ?)").get(autoRunId) as { count: number }).count, 0);
     assert.equal((await api(address, cookie, `/api/tasks/${autoTaskId}/cancel`)).body.status, "cancelled");
 
-    assert.equal((await fetch(address + "/api/settings/agents/runtime", { method: "PUT", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify({ sandboxMode: "read-only", approvalPolicy: "never", networkAccess: false }) })).status, 200);
+    assert.equal((await fetch(address + "/api/agents/runtime", { method: "PUT", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify({ sandboxMode: "read-only", approvalPolicy: "never", networkAccess: false }) })).status, 200);
     const configuredTaskId = seedTask(database, home).taskId;
     database.prepare("UPDATE tasks SET status = 'backlog' WHERE id = ?").run(configuredTaskId);
     const configuredRunId = String(((await api(address, cookie, `/api/tasks/${configuredTaskId}/trigger`)).body.runIds as string[])[0]);
-    assert.deepEqual(JSON.parse((database.prepare("SELECT config_snapshot_json FROM runs WHERE id = ?").get(configuredRunId) as { config_snapshot_json: string }).config_snapshot_json), { prompt: "", customArgs: [], sandboxMode: "read-only", approvalPolicy: "never", networkAccess: false });
+    assert.deepEqual(JSON.parse((database.prepare("SELECT config_snapshot_json FROM runs WHERE id = ?").get(configuredRunId) as { config_snapshot_json: string }).config_snapshot_json), { prompt: "", model: null, reasoningEffort: null, sandboxMode: "read-only", approvalPolicy: "never", networkAccess: false, agentBackend: "codex", pluginVersion: "0.3.12", runtimeVersion: "0.147.0", backendOptions: { customArgs: [] } });
     assert.ok(calls.includes("sandbox:read-only"));
-    assert.ok(calls.includes('args:["app-server","-c","sandbox_mode=\\"read-only\\"","-c","approval_policy=\\"never\\""]'));
+    assert.ok(calls.includes('backend:{"customArgs":[]}'));
+    assert.ok(calls.includes("session-sandbox:read-only"));
+    assert.ok(calls.includes("session-network:false"));
     assert.equal((await api(address, cookie, `/api/tasks/${configuredTaskId}/cancel`)).body.status, "cancelled");
 
     const resumed = await api(address, cookie, `/api/tasks/${taskId}/resume`);
@@ -163,6 +204,173 @@ test("production assembly wires Codex controls, approvals, and live events", asy
     await assert.rejects(access(join(home, ".openworkshop", "runs", runId)));
   } finally {
     await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a second startup health failure terminally fails the Run", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-start-health-failure-"));
+  const database = await openWorkshopDatabase(home);
+  const { taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  const terminal: string[] = [];
+  let launched = false;
+  const controller = new AgentRunController(database, new EventHub(), () => { launched = true; throw new Error("must not launch"); }, async (id) => { terminal.push(id); }, "attachments", 0, async () => ({ id: "codex", ok: false, pluginVersion: "1.0.0", capabilities: { ok: false, models: [], reasoningEfforts: [] }, error: "unavailable" }));
+  try {
+    await assert.rejects(controller.start(runId, home), /unavailable/);
+    assert.equal(launched, false);
+    assert.deepEqual(terminal, [runId]);
+    assert.equal((database.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string }).status, "failed");
+  } finally {
+    await controller.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("persists a sanitized Session construction failure", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-session-construction-failure-"));
+  const database = await openWorkshopDatabase(home);
+  const { taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  const terminal: string[] = [];
+  const registry = fakeAgentRegistry();
+  const previous = process.env.WORKSHOP_CODEX_PATH;
+  process.env.WORKSHOP_CODEX_PATH = "/opt/private/agent";
+  const controller = new AgentRunController(database, new EventHub(), () => { throw new Error("Plugin construction failed at /opt/private/agent"); }, async (id) => { terminal.push(id); }, "attachments", 0, undefined, (backend, error) => registry.safeError(backend, error));
+  try {
+    await assert.rejects(controller.start(runId, home), /Plugin construction failed/);
+    const run = database.prepare("SELECT status, failure_summary FROM runs WHERE id = ?").get(runId) as { status: string; failure_summary: string };
+    assert.equal(run.status, "failed");
+    assert.match(run.failure_summary, /Plugin construction failed/);
+    assert.doesNotMatch(run.failure_summary, /private|\/opt\//);
+    assert.deepEqual(terminal, [runId]);
+  } finally {
+    if (previous === undefined) delete process.env.WORKSHOP_CODEX_PATH; else process.env.WORKSHOP_CODEX_PATH = previous;
+    await controller.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("persists standard text supplied only by the completion event", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-completion-text-"));
+  const database = await openWorkshopDatabase(home);
+  const { taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  const controller = new AgentRunController(database, new EventHub(), () => ({
+    initialize: async () => undefined,
+    start: async () => ({ completed: Promise.resolve({ status: "succeeded", event: { type: "turn.completed", summary: "done", sourceType: "fake/completed", payload: { raw: "plugin payload" }, text: "final output" } }) }),
+    continue: async () => { throw new Error("unused"); }, steer: async () => undefined, interrupt: async () => undefined, close: async () => undefined
+  }), async () => undefined, "attachments", 0);
+  try {
+    await controller.start(runId, home);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const event = database.prepare("SELECT payload_json FROM run_events WHERE run_id = ? AND event_type = 'turn.completed'").get(runId) as { payload_json: string };
+    assert.equal(JSON.parse(event.payload_json).text, "final output");
+  } finally {
+    await controller.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("marks a Run failed for an incomplete Codex terminal status", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-incomplete-turn-"));
+  const database = await openWorkshopDatabase(home);
+  const { taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  let terminal!: () => void;
+  const terminated = new Promise<void>((resolve) => { terminal = resolve; });
+  const completion = codexAgentCompletion(normalizeCodexEvent("turn/completed", { turn: { status: "inProgress" } }));
+  const controller = new AgentRunController(database, new EventHub(), () => ({
+    initialize: async () => undefined,
+    start: async () => ({ completed: Promise.resolve(completion) }),
+    continue: async () => { throw new Error("unused"); }, steer: async () => undefined, interrupt: async () => undefined, close: async () => undefined
+  }), async () => terminal(), "attachments", 0);
+  try {
+    await controller.start(runId, home);
+    await terminated;
+    assert.deepEqual({ ...database.prepare("SELECT status, failure_summary FROM runs WHERE id = ?").get(runId) }, { status: "failed", failure_summary: "Turn failed: unexpected status inProgress" });
+    const event = database.prepare("SELECT payload_json FROM run_events WHERE run_id = ? AND event_type = 'run.status' ORDER BY id DESC LIMIT 1").get(runId) as { payload_json: string };
+    assert.deepEqual(JSON.parse(event.payload_json), { status: "failed", summary: "Turn failed: unexpected status inProgress" });
+  } finally {
+    await controller.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("stores a sanitized failure summary from a plugin completion", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-plugin-failure-"));
+  const database = await openWorkshopDatabase(home);
+  const { taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  let terminal!: () => void;
+  const terminated = new Promise<void>((resolve) => { terminal = resolve; });
+  const controller = new AgentRunController(database, new EventHub(), () => ({
+    initialize: async () => undefined,
+    start: async () => ({ completed: Promise.resolve({ status: "failed", event: { type: "turn.failed", summary: "plugin failed: spawn /opt/private/agent EACCES", sourceType: "plugin/turn", payload: {} } }) }),
+    continue: async () => { throw new Error("unused"); }, steer: async () => undefined, interrupt: async () => undefined, close: async () => undefined
+  }), async () => terminal(), "attachments", 0);
+  try {
+    await controller.start(runId, home);
+    await terminated;
+    const run = database.prepare("SELECT status, failure_summary FROM runs WHERE id = ?").get(runId) as { status: string; failure_summary: string };
+    assert.equal(run.status, "failed");
+    assert.match(run.failure_summary, /plugin failed/);
+    assert.doesNotMatch(run.failure_summary, /private|\/opt\//);
+    const event = database.prepare("SELECT payload_json FROM run_events WHERE run_id = ? AND event_type = 'run.status' ORDER BY id DESC LIMIT 1").get(runId) as { payload_json: string };
+    assert.equal(JSON.parse(event.payload_json).summary, run.failure_summary);
+  } finally {
+    await controller.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("retries model capacity failures three times in the same Agent session", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-capacity-same-session-"));
+  const database = await openWorkshopDatabase(home);
+  const { taskId } = seedTask(database, home);
+  const runId = seedRun(database, taskId, 1);
+  database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
+  let launches = 0;
+  let starts = 0;
+  let continuations = 0;
+  let closes = 0;
+  let terminal!: () => void;
+  const terminated = new Promise<void>((resolve) => { terminal = resolve; });
+  const controller = new AgentRunController(database, new EventHub(), (_backend, options) => {
+    launches += 1;
+    const failedTurn = async () => {
+      options.onEvent?.({ type: "agent.message.delta", summary: "Agent message", sourceType: "item/agentMessage/delta", payload: {}, text: "Selected model is at capacity. Please try a different model." });
+      return { completed: Promise.resolve<AgentCompletion>({ status: "failed", event: { type: "turn.failed", summary: "Turn failed", sourceType: "turn/completed", payload: {} } }) };
+    };
+    return {
+      initialize: async () => undefined,
+      start: async () => { starts += 1; return failedTurn(); },
+      continue: async () => { continuations += 1; return failedTurn(); },
+      steer: async () => undefined, interrupt: async () => undefined, close: async () => { closes += 1; }
+    };
+  }, async () => terminal(), "attachments", 0, undefined, undefined, undefined, 0);
+  try {
+    await controller.start(runId, home);
+    await terminated;
+
+    const run = database.prepare("SELECT status, failure_code, failure_summary FROM runs WHERE id = ?").get(runId) as { status: string; failure_code: string | null; failure_summary: string | null };
+    assert.deepEqual({ ...run }, { status: "failed", failure_code: "model_at_capacity", failure_summary: "Turn failed" });
+    assert.deepEqual({ launches, starts, continuations, closes }, { launches: 1, starts: 1, continuations: 3, closes: 1 });
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM runs WHERE task_id = ?").get(taskId) as { count: number }).count, 1);
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM run_events WHERE run_id = ? AND event_type = 'run.model_capacity_retry'").get(runId) as { count: number }).count, 3);
+  } finally {
+    await controller.close();
     database.close();
     await rm(home, { recursive: true, force: true });
   }
@@ -212,7 +420,7 @@ test("passes image attachments as initial visual input when an @Agent mention cr
   const home = await mkdtemp(join(tmpdir(), "project-workshop-mentioned-run-image-"));
   const database = await openWorkshopDatabase(home);
   const server = Fastify();
-  const inputs: CodexRunOptions["input"][] = [];
+  const inputs: AgentStartOptions["input"][] = [];
   try {
     const { commissionId, taskId } = seedTask(database, home);
     database.prepare("UPDATE tasks SET status = 'backlog' WHERE id = ?").run(taskId);
@@ -221,9 +429,9 @@ test("passes image attachments as initial visual input when an @Agent mention cr
     database.prepare("UPDATE attachments SET comment_id = ? WHERE id = ?").run(String(comment.id), attachment.id);
     const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
       initialize: async () => undefined,
-      startRun: async (options) => {
+      start: async (options) => {
         inputs.push(options.input);
-        return { threadId: "thread-image", turnId: "turn-image", completed: new Promise<NormalizedCodexEvent>(() => undefined) };
+        return { threadId: "thread-image", turnId: "turn-image", completed: new Promise<AgentEvent>(() => undefined) };
       },
       steer: async () => undefined,
       interrupt: async () => undefined,
@@ -266,7 +474,7 @@ test("starts a scheduling Agent when the main task is mentioned", async () => {
       .run(randomUUID(), childTaskId, previousRunId, JSON.stringify({ passed: false, findings: [{ severity: "blocking", message: "Missing regression test" }] }), now);
     const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
       initialize: async () => undefined,
-      startRun: async (options) => { prompts.push(options.prompt); return { threadId: "thread-coordinate", turnId: "turn-coordinate", completed: new Promise<NormalizedCodexEvent>(() => undefined) }; },
+      start: async (options) => { prompts.push(options.prompt); return { threadId: "thread-coordinate", turnId: "turn-coordinate", completed: new Promise<AgentEvent>(() => undefined) }; },
       steer: async () => undefined,
       interrupt: async () => undefined,
       close: async () => undefined
@@ -308,7 +516,7 @@ test("retries an active plan revision instead of coordinating the main task", as
     saveRevisionProposal(database, revisionId, { summary: "合并任务", changes: [] });
     const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
       initialize: async () => undefined,
-      startRun: async () => ({ threadId: "thread-revision", turnId: "turn-revision", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
+      start: async () => ({ threadId: "thread-revision", turnId: "turn-revision", completed: new Promise<AgentEvent>(() => undefined) }),
       steer: async () => undefined,
       interrupt: async () => undefined,
       close: async () => undefined
@@ -336,7 +544,7 @@ test("final board move cancels the server Run and starts main-task coordination"
     database.prepare("UPDATE commissions SET main_task_id = ? WHERE id = ?").run(mainTaskId, commissionId);
     const handler = await registerProductionRunRoutes(server, database, () => ({
       initialize: async () => undefined,
-      startRun: async (options) => { prompts.push(options.prompt); return { threadId: "thread-final-coordinate", turnId: "turn-final-coordinate", completed: new Promise<NormalizedCodexEvent>(() => undefined) }; },
+      start: async (options) => { prompts.push(options.prompt); return { threadId: "thread-final-coordinate", turnId: "turn-final-coordinate", completed: new Promise<AgentEvent>(() => undefined) }; },
       steer: async () => undefined,
       interrupt: async () => undefined,
       close: async () => undefined
@@ -387,7 +595,7 @@ test("reconcile context distinguishes a successful Reviewer Run from a failed re
     addTaskComment(database, { taskId, authorType: "human", content: "人工已修复并测试通过" });
     const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
       initialize: async () => undefined,
-      startRun: async (options) => { prompts.push(options.prompt); return { threadId: "thread-reconcile", turnId: "turn-reconcile", completed: new Promise<NormalizedCodexEvent>(() => undefined) }; },
+      start: async (options) => { prompts.push(options.prompt); return { threadId: "thread-reconcile", turnId: "turn-reconcile", completed: new Promise<AgentEvent>(() => undefined) }; },
       steer: async () => undefined,
       interrupt: async () => undefined,
       close: async () => undefined
@@ -443,9 +651,9 @@ test("Reviewer context binds rework review to task-owned and current Developer c
     });
     await registerProductionRunRoutes(server, database, () => ({
       initialize: async () => undefined,
-      startRun: async (options) => {
+      start: async (options) => {
         prompts.push(options.prompt);
-        return { threadId: "thread-review-scope", turnId: "turn-review-scope", completed: new Promise<NormalizedCodexEvent>(() => undefined) };
+        return { threadId: "thread-review-scope", turnId: "turn-review-scope", completed: new Promise<AgentEvent>(() => undefined) };
       },
       steer: async () => undefined,
       interrupt: async () => undefined,
@@ -493,7 +701,7 @@ test("Run validation policy keeps main-task instructions global and child instru
     addTaskComment(database, { taskId: siblingTaskId, authorType: "human", content: "仅兄弟任务使用 Debug 构建" });
     const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
       initialize: async () => undefined,
-      startRun: async (options) => { prompts.push(options.prompt); return { threadId: "thread-policy", turnId: "turn-policy", completed: new Promise<NormalizedCodexEvent>(() => undefined) }; },
+      start: async (options) => { prompts.push(options.prompt); return { threadId: "thread-policy", turnId: "turn-policy", completed: new Promise<AgentEvent>(() => undefined) }; },
       steer: async () => undefined,
       interrupt: async () => undefined,
       close: async () => undefined
@@ -542,7 +750,7 @@ test("recovered scheduling Agent rebuilds task Run context after restart", async
       .run(childRunId, projectId, commissionId, childTaskId);
     await registerProductionRunRoutes(server, database, () => ({
       initialize: async () => undefined,
-      startRun: async () => ({ threadId: "thread-recovered-coordinate", turnId: "turn-recovered-coordinate", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
+      start: async () => ({ threadId: "thread-recovered-coordinate", turnId: "turn-recovered-coordinate", completed: new Promise<AgentEvent>(() => undefined) }),
       steer: async () => undefined, interrupt: async () => undefined, close: async () => undefined
     }), join(home, "attachments"));
 
@@ -550,6 +758,26 @@ test("recovered scheduling Agent rebuilds task Run context after restart", async
     const taskTree = await readFile(join(home, ".openworkshop", "runs", recovered.id, "task-tree.md"), "utf8");
     assert.doesNotMatch(taskTree, /STALE CHILD STATUS/);
     assert.match(taskTree, new RegExp(`Latest Run: ${childRunId} · developer · interrupted`));
+  } finally {
+    await server.close();
+    database.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("registers Run routes while startup coordination health is unavailable", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-unavailable-startup-agent-"));
+  const database = await openWorkshopDatabase(home);
+  const server = Fastify();
+  try {
+    const { commissionId, taskId } = seedTask(database, home);
+    database.prepare("UPDATE commissions SET main_task_id = ?, status = 'active', coordination_pending = 1 WHERE id = ?").run(taskId, commissionId);
+    await registerProductionRunRoutes(server, database, () => { throw new Error("unavailable backend must not launch"); }, join(home, "attachments"), undefined, undefined, async () => { throw Object.assign(new Error("Agent backend is unavailable"), { statusCode: 503 }); });
+    server.get("/startup-probe", async () => ({ ok: true }));
+
+    assert.deepEqual((await server.inject({ method: "GET", url: "/startup-probe" })).json(), { ok: true });
+    assert.equal((database.prepare("SELECT coordination_pending FROM commissions WHERE id = ?").get(commissionId) as { coordination_pending: number }).coordination_pending, 1);
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM runs").get() as { count: number }).count, 0);
   } finally {
     await server.close();
     database.close();
@@ -583,7 +811,7 @@ test("associates a queued @Agent image with the reserved Run before its initial 
   const home = await mkdtemp(join(tmpdir(), "project-workshop-queued-run-image-"));
   const database = await openWorkshopDatabase(home);
   const server = Fastify();
-  const inputs: CodexRunOptions["input"][] = [];
+  const inputs: AgentStartOptions["input"][] = [];
   try {
     const { commissionId, taskId } = seedTask(database, home);
     const runId = seedRun(database, taskId, 1);
@@ -594,7 +822,7 @@ test("associates a queued @Agent image with the reserved Run before its initial 
     const attachment = await storeAttachment(database, join(home, "attachments"), { commissionId, taskId, originalName: "queued.png", mediaType: "image/png", data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) });
     const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
       initialize: async () => undefined,
-      startRun: async () => ({ threadId: "unused", turnId: "unused", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
+      start: async () => ({ threadId: "unused", turnId: "unused", completed: new Promise<AgentEvent>(() => undefined) }),
       steer: async () => undefined,
       interrupt: async () => undefined,
       close: async () => undefined
@@ -605,11 +833,11 @@ test("associates a queued @Agent image with the reserved Run before its initial 
     await server.close();
     database.prepare("UPDATE runs SET status = 'failed', finished_at = ? WHERE id = ?").run(new Date().toISOString(), blockerRunId);
     database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
-    const controller = new CodexRunController(database, new EventHub(), () => ({
+    const controller = new AgentRunController(database, new EventHub(), () => ({
       initialize: async () => undefined,
-      startRun: async (options) => {
+      start: async (options) => {
         inputs.push(options.input);
-        return { threadId: "thread-queued", turnId: "turn-queued", completed: new Promise<NormalizedCodexEvent>(() => undefined) };
+        return { threadId: "thread-queued", turnId: "turn-queued", completed: new Promise<AgentEvent>(() => undefined) };
       },
       steer: async () => undefined,
       interrupt: async () => undefined,
@@ -634,11 +862,11 @@ test("steers an @Agent image that arrives while a Run is preparing", async () =>
   const attachment = await storeAttachment(database, join(home, "attachments"), { commissionId, taskId, originalName: "preparing.png", mediaType: "image/png", data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) });
   let continueInitialize!: () => void;
   const initializing = new Promise<void>((resolve) => { continueInitialize = resolve; });
-  const steers: Array<string | CodexRunOptions["input"]> = [];
-  const controller = new CodexRunController(database, new EventHub(), () => ({
+  const steers: Array<string | AgentStartOptions["input"]> = [];
+  const controller = new AgentRunController(database, new EventHub(), () => ({
     initialize: async () => initializing,
-    startRun: async () => ({ threadId: "thread-preparing", turnId: "turn-preparing", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
-    steer: async (_threadId, _turnId, input) => { steers.push(input); },
+    start: async () => ({ completed: new Promise<AgentCompletion>(() => undefined) }),
+    steer: async (input) => { steers.push(input); },
     interrupt: async () => undefined,
     close: async () => undefined
   }), undefined, join(home, "attachments"));
@@ -648,7 +876,7 @@ test("steers an @Agent image that arrives while a Run is preparing", async () =>
     controller.queuePreparingSteer(runId, "@Agent 准备中截图", [attachment.id]);
     continueInitialize();
     await starting;
-    assert.deepEqual((steers[0] as CodexRunOptions["input"])?.slice(1), [{ type: "localImage", path: join(home, ".openworkshop", "runs", runId, "attachments", attachment.id, attachment.original_name) }]);
+    assert.deepEqual((steers[0] as AgentStartOptions["input"])?.slice(1), [{ type: "localImage", path: join(home, ".openworkshop", "runs", runId, "attachments", attachment.id, attachment.original_name) }]);
     assert.equal((database.prepare("SELECT run_id FROM attachments WHERE id = ?").get(attachment.id) as { run_id: string }).run_id, runId);
   } finally {
     await controller.close();
@@ -663,25 +891,26 @@ test("interrupts a Run cancelled while Codex is starting the turn", async () => 
   const { taskId } = seedTask(database, home);
   const runId = seedRun(database, taskId, 1);
   database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
-  let provideHandle!: (handle: CodexRunHandle) => void;
+  let provideHandle!: (handle: AgentTurn) => void;
   let startRunEntered!: () => void;
   const entered = new Promise<void>((resolve) => { startRunEntered = resolve; });
-  let complete!: (event: NormalizedCodexEvent) => void;
-  const completed = new Promise<NormalizedCodexEvent>((resolve) => { complete = resolve; });
+  let complete!: (completion: AgentCompletion) => void;
+  const completed = new Promise<AgentCompletion>((resolve) => { complete = resolve; });
   const interrupts: string[] = [];
   const terminal: string[] = [];
   let reachTerminal!: () => void;
   const terminalReached = new Promise<void>((resolve) => { reachTerminal = resolve; });
-  const controller = new CodexRunController(database, new EventHub(), () => ({
+  const controller = new AgentRunController(database, new EventHub(), () => ({
     initialize: async () => undefined,
-    startRun: async () => {
+    start: async () => {
       startRunEntered();
-      return new Promise<CodexRunHandle>((resolve) => { provideHandle = resolve; });
+      return new Promise<AgentTurn>((resolve) => { provideHandle = resolve; });
     },
     steer: async () => undefined,
-    interrupt: async (threadId, turnId) => {
-      interrupts.push(`${threadId}:${turnId}`);
-      complete(codexEvent("turn.interrupted", "Turn interrupted", "turn/completed", { turn: { id: turnId, status: "interrupted" } }));
+    interrupt: async () => {
+      interrupts.push("interrupt");
+      const event = codexEvent("turn.interrupted", "Turn interrupted", "turn/completed", { turn: { status: "interrupted" } });
+      complete({ status: "interrupted", event });
     },
     close: async () => undefined
   }), async (id) => { terminal.push(id); reachTerminal(); });
@@ -689,10 +918,10 @@ test("interrupts a Run cancelled while Codex is starting the turn", async () => 
     const starting = controller.start(runId, home);
     await entered;
     await controller.interrupt(runId, "cancel");
-    provideHandle({ threadId: "thread-starting", turnId: "turn-starting", completed });
+    provideHandle({ completed });
     await starting;
     await terminalReached;
-    assert.deepEqual(interrupts, ["thread-starting:turn-starting"]);
+    assert.deepEqual(interrupts, ["interrupt"]);
     assert.deepEqual(terminal, [runId]);
   } finally {
     await controller.close();
@@ -701,23 +930,26 @@ test("interrupts a Run cancelled while Codex is starting the turn", async () => 
   }
 });
 
-test("warns once when a running Codex turn stops producing events", async () => {
+test("warns, then interrupts a running Agent turn that remains inactive", async () => {
   const home = await mkdtemp(join(tmpdir(), "project-workshop-run-inactivity-"));
   const database = await openWorkshopDatabase(home);
   const { taskId } = seedTask(database, home);
   const runId = seedRun(database, taskId, 1);
   database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
-  let emit!: (event: NormalizedCodexEvent) => void;
-  const controller = new CodexRunController(database, new EventHub(), (options) => {
+  let emit!: (event: AgentEvent) => void;
+  const interrupts: string[] = [];
+  let terminal!: () => void;
+  const terminalReached = new Promise<void>((resolve) => { terminal = resolve; });
+  const controller = new AgentRunController(database, new EventHub(), (_backend, options) => {
     emit = options.onEvent!;
     return {
       initialize: async () => undefined,
-      startRun: async () => ({ threadId: "thread-idle", turnId: "turn-idle", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
+      start: async () => ({ threadId: "thread-idle", turnId: "turn-idle", completed: new Promise<AgentEvent>(() => undefined) }),
       steer: async () => undefined,
-      interrupt: async () => undefined,
+      interrupt: async () => { interrupts.push("interrupt"); },
       close: async () => undefined
     };
-  }, undefined, join(home, "attachments"), 40);
+  }, async () => { terminal(); }, join(home, "attachments"), 40);
   try {
     await controller.start(runId, home);
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
@@ -728,7 +960,13 @@ test("warns once when a running Codex turn stops producing events", async () => 
     assert.equal((database.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string }).status, "running");
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE kind = 'attention' AND entity_id = ?").get(taskId) as { count: number }).count, 1);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM run_events WHERE run_id = ? AND event_type = 'run.inactivity_warning'").get(runId) as { count: number }).count, 1);
-    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    emit(codexEvent("agent.message.delta", "Still working after warning", "item/agentMessage/delta", {}));
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    assert.deepEqual(interrupts, []);
+    await terminalReached;
+    assert.deepEqual(interrupts, ["interrupt"]);
+    assert.deepEqual({ ...database.prepare("SELECT status, failure_code FROM runs WHERE id = ?").get(runId) }, { status: "interrupted", failure_code: "health_check_timeout" });
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM run_events WHERE run_id = ? AND event_type = 'run.health_check_timeout'").get(runId) as { count: number }).count, 1);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM notifications WHERE kind = 'attention' AND entity_id = ?").get(taskId) as { count: number }).count, 1);
   } finally {
     await controller.close();
@@ -744,13 +982,13 @@ test("does not steer an @Agent image already included in the initial Run snapsho
   const runId = seedRun(database, taskId, 1);
   database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
   const attachment = await storeAttachment(database, join(home, "attachments"), { commissionId, taskId, originalName: "initial.png", mediaType: "image/png", data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) });
-  const inputs: CodexRunOptions["input"][] = [];
-  const steers: Array<string | CodexRunOptions["input"]> = [];
-  const controller = new CodexRunController(database, new EventHub(), () => ({
+  const inputs: AgentStartOptions["input"][] = [];
+  const steers: Array<string | AgentStartOptions["input"]> = [];
+  const controller = new AgentRunController(database, new EventHub(), () => ({
     initialize: async () => undefined,
-    startRun: async (options) => {
+    start: async (options) => {
       inputs.push(options.input);
-      return { threadId: "thread-initial", turnId: "turn-initial", completed: new Promise<NormalizedCodexEvent>(() => undefined) };
+      return { threadId: "thread-initial", turnId: "turn-initial", completed: new Promise<AgentEvent>(() => undefined) };
     },
     steer: async (_threadId, _turnId, input) => { steers.push(input); },
     interrupt: async () => undefined,
@@ -797,9 +1035,9 @@ test("keeps a Run cancelled when Codex initialization later fails", async () => 
   const initializeEntered = new Promise<void>((resolve) => { enteredInitialize = resolve; });
   const initializing = new Promise<void>((_resolve, reject) => { rejectInitialize = reject; });
   const hub = new EventHub();
-  const controller = new CodexRunController(database, hub, () => ({
+  const controller = new AgentRunController(database, hub, () => ({
     initialize: async () => { enteredInitialize(); await initializing; },
-    startRun: async () => ({ threadId: "unused", turnId: "unused", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
+    start: async () => ({ threadId: "unused", turnId: "unused", completed: new Promise<AgentEvent>(() => undefined) }),
     steer: async () => undefined,
     interrupt: async () => undefined,
     close: async () => undefined
@@ -912,11 +1150,11 @@ test("releases an intervention attachment when Codex rejects steer", async () =>
   const runId = seedRun(database, taskId, 1);
   database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
   const attachment = await storeAttachment(database, join(home, "attachments"), { commissionId, taskId, originalName: "notes.txt", mediaType: "text/plain", data: Buffer.from("notes") });
-  const steers: Array<string | CodexRunOptions["input"]> = [];
-  const controller = new CodexRunController(database, new EventHub(), () => ({
+  const steers: Array<string | AgentStartOptions["input"]> = [];
+  const controller = new AgentRunController(database, new EventHub(), () => ({
     initialize: async () => undefined,
-    startRun: async () => ({ threadId: "thread-steer", turnId: "turn-steer", completed: new Promise<NormalizedCodexEvent>(() => undefined) }),
-    steer: async (_threadId, _turnId, input) => { steers.push(input); throw new Error("steer failed"); },
+    start: async () => ({ completed: new Promise<AgentCompletion>(() => undefined) }),
+    steer: async (input) => { steers.push(input); throw new Error("steer failed"); },
     interrupt: async () => undefined,
     close: async () => undefined
   }), undefined, join(home, "attachments"));
@@ -924,7 +1162,7 @@ test("releases an intervention attachment when Codex rejects steer", async () =>
     await controller.start(runId, home);
     await assert.rejects(controller.steer(runId, "Read this", [attachment.id]), /steer failed/);
     const copyPath = join(home, ".openworkshop", "runs", runId, "attachments", attachment.id, attachment.original_name);
-    assert.match(String((steers[0] as CodexRunOptions["input"])?.[0] && (steers[0] as NonNullable<CodexRunOptions["input"]>)[0]!.type === "text" ? (steers[0] as NonNullable<CodexRunOptions["input"]>)[0]!.text : ""), new RegExp(copyPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(String((steers[0] as AgentStartOptions["input"])?.[0] && (steers[0] as NonNullable<AgentStartOptions["input"]>)[0]!.type === "text" ? (steers[0] as NonNullable<AgentStartOptions["input"]>)[0]!.text : ""), new RegExp(copyPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.equal(await readFile(copyPath, "utf8"), "notes");
     assert.equal((database.prepare("SELECT run_id FROM attachments WHERE id = ?").get(attachment.id) as { run_id: string | null }).run_id, null);
   } finally {
@@ -942,9 +1180,9 @@ test("releases initial Run attachments when the Codex turn cannot start", async 
   database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
   const attachment = await storeAttachment(database, join(home, "attachments"), { commissionId, taskId, originalName: "notes.txt", mediaType: "text/plain", data: Buffer.from("notes") });
   database.prepare("UPDATE attachments SET run_id = ? WHERE id = ?").run(runId, attachment.id);
-  const controller = new CodexRunController(database, new EventHub(), () => ({
+  const controller = new AgentRunController(database, new EventHub(), () => ({
     initialize: async () => undefined,
-    startRun: async () => { throw new Error("turn start failed"); },
+    start: async () => { throw new Error("turn start failed"); },
     steer: async () => undefined,
     interrupt: async () => undefined,
     close: async () => undefined
@@ -969,10 +1207,21 @@ test("main task Run tree includes descendant Token data", async () => {
       SELECT ?, commission_id, id, '1.1', 1, 'Child', '', 'in_progress', 'medium', 'ai', '[]', 2, 0, ?, ? FROM tasks WHERE id = ?`).run(childId, now, now, fixture.taskId);
     const childRun = seedRun(fixture.database, childId, 1);
     fixture.database.prepare("UPDATE runs SET status = 'succeeded', token_input = 120, token_output = 30, token_cached = 80 WHERE id = ?").run(childRun);
-    const own = (await fixture.server.inject({ method: "GET", url: `/api/tasks/${fixture.taskId}/runs` })).json() as Array<{ id: string }>;
-    const tree = (await fixture.server.inject({ method: "GET", url: `/api/tasks/${fixture.taskId}/runs?scope=tree` })).json() as Array<{ id: string }>;
+    const diffId = randomUUID();
+    fixture.database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'diff', 'passed', 'one changed file', ?, ?)")
+      .run(diffId, childId, childRun, JSON.stringify({ changes: [{ path: "src/app.ts", changeType: "modified", baselineHash: "before", hash: "after", safe: true }] }), now);
+    fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'codex.event', 'turn/diff/updated', ?, 0, ?)")
+      .run(childRun, JSON.stringify({ sourceType: "turn/diff/updated", diff: "diff --git a/src/app.ts b/src/app.ts" }), now);
+    const own = (await fixture.server.inject({ method: "GET", url: `/api/tasks/${fixture.taskId}/runs` })).json() as Array<{ id: string; has_diff: boolean }>;
+    const tree = (await fixture.server.inject({ method: "GET", url: `/api/tasks/${fixture.taskId}/runs?scope=tree` })).json() as Array<{ id: string; has_diff: boolean }>;
     assert.deepEqual(own.map((run) => run.id), [fixture.runId]);
+    assert.equal(own[0]!.has_diff, false);
     assert.deepEqual(new Set(tree.map((run) => run.id)), new Set([fixture.runId, childRun]));
+    assert.equal(tree.find((run) => run.id === childRun)!.has_diff, true);
+    const runDiff = (await fixture.server.inject({ method: "GET", url: `/api/runs/${childRun}/diff` })).json() as { id: string; payload_json: string };
+    assert.equal(runDiff.id, diffId);
+    assert.equal(JSON.parse(runDiff.payload_json).patch, "diff --git a/src/app.ts b/src/app.ts");
+    assert.equal((await fixture.server.inject({ method: "GET", url: `/api/runs/${fixture.runId}/diff` })).statusCode, 404);
     fixture.database.prepare("UPDATE tasks SET status = 'archived', archived_at = ? WHERE id IN (?, ?)").run(now, fixture.taskId, childId);
     const archivedTree = (await fixture.server.inject({ method: "GET", url: `/api/tasks/${fixture.taskId}/runs?scope=tree` })).json() as Array<{ id: string }>;
     assert.deepEqual(new Set(archivedTree.map((run) => run.id)), new Set([fixture.runId, childRun]));
@@ -985,15 +1234,15 @@ test("expires resolved input requests and validates their exact question set", a
   const { taskId } = seedTask(database);
   const runId = seedRun(database, taskId, 1);
   const hub = new EventHub();
-  let options!: CodexAppServerOptions;
+  let options!: AgentSessionOptions;
   const answers: unknown[] = [];
   const approvalResponses: unknown[] = [];
-  const completed = new Promise<NormalizedCodexEvent>(() => undefined);
-  const controller = new CodexRunController(database, hub, (value) => {
+  const completed = new Promise<AgentEvent>(() => undefined);
+  const controller = new AgentRunController(database, hub, (_backend, value) => {
     options = value;
     return {
       initialize: async () => undefined,
-      startRun: async () => ({ threadId: "thread-input", turnId: "turn-input", model: "resolved-model", completed }),
+      start: async () => ({ threadId: "thread-input", turnId: "turn-input", model: "resolved-model", completed }),
       steer: async () => undefined,
       interrupt: async () => undefined,
       close: async () => undefined
@@ -1007,8 +1256,9 @@ test("expires resolved input requests and validates their exact question set", a
     void options.onInput?.(event, (response) => answers.push(response));
   };
   try {
+    const snapshot = (database.prepare("SELECT config_snapshot_json FROM runs WHERE id = ?").get(runId) as { config_snapshot_json: string }).config_snapshot_json;
     await controller.start(runId, process.cwd());
-    assert.equal(JSON.parse((database.prepare("SELECT config_snapshot_json FROM runs WHERE id = ?").get(runId) as { config_snapshot_json: string }).config_snapshot_json).model, "resolved-model");
+    assert.equal((database.prepare("SELECT config_snapshot_json FROM runs WHERE id = ?").get(runId) as { config_snapshot_json: string }).config_snapshot_json, snapshot);
     const approval = codexEvent("approval.requested", "Command approval requested", "item/commandExecution/requestApproval", {
       commandActions: [{ command: "bash -lc \"rm -rf target\"" }], cwd: "/workspace", reason: "Remove generated output", impactScope: "target"
     }, "approval-wrapped");
@@ -1020,7 +1270,11 @@ test("expires resolved input requests and validates their exact question set", a
       commandActions: [{ command: "bash -lc \"rm -rf target\"" }], cwd: "/workspace", reason: "Remove generated output", impactScope: "target",
       executable: "rm", arguments: ["-rf", "target"], redacted: false
     });
-    options.onEvent?.(codexEvent("request.resolved", "Server request resolved", "serverRequest/resolved", { requestId: "approval-wrapped" }));
+    options.onEvent?.(codexEvent("request.resolved", "Server request resolved", "serverRequest/resolved", { requestId: "stale-request", sourceType: "stale/source" }, "approval-wrapped"));
+    assert.equal((database.prepare("SELECT status FROM approvals WHERE codex_request_id = 'approval-wrapped'").get() as { status: string }).status, "expired");
+    assert.deepEqual(JSON.parse((database.prepare("SELECT payload_json FROM run_events WHERE run_id = ? AND event_type = 'request.resolved' ORDER BY id DESC LIMIT 1").get(runId) as { payload_json: string }).payload_json), {
+      requestId: "approval-wrapped", sourceType: "serverRequest/resolved"
+    });
 
     const mcpApproval = codexEvent("approval.requested", "MCP tool approval requested", "mcpServer/elicitation/request", {
       serverName: "computer-use", mode: "form", message: "Allow Computer Use?", requestedSchema: { type: "object", properties: {} },
@@ -1055,21 +1309,21 @@ test("expires resolved input requests and validates their exact question set", a
   }
 });
 
-test("keeps an active Run recoverable when the controller closes normally", async () => {
+test("records cleanup warnings while keeping an active Run recoverable", async () => {
   const home = await mkdtemp(join(tmpdir(), "project-workshop-run-shutdown-"));
   const database = await openWorkshopDatabase(home);
   const { taskId } = seedTask(database, home);
   const runId = seedRun(database, taskId, 1);
   database.prepare("UPDATE runs SET status = 'preparing' WHERE id = ?").run(runId);
   let rejectCompletion!: (error: Error) => void;
-  const completed = new Promise<NormalizedCodexEvent>((_resolve, reject) => { rejectCompletion = reject; });
+  const completed = new Promise<AgentEvent>((_resolve, reject) => { rejectCompletion = reject; });
   const terminal: string[] = [];
-  const controller = new CodexRunController(database, new EventHub(), () => ({
+  const controller = new AgentRunController(database, new EventHub(), () => ({
     initialize: async () => undefined,
-    startRun: async () => ({ threadId: "thread-shutdown", turnId: "turn-shutdown", completed }),
+    start: async () => ({ threadId: "thread-shutdown", turnId: "turn-shutdown", completed }),
     steer: async () => undefined,
     interrupt: async () => undefined,
-    close: async () => { rejectCompletion(new Error("closed by test host")); }
+    close: async () => { rejectCompletion(new Error("closed by test host")); throw new Error("close path C:\\private\\codex.cmd failed"); }
   }), async (id) => { terminal.push(id); });
   try {
     await controller.start(runId, home);
@@ -1080,6 +1334,9 @@ test("keeps an active Run recoverable when the controller closes normally", asyn
     assert.equal(run.finished_at, null);
     assert.equal(run.failure_summary, null);
     assert.deepEqual(terminal, []);
+    const warning = database.prepare("SELECT summary, payload_json FROM run_events WHERE run_id = ? AND event_type = 'run.cleanup.warning'").get(runId) as { summary: string; payload_json: string } | undefined;
+    assert.equal(warning?.summary, "Run cleanup failed");
+    assert.doesNotMatch(warning?.payload_json ?? "", /private|codex\.cmd/);
   } finally {
     await controller.close();
     database.close();
@@ -1146,49 +1403,67 @@ async function readUntil(reader: ReadableStreamDefaultReader<Uint8Array>, marker
 
 function fakeRunClientLauncher(database: Awaited<ReturnType<typeof openWorkshopDatabase>>, calls: string[]): RunClientLauncher {
   let sequence = 0;
-  return (options: CodexAppServerOptions) => {
+  return (backend: string, options: AgentSessionOptions) => {
+    calls.push(`backend-id:${backend}`);
     const id = ++sequence;
     const runId = (database.prepare("SELECT id FROM runs WHERE status = 'preparing' ORDER BY rowid DESC LIMIT 1").get() as { id: string }).id;
     const automaticPermission = Boolean((database.prepare("SELECT task.auto_approve_permissions FROM tasks AS task JOIN runs AS run ON run.task_id = task.id WHERE run.id = ?").get(runId) as { auto_approve_permissions: number }).auto_approve_permissions);
-    let complete!: (event: NormalizedCodexEvent) => void;
-    const completed = new Promise<NormalizedCodexEvent>((resolve) => { complete = resolve; });
-    const handle: CodexRunHandle = { threadId: `thread-${id}`, turnId: `turn-${id}`, completed };
-    if (options.args) calls.push(`args:${JSON.stringify(options.args)}`);
-    return {
-      initialize: async () => { calls.push(`initialize:${runId}`); },
-      startRun: async (run: CodexRunOptions) => {
+    const threadId = `thread-${id}`; const turnId = `turn-${id}`;
+    let complete!: (completion: AgentCompletion) => void;
+    const completed = new Promise<AgentCompletion>((resolve) => { complete = resolve; });
+    const start = async (run: AgentStartOptions): Promise<AgentTurn> => {
         calls.push(`approval-policy:${run.approvalPolicy}`);
         calls.push(`sandbox:${run.sandbox}`);
         if (run.model) calls.push(`model:${run.model}`);
-        if (run.effort) calls.push(`effort:${run.effort}`);
+        if (run.reasoningEffort) calls.push(`effort:${run.reasoningEffort}`);
         calls.push(`prompt:${run.prompt}`);
-        options.onEvent?.(codexEvent("turn.started", "Turn started", "turn/started", { turn: { id: handle.turnId } }));
-        options.onEvent?.(codexEvent("token.usage", "Token usage updated", "thread/tokenUsage/updated", { threadId: handle.threadId, turnId: handle.turnId, tokenUsage: { total: { totalTokens: 150, inputTokens: 120, cachedInputTokens: 90, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 }, last: { totalTokens: 150, inputTokens: 120, cachedInputTokens: 90, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 }, modelContextWindow: 200000 } }));
-        options.onEvent?.(codexEvent("agent.message.delta", "Agent message", "item/agentMessage/delta", { delta: "working" }));
+        options.onEvent?.(codexEvent("turn.started", "Turn started", "turn/started", { turn: { id: turnId } }));
+        options.onEvent?.(codexEvent("token.usage", "Token usage updated", "fake/token-usage", {}, undefined, { tokenUsage: { input: 120, output: 30, cached: 90 } }));
+        options.onEvent?.(codexEvent("agent.message.delta", "Agent message", "fake/message", {}, undefined, { text: "working" }));
         const approval = automaticPermission
-          ? codexEvent("approval.requested", "Sandbox permission requested", "item/permissions/requestApproval", { permissions: ["network"] }, `approval-${id}`)
-          : codexEvent("approval.requested", "Command approval requested", "item/commandExecution/requestApproval", { command: "npm test" }, `approval-${id}`);
+          ? codexEvent("approval.requested", "Sandbox permission requested", "fake/approval", { permissions: ["network"] }, `approval-${id}`, { approvalKind: "permission" })
+          : codexEvent("approval.requested", "Command approval requested", "fake/approval", { command: "npm test" }, `approval-${id}`, { approvalKind: "command" });
         options.onEvent?.(approval);
         await options.onApproval?.(approval, (decision) => {
           const value = decision as { decision?: string; scope?: string };
           calls.push(`approval:${value.decision}:${value.scope}`);
         });
-        return handle;
-      },
-      steer: async (_threadId, _turnId, message) => { calls.push(`steer:${runId}:${message}`); },
+        return { completed };
+      };
+    if (options.backendOptions) calls.push(`backend:${JSON.stringify(options.backendOptions)}`);
+    calls.push(`session-sandbox:${options.sandboxMode}`);
+    calls.push(`session-network:${options.networkAccess}`);
+    return {
+      initialize: async () => { calls.push(`initialize:${runId}`); },
+      start, continue: start,
+      steer: async (message) => { calls.push(`steer:${runId}:${message}`); },
       interrupt: async () => {
         calls.push(`interrupt:${runId}`);
-        const event = codexEvent("turn.interrupted", "Turn interrupted", "turn/completed", { turn: { id: handle.turnId, status: "interrupted" } });
+        const event = codexEvent("turn.interrupted", "Turn interrupted", "turn/completed", { turn: { id: turnId, status: "interrupted" } });
         options.onEvent?.(event);
-        complete(event);
+        complete({ status: "interrupted", event });
       },
       close: async () => { calls.push(`close:${runId}`); }
     };
   };
 }
 
-function codexEvent(type: string, summary: string, method: string, payload: Record<string, unknown>, requestId?: string): NormalizedCodexEvent {
-  return { type, summary, method, payload, ...(requestId ? { requestId } : {}) };
+function fakeAgentRegistry(): AgentRegistry {
+  const plugin: AgentPlugin = {
+    id: "codex", displayName: "Codex", pluginVersion: "0.3.12", defaultCommand: "codex", executableEnvKey: "WORKSHOP_CODEX_PATH", runtimeVersion: { min: "0.147.0" }, description: "test", backendOptions: {},
+    validateConfig: () => undefined,
+    capabilities: { continuation: true, steering: true, interruption: true, approvals: true, userInput: true, tokenUsage: true, structuredFileEvents: true },
+    health: async () => ({ id: "codex", ok: true, pluginVersion: "0.3.12", runtimeVersion: "0.147.0", capabilities: { ok: true, models: [], reasoningEfforts: [] } }),
+    createSession: () => { throw new Error("unused"); }
+  };
+  return new AgentRegistry([plugin]);
+}
+
+function codexEvent(type: string, summary: string, sourceType: string, payload: Record<string, unknown>, requestId?: string, standard: Partial<Pick<AgentEvent, "text" | "tokenUsage" | "approvalKind" | "questions">> = {}): AgentEvent {
+  const approvalKind = type === "approval.requested" ? sourceType.includes("commandExecution") ? "command" : sourceType.includes("fileChange") ? "file_change" : sourceType.includes("permissions") ? "permission" : "mcp_tool_call" : undefined;
+  const questions = type === "input.requested" && Array.isArray(payload.questions) ? payload.questions as Array<{ id: string }> : undefined;
+  const text = type === "agent.message.delta" && typeof payload.delta === "string" ? payload.delta : undefined;
+  return { type, summary, sourceType, payload, ...(requestId ? { requestId } : {}), ...(text === undefined ? {} : { text }), ...(approvalKind ? { approvalKind } : {}), ...(questions ? { questions } : {}), ...standard };
 }
 
 async function api(address: string, cookie: string, path: string, payload?: Record<string, unknown>) {

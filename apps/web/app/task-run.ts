@@ -4,8 +4,16 @@ export type ThreadedComment = { id: string; parent_id: string | null };
 export type TaskMentionPart = string | { numberPath: string; label: string };
 export type CommentMentionPart = string | { kind: "task"; numberPath: string; label: string } | { kind: "role"; label: string };
 export type MentionTrigger = { start: number; query: string };
-export type CodeChange = { id: string; path: string; kind: string; movePath: string | null; diff: string; event: RunEvent };
-export type DiffLine = { text: string; kind: "add" | "remove" | "hunk" | "context" };
+export type RunDiffChange = { path: string; changeType: string; baselineHash: string | null; hash: string | null; safe: boolean };
+export type RunDiffFilePatch = { path: string; patch: string; changeType: string };
+
+export function currentRunsForEvents<Run extends { id: string }>(runs: Run[]): Run[] {
+  return runs.slice(0, 1);
+}
+
+export function isNearScrollBottom(scroll: { scrollTop: number; clientHeight: number; scrollHeight: number }, threshold = 0.9): boolean {
+  return scroll.scrollHeight <= scroll.clientHeight || scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight * threshold;
+}
 export type TokenUsageSource = { token_input: number | null; token_output: number | null; token_cached: number | null; configSnapshot?: { model?: string } };
 
 const CLIPBOARD_IMAGE_EXTENSIONS: Record<string, string> = {
@@ -143,46 +151,6 @@ export function runTimelineEvents(events: RunEvent[]): RunEvent[] {
   return timeline;
 }
 
-export function runCodeChanges(events: RunEvent[]): CodeChange[] {
-  const changes = new Map<string, CodeChange>();
-  for (const event of events) {
-    if (!event.event_type.includes("file_change")) continue;
-    const item = objectValue(event.payload.item);
-    const itemId = String(item?.id ?? event.id);
-    const entries = Array.isArray(item?.changes) ? item.changes : [];
-    for (const entry of entries) {
-      const change = objectValue(entry);
-      const path = typeof change?.path === "string" ? change.path : "";
-      if (!path || hiddenWorkshopPath(path)) continue;
-      const kind = objectValue(change?.kind);
-      const id = `${itemId}:${path}`;
-      changes.delete(id);
-      changes.set(id, {
-        id,
-        path,
-        kind: typeof kind?.type === "string" ? kind.type : typeof change?.kind === "string" ? change.kind : "update",
-        movePath: typeof kind?.move_path === "string" ? kind.move_path : null,
-        diff: typeof change?.diff === "string" ? change.diff : "",
-        event
-      });
-    }
-  }
-  return [...changes.values()].reverse();
-}
-
-function hiddenWorkshopPath(path: string): boolean {
-  const normalized = path.replaceAll("\\", "/");
-  const match = /(^|\/)\.openworkshop(?:\/|$)/.exec(normalized);
-  return Boolean(match) && !normalized.slice((match?.index ?? 0) + (match?.[1]?.length ?? 0)).startsWith(".openworkshop/worktrees/");
-}
-
-export function diffLines(diff: string): DiffLine[] {
-  return diff.split(/\r?\n/).map((text) => ({
-    text,
-    kind: text.startsWith("@@") ? "hunk" : text.startsWith("+") && !text.startsWith("+++") ? "add" : text.startsWith("-") && !text.startsWith("---") ? "remove" : "context"
-  }));
-}
-
 export function formatJson(value: string): string {
   try { return JSON.stringify(JSON.parse(value), null, 2); }
   catch { return value; }
@@ -208,6 +176,69 @@ export function commentThreadRows<T extends ThreadedComment>(comments: T[]): Arr
 
 export function upsertComment<T extends { id: string }>(comments: T[], comment: T): T[] {
   return comments.some((item) => item.id === comment.id) ? comments.map((item) => item.id === comment.id ? comment : item) : [...comments, comment];
+}
+
+export function runDiffChanges(payloadJson: string): RunDiffChange[] {
+  try {
+    const payload = objectValue(JSON.parse(payloadJson));
+    return (Array.isArray(payload?.changes) ? payload.changes : []).flatMap((entry) => {
+      const change = objectValue(entry);
+      return typeof change?.path === "string" ? [{
+        path: change.path,
+        changeType: typeof change.changeType === "string" ? change.changeType : "modified",
+        baselineHash: typeof change.baselineHash === "string" ? change.baselineHash : null,
+        hash: typeof change.hash === "string" ? change.hash : null,
+        safe: change.safe === true
+      }] : [];
+    });
+  } catch { return []; }
+}
+
+export function runDiffPatch(payloadJson: string): string {
+  try {
+    const patch = objectValue(JSON.parse(payloadJson))?.patch;
+    return typeof patch === "string" ? patch : "";
+  } catch { return ""; }
+}
+
+function gitDiffPath(value: string, stripSidePrefix = true): string {
+  let path = value.trim();
+  if (path.startsWith("\"") && path.endsWith("\"")) {
+    const bytes: number[] = [];
+    for (let index = 1; index < path.length - 1; index += 1) {
+      const character = path[index]!;
+      if (character !== "\\") { bytes.push(...new TextEncoder().encode(character)); continue; }
+      const escaped = path[++index];
+      if (escaped === undefined) break;
+      const octal = path.slice(index).match(/^[0-7]{1,3}/)?.[0];
+      if (octal) { bytes.push(Number.parseInt(octal, 8)); index += octal.length - 1; continue; }
+      bytes.push({ a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13 }[escaped] ?? escaped.charCodeAt(0));
+    }
+    path = new TextDecoder().decode(Uint8Array.from(bytes));
+  }
+  return path === "/dev/null" ? "" : stripSidePrefix ? path.replace(/^[ab]\//, "") : path;
+}
+
+export function runDiffFilePatches(payloadJson: string): RunDiffFilePatch[] {
+  return runDiffPatch(payloadJson).split(/(?=^diff --git )/m).flatMap((patch) => {
+    if (!patch.startsWith("diff --git ")) return [];
+    const changeType = /^new file mode /m.test(patch) ? "added"
+      : /^deleted file mode /m.test(patch) ? "deleted"
+      : /^rename (from|to) /m.test(patch) ? "renamed"
+      : /^(copy from|copy to) /m.test(patch) ? "copied"
+      : "modified";
+    const path = [
+      patch.match(/^\+\+\+ (.+)$/m)?.[1],
+      patch.match(/^rename to (.+)$/m)?.[1],
+      patch.match(/^--- (.+)$/m)?.[1],
+      patch.match(/^diff --git .+ ("?b\/.+)$/m)?.[1]
+    ].map((value, index) => value ? gitDiffPath(value, index !== 1) : "").find(Boolean);
+    return path ? [{ path, patch: patch.trimEnd(), changeType }] : [];
+  });
+}
+
+export function sameCommentSnapshot<T>(left: T[], right: T[]): boolean {
+  return left.length === right.length && left.every((item, index) => JSON.stringify(item) === JSON.stringify(right[index]));
 }
 
 export function taskMentionParts(content: string): TaskMentionPart[] {

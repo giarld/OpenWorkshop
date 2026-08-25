@@ -10,14 +10,16 @@ Use the `workshop` CLI as the sole workflow interface. Do not edit the Workshop 
 ## Start safely
 
 1. Check installed syntax when uncertain with `workshop --help` and `workshop <family> help`.
-2. Check the service and authentication before workflow calls:
+2. Run `workshop preflight --output json` before workflow calls. Continue service-level reads when `capabilities.readOnly` is true; do not call project or Agent-backed actions when the corresponding capability is false. Report the check's `status` and `detail` instead.
+
+   If preflight itself is unavailable, fall back to the service and authentication checks below:
 
    ```bash
    workshop status --output json
    workshop auth status --output json
    ```
 
-3. Check `workshop runtime codex-health --output json` only before Agent-backed actions: requirement analysis, requirement approval and planning, task trigger, or task resume.
+3. Check `workshop agent health --output json` only before Agent-backed actions: requirement analysis, requirement approval and planning, task trigger, or task resume.
 4. If login is required, ask the user to run `workshop login`. Never request, pass, store, or print the PIN.
 5. Use `--output json` for every command whose result will be parsed.
 6. Read canonical IDs from command output. Do not guess IDs from titles or array positions.

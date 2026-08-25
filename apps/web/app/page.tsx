@@ -6,7 +6,7 @@ import { TaskWorkspace } from "./task-workspace";
 import { watchSystemColorTheme } from "./theme-settings";
 
 type Screen = "loading" | "initialize" | "login" | "settings";
-type AgentHealth = { ok: boolean; version?: string; error?: string };
+type AgentHealth = { ok: boolean; runtimeVersion?: string; error?: string };
 type RunStatus = { queued: number; active: number; waiting: number; tasks: Array<{ taskId: string; status: string; numberPath: string; title: string; description: string; projectName: string }> };
 type AgentPresetSummary = { id: string; name: string };
 type AgentPresetResponse = { activePresetId: string; presets: AgentPresetSummary[] };
@@ -82,10 +82,10 @@ function AgentIndicators() {
 
   useEffect(() => {
     let mounted = true;
-    const refreshHealth = () => void fetch("/api/runtime/codex-health").then(async (response) => {
+    const refreshHealth = () => void fetch("/api/agents/health").then(async (response) => {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const result = await response.json() as AgentHealth;
-      if (mounted) setHealth(result);
+      const result = await response.json() as AgentHealth[];
+      if (mounted) setHealth(result[0] ?? { ok: false, error: "未注册 Agent 后端" });
     }).catch((error: Error) => mounted && setHealth({ ok: false, error: error.message }));
     const refreshRuns = () => void fetch("/api/runtime/run-status").then(async (response) => {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -107,7 +107,7 @@ function AgentIndicators() {
   const healthState = health === null ? "checking" : health.ok ? "healthy" : "unhealthy";
   const healthLabel = health === null ? "健康：检查中" : health.ok ? "健康：正常" : "健康：异常";
   return <div className="agent-indicators" role="status" aria-live="polite" aria-label={`Agent ${healthLabel}，${run.label}`}>
-    <span className={`agent-indicator ${healthState}`} title={health?.version ?? health?.error}><i />{healthLabel}</span>
+    <span className={`agent-indicator ${healthState}`} title={health?.runtimeVersion ?? health?.error}><i />{healthLabel}</span>
     <div className="agent-run-indicator" tabIndex={0} aria-describedby="agent-run-summary"><span className={`agent-indicator ${run.state}`}><i />{run.label}</span><div className="agent-run-popover" id="agent-run-summary" role="tooltip"><strong>Agent 任务</strong>{runs?.tasks.length ? <ul>{runs.tasks.map((task) => <li key={task.taskId}><span><b>{task.projectName} · {task.numberPath} {task.title}</b><small>{task.status === "queued" ? "排队" : task.status === "preparing" ? "准备中" : task.status === "running" ? "运行中" : task.status === "waiting_approval" ? "等待审批" : "等待输入"}</small></span><p>{task.description || "暂无任务简介"}</p></li>)}</ul> : <p>当前没有运行、排队或等待处理的任务。</p>}</div></div>
   </div>;
 }
@@ -119,7 +119,7 @@ function AgentPresetSwitcher() {
 
   useEffect(() => {
     let mounted = true;
-    const refresh = () => void fetch("/api/settings/agents").then(async (response) => {
+    const refresh = () => void fetch("/api/agents/presets").then(async (response) => {
       if (!response.ok) throw new Error("加载预设失败");
       const result = await response.json() as AgentPresetResponse;
       if (mounted) setSettings(result);
@@ -134,7 +134,7 @@ function AgentPresetSwitcher() {
     setMessage("");
     setBusy(true);
     try {
-      const response = await fetch("/api/settings/agents/active", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ presetId }) });
+      const response = await fetch("/api/agents/active", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ presetId }) });
       if (!response.ok) {
         const result = await response.json() as { error?: string };
         setMessage(result.error ?? "切换预设失败");
