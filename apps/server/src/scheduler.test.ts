@@ -37,7 +37,7 @@ test("task trigger creates the right grant and promotes only its authorized clos
     assert.equal(response.json().grant.scope, "target_closure");
     assert.deepEqual(statuses(fixture.database, [dependency, target, sibling]), ["in_progress", "todo", "backlog"]);
     assert.equal(started.length, 1);
-    assert.deepEqual(JSON.parse((fixture.database.prepare("SELECT config_snapshot_json FROM runs WHERE id = ?").get(started[0]!) as { config_snapshot_json: string }).config_snapshot_json), { prompt: "", model: "configured-model", reasoningEffort: "high", sandboxMode: "workspace-write", approvalPolicy: "on-request", networkAccess: true, agentBackend: "codex", pluginVersion: "0.3.15", backendOptions: { customArgs: ["--enable", "example"] } });
+    assert.deepEqual(JSON.parse((fixture.database.prepare("SELECT config_snapshot_json FROM runs WHERE id = ?").get(started[0]!) as { config_snapshot_json: string }).config_snapshot_json), { prompt: "", model: "configured-model", reasoningEffort: "high", sandboxMode: "workspace-write", approvalPolicy: "on-request", networkAccess: true, agentBackend: "codex", pluginVersion: "0.3.16", backendOptions: { customArgs: ["--enable", "example"] } });
     assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM runs").get() as { count: number }).count, 1);
     assert.equal((await server.inject({ method: "GET", url: `/api/tasks/${dependency}` })).json().latestRunStatus, "running");
     assert.equal((await server.inject({ method: "POST", url: `/api/tasks/${target}/trigger` })).statusCode, 409);
@@ -822,7 +822,7 @@ test("re-execution reconciles with a read-only supervisor before choosing the ne
     const supervisor = triggered.runIds[0]!;
     const supervisorRun = fixture.database.prepare("SELECT role, trigger_type, trigger_ref_id, config_snapshot_json FROM runs WHERE id = ?").get(supervisor) as { role: string; trigger_type: string; trigger_ref_id: string; config_snapshot_json: string };
     assert.deepEqual([supervisorRun.role, supervisorRun.trigger_type, supervisorRun.trigger_ref_id], ["supervisor", "reconcile", failedReviewer]);
-    assert.deepEqual(JSON.parse(supervisorRun.config_snapshot_json), { prompt: "", model: null, reasoningEffort: null, sandboxMode: "read-only", approvalPolicy: "never", networkAccess: false, agentBackend: "codex", pluginVersion: "0.3.15", backendOptions: { customArgs: [] } });
+    assert.deepEqual(JSON.parse(supervisorRun.config_snapshot_json), { prompt: "", model: null, reasoningEffort: null, sandboxMode: "read-only", approvalPolicy: "never", networkAccess: false, agentBackend: "codex", pluginVersion: "0.3.16", backendOptions: { customArgs: [] } });
 
     fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'decision', ?, 0, ?)")
       .run(supervisor, JSON.stringify({ delta: '{"action":"resume_reviewer","summary":"The review process was interrupted by infrastructure shutdown."}' }), new Date().toISOString());

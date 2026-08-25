@@ -24,6 +24,7 @@ export type AgentCompletion = { status: "succeeded" | "failed" | "cancelled" | "
 export type AgentTurn = { model?: string; completed: Promise<AgentCompletion> };
 export type AgentStartOptions = {
   cwd: string; prompt: string; input?: AgentInput[]; model?: string; reasoningEffort?: string;
+  developerInstructions?: string;
   approvalPolicy?: "untrusted" | "on-request" | "never"; sandbox?: "read-only" | "workspace-write" | "danger-full-access";
 };
 export type AgentRoleConfig = {

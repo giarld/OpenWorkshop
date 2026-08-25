@@ -65,6 +65,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   if (message.method === "thread/start") {
     if (!["read-only", "workspace-write", "danger-full-access"].includes(message.params.sandbox)) return send({ id: message.id, error: { message: "invalid sandbox" } });
     send({ id: message.id, result: { thread: { id: "thread-1" } } });
+    send({ method: "test/threadStartParams", params: message.params });
     return send({ method: "thread/started", params: { thread: { id: "thread-1" } } });
   }
   if (message.method === "turn/start") {
@@ -143,12 +144,13 @@ test("streams a fake Run through approval, steer, and interrupt", async () => {
   try {
     await client.initialize();
     assert.deepEqual((await client.models()).map((model) => model.id), ["fake-model", "opencodex/custom-model"]);
-    const run = await client.startRun({ cwd: process.cwd(), prompt: "Do the work", model: "fake-model", effort: "medium" });
+    const run = await client.startRun({ cwd: process.cwd(), prompt: "Do the work", developerInstructions: "Return JSON without tools", model: "fake-model", effort: "medium" });
     assert.equal(run.model, "fake-model");
     await client.steer(run.threadId, run.turnId, [{ type: "text", text: "Focus on tests" }, { type: "localImage", path: join(process.cwd(), "screenshot.png") }]);
     await client.interrupt(run.threadId, run.turnId);
     assert.equal((await run.completed).type, "turn.interrupted");
     assert.equal(approval?.type, "approval.requested");
+    assert.equal(events.find((event) => event.method === "test/threadStartParams")?.payload.developerInstructions, "Return JSON without tools");
     assert.ok(events.some((event) => event.type === "agent.message.delta"));
     assert.ok(events.some((event) => event.type === "request.resolved"));
   } finally {

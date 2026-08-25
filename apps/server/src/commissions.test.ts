@@ -196,7 +196,7 @@ test("approving a requirement automatically writes the planning Agent task tree"
     assert.equal((await server.inject({ method: "POST", url: `/api/requirements/${requirementId}/approve` })).statusCode, 200);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM tasks WHERE commission_id = ? AND status = 'backlog'").get(commissionId) as { count: number }).count, 2);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM documents WHERE commission_id = ? AND type = 'plan'").get(commissionId) as { count: number }).count, 1);
-    assert.deepEqual(analyzedWith, { prompt: "", model: "supervisor-model", reasoningEffort: "high", sandboxMode: "workspace-write", approvalPolicy: "on-request", networkAccess: true, agentBackend: "codex", pluginVersion: "0.3.15", backendOptions: { customArgs: [] } });
+    assert.deepEqual(analyzedWith, { prompt: "", model: "supervisor-model", reasoningEffort: "high", sandboxMode: "workspace-write", approvalPolicy: "on-request", networkAccess: true, agentBackend: "codex", pluginVersion: "0.3.16", backendOptions: { customArgs: [] } });
     assert.deepEqual(plannedWith, analyzedWith);
 
     const mainTaskId = (database.prepare("SELECT main_task_id FROM commissions WHERE id = ?").get(commissionId) as { main_task_id: string }).main_task_id;

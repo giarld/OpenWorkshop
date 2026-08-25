@@ -459,6 +459,7 @@ test("starts a scheduling Agent when the main task is mentioned", async () => {
   const database = await openWorkshopDatabase(home);
   const server = Fastify();
   const prompts: string[] = [];
+  const developerInstructions: Array<string | undefined> = [];
   try {
     const { commissionId, taskId: mainTaskId } = seedTask(database, home);
     database.prepare("UPDATE commissions SET main_task_id = ? WHERE id = ?").run(mainTaskId, commissionId);
@@ -474,7 +475,7 @@ test("starts a scheduling Agent when the main task is mentioned", async () => {
       .run(randomUUID(), childTaskId, previousRunId, JSON.stringify({ passed: false, findings: [{ severity: "blocking", message: "Missing regression test" }] }), now);
     const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
       initialize: async () => undefined,
-      start: async (options) => { prompts.push(options.prompt); return { threadId: "thread-coordinate", turnId: "turn-coordinate", completed: new Promise<AgentEvent>(() => undefined) }; },
+      start: async (options) => { prompts.push(options.prompt); developerInstructions.push(options.developerInstructions); return { threadId: "thread-coordinate", turnId: "turn-coordinate", completed: new Promise<AgentEvent>(() => undefined) }; },
       steer: async () => undefined,
       interrupt: async () => undefined,
       close: async () => undefined
@@ -488,6 +489,9 @@ test("starts a scheduling Agent when the main task is mentioned", async () => {
     assert.equal(run.role, "supervisor");
     assert.equal(run.trigger_type, "coordinate");
     assert.match(prompts[0]!, /project scheduling Agent/);
+    assert.match(prompts[0]!, /## task-tree\.md/);
+    assert.doesNotMatch(prompts[0]!, /Context files:/);
+    assert.match(developerInstructions[0]!, /Do not invoke tools/);
     const taskTree = await readFile(join(home, ".openworkshop", "runs", result.runId!, "task-tree.md"), "utf8");
     assert.match(taskTree, /1\.1 Child/);
     assert.match(taskTree, new RegExp(childTaskId));

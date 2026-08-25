@@ -46,6 +46,7 @@ export type CodexRoleConfig = {
 export type CodexRunOptions = {
   cwd: string;
   prompt: string;
+  developerInstructions?: string;
   input?: CodexInput[];
   threadId?: string;
   model?: string;
@@ -133,6 +134,7 @@ export class CodexAppServer {
     const started = options.threadId ? undefined : asObject(await this.request("thread/start", compact({
       cwd: options.cwd,
       model,
+      developerInstructions: options.developerInstructions,
       approvalPolicy: options.approvalPolicy ?? COMMAND_APPROVAL_POLICY,
       sandbox: options.sandbox ?? COMMAND_SANDBOX_MODE,
       serviceName: "project_workshop"
@@ -518,7 +520,7 @@ class CodexAgentSession implements AgentSession {
     this.busy = true;
     try {
       const handle = await this.client.startRun({
-        cwd: options.cwd, prompt: options.prompt, ...(options.input ? { input: options.input } : {}),
+        cwd: options.cwd, prompt: options.prompt, ...(options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}), ...(options.input ? { input: options.input } : {}),
         ...(continuation && this.threadId ? { threadId: this.threadId } : {}), ...(options.model ? { model: options.model } : {}),
         ...(options.reasoningEffort ? { effort: options.reasoningEffort } : {}), ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
         ...(options.sandbox ? { sandbox: options.sandbox } : {})
