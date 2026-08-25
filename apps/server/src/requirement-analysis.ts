@@ -3,23 +3,72 @@ export const CLARIFICATION_COMPLETION_QUESTION = "需求信息已经足够。是
 export type ParsedRequirementAnalysis = { question: string; options?: string[] } | { completionQuestion: true } | { contentMarkdown: string; acceptanceCriteria: unknown[] };
 
 export function parseRequirementAnalysis(output: string): ParsedRequirementAnalysis {
-  const json = /```(?:json)?\s*([\s\S]*?)```/i.exec(output)?.[1] ?? output.slice(output.indexOf("{"), output.lastIndexOf("}") + 1);
-  let value: unknown;
-  try { value = JSON.parse(json); }
-  catch (error) { throw badGateway("Requirement Agent returned invalid JSON", error); }
-  if (!value || typeof value !== "object") throw badGateway("Requirement Agent returned invalid output");
+  let parsed = false;
+  let invalid: Error | undefined;
+  for (const json of jsonObjects(output)) {
+    let value: unknown;
+    try { value = JSON.parse(json); }
+    catch { continue; }
+    parsed = true;
+    try {
+      const result = parseResult(value);
+      if (result) return result;
+    } catch (error) {
+      if (error instanceof Error) invalid ??= error;
+      else throw error;
+    }
+  }
+  if (invalid) throw invalid;
+  if (parsed) throw badGateway("Requirement Agent returned an unsupported result");
+  throw badGateway("Requirement Agent returned invalid JSON");
+}
+
+function parseResult(value: unknown): ParsedRequirementAnalysis | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const result = value as Record<string, unknown>;
   if (typeof result.question === "string" && result.question.trim()) {
-    const options = parseOptions(result.options);
-    return options ? { question: result.question.trim(), options } : { question: result.question.trim() };
+    return parseQuestion(result.question, result.options);
   }
   if (result.completionQuestion === true) return { completionQuestion: true };
   if (typeof result.contentMarkdown === "string" && result.contentMarkdown.trim() && Array.isArray(result.acceptanceCriteria)) {
     const contentMarkdown = result.contentMarkdown.trim();
     const openQuestion = firstOpenQuestion(contentMarkdown);
-    return openQuestion ? { question: openQuestion } : { contentMarkdown, acceptanceCriteria: result.acceptanceCriteria };
+    return openQuestion ? parseQuestion(openQuestion) : { contentMarkdown, acceptanceCriteria: result.acceptanceCriteria };
   }
-  throw badGateway("Requirement Agent returned an unsupported result");
+  return undefined;
+}
+
+function parseQuestion(question: string, optionsValue?: unknown): ParsedRequirementAnalysis {
+  const trimmed = question.trim();
+  if (!/[?？]$/.test(trimmed)) throw badGateway("Requirement Agent returned invalid question");
+  const options = parseOptions(optionsValue);
+  return options ? { question: trimmed, options } : { question: trimmed };
+}
+
+function jsonObjects(output: string): string[] {
+  const objects: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < output.length; index++) {
+    const character = output[index]!;
+    if (start < 0) {
+      if (character === "{") { start = index; depth = 1; }
+      continue;
+    }
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === "\"") quoted = false;
+    } else if (character === "\"") quoted = true;
+    else if (character === "{") depth++;
+    else if (character === "}" && --depth === 0) {
+      objects.push(output.slice(start, index + 1));
+      start = -1;
+    }
+  }
+  return objects;
 }
 
 function parseOptions(value: unknown): string[] | undefined {
