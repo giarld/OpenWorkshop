@@ -562,6 +562,9 @@ aside { padding: .8rem 1rem; border-left: .25rem solid #c47a2c; background: #fff
 .task-comment-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: .6rem; padding: .75rem; border-top: 1px solid #d9d2c1; background: #f7f3ea; }
 .task-comment-editor { position: relative; min-width: 0; grid-column: 1 / -1; }
 .task-comment-form textarea { resize: vertical; }
+.task-comment-form[aria-busy="true"] .task-comment-editor,
+.task-comment-form[aria-busy="true"] .task-attachment-control,
+.task-comment-form[aria-busy="true"] .comment-replying { opacity: .5; }
 .task-comment-form .workspace-message { grid-column: 1 / -1; }
 .comment-replying { grid-column: 1 / -1; grid-row: 1; display: flex; align-items: center; justify-content: space-between; gap: .6rem; padding: .45rem .55rem; border-left: .2rem solid #3977b8; background: #e9f1f8; color: #36536b; font-size: .72rem; }
 .comment-replying span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -592,6 +595,8 @@ aside { padding: .8rem 1rem; border-left: .25rem solid #c47a2c; background: #fff
 .run-record-toggle > span:nth-child(2) { display: grid; gap: .1rem; }
 .run-record-toggle small { color: #9f3f24; font-size: .62rem; font-weight: 900; letter-spacing: .08em; }
 .run-record-toggle strong { font-size: .82rem; }
+.run-record-timing { display: flex; flex-wrap: wrap; gap: .2rem .65rem; }
+.run-record-toggle .run-record-started { color: #6e766f; font-weight: 650; letter-spacing: 0; }
 .run-record-toggle .run-record-duration { color: #6e766f; font-weight: 650; letter-spacing: 0; }
 .run-record-toggle .run-record-tokens { color: #3977b8; font-variant-numeric: tabular-nums; letter-spacing: 0; }
 .run-record-chevron { color: #55735f; font-size: 1rem; }

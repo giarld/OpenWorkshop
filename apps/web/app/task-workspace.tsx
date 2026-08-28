@@ -14,7 +14,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Children, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { Children, memo, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import webPackage from "../package.json";
 import { AVATAR_SETTINGS_EVENT, DEFAULT_AVATARS, avatarSettings, isImageAvatar, type AvatarSettings } from "./avatar-settings";
@@ -23,7 +23,7 @@ import { DeliveryWorkspace } from "./delivery-workspace";
 import { CommissionWorkspace } from "./commission-workspace";
 import { UsageStatisticsWorkspace } from "./usage-statistics-workspace";
 import { PROJECT_NAME_MAX_LENGTH, activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, initialWorkspaceView, isStaleWorkspaceHash, projectIdAfterArchive, projectNameError, projectRunLabels, workspaceContentState, type ManagedProject, type WorkspaceView } from "./project-management";
-import { canOpenTaskDelivery, canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, currentRunsForEvents, formatJson, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, isNearScrollBottom, mentionTriggerAtCursor, parseReviewComment, runDiffChanges, runDiffFilePatches, runEventDetail, runQuestions, runTimelineEvents, sameCommentSnapshot, screenshotFileName, taskLifecycleAction, tokenPrice, tokenUsageTotals, upsertComment, type MentionTrigger, type ReviewFinding, type RunDiffChange, type RunDiffFilePatch, type RunEvent, type RunQuestion } from "./task-run";
+import { canOpenTaskDelivery, canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, currentRunsForEvents, formatJson, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, isNearScrollBottom, mentionTriggerAtCursor, parseReviewComment, runDiffChanges, runDiffFilePatches, runEventDetail, runQuestions, runTimelineEvents, sameCommentLinkTargets, sameCommentSnapshot, screenshotFileName, taskLifecycleAction, tokenPrice, tokenUsageTotals, upsertComment, type MentionTrigger, type ReviewFinding, type RunDiffChange, type RunDiffFilePatch, type RunEvent, type RunQuestion } from "./task-run";
 import {
   TASK_STATUSES,
   boardCollisionDetection,
@@ -922,7 +922,7 @@ function TaskComments({ comments, tasks, mentionTasks, readOnly, busy, error, up
       <div className={`comment-card ${comment.deleted_at ? "deleted" : ""} ${comment.revisionCard ? "revision-card" : ""}`}><header><span><strong>{comment.author_type === "human" ? "人工负责人" : comment.agent_role ? ROLE_LABELS[comment.agent_role] ?? comment.agent_role : comment.author_type === "agent" ? "AI Agent" : "系统"}</strong>{comment.author_type === "agent" && <small>Agent</small>}{comment.run_id && <small>Run</small>}</span><time>{new Date(comment.created_at).toLocaleString()}</time></header>{comment.deleted_at ? <p className="comment-deleted">评论已删除</p> : <>{comment.content && <CommentMarkdown content={comment.content} tasks={tasks} onOpenTask={onOpenTask} />}<AttachmentList taskId={comment.task_id} attachments={comment.attachments ?? []} />{comment.revisionCard && <PlanRevisionCard comment={comment} busy={busy || readOnly} onRespond={onRespond} />}</>}{!readOnly && !comment.deleted_at && !comment.revisionCard && <footer><button type="button" className="comment-reply" onClick={() => { setReplyTo(comment); window.setTimeout(() => textarea.current?.focus(), 0); }}>回复</button>{comment.author_type === "human" && <button type="button" className="comment-delete" onClick={() => void onDelete(comment)}>删除</button>}</footer>}</div>
     </article>) : <p className="task-tab-empty">{readOnly ? "该归档任务没有历史评论。" : "暂无评论，输入一条协作信息开始讨论。"}</p>}</div>
     {showScrollBottom && <button type="button" className="comment-scroll-bottom" aria-label="滚动到评论底部" title="滚动到评论底部" onClick={() => { const scrollContainer = commentList.current?.closest<HTMLElement>(".commission-dialog-body"); scrollContainer?.scrollTo({ top: scrollContainer.scrollHeight, behavior: "smooth" }); }}><span aria-hidden="true">↓</span></button>}
-    {readOnly ? <p className="task-tab-empty">归档任务的评论为只读，历史记录仍会保留。</p> : <form className="task-comment-form" onSubmit={(event) => void submit(event)}>
+    {readOnly ? <p className="task-tab-empty">归档任务的评论为只读，历史记录仍会保留。</p> : <form className="task-comment-form" aria-busy={busy} onSubmit={(event) => void submit(event)}>
       {replyTo && <div className="comment-replying"><span>回复 {replyTo.author_type === "human" ? "人工负责人" : replyTo.agent_role ? ROLE_LABELS[replyTo.agent_role] ?? replyTo.agent_role : "系统"}：{replyTo.content.slice(0, 60)}</span><button type="button" className="secondary compact" onClick={() => setReplyTo(null)}>取消回复</button></div>}
       <input type="hidden" name="parentId" value={replyTo?.id ?? ""} />
       <div className="task-comment-editor">
@@ -1046,7 +1046,7 @@ function formatAttachmentSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function CommentMarkdown({ content, tasks, onOpenTask }: { content: string; tasks: Task[]; onOpenTask(task: Task): Promise<void> }) {
+const CommentMarkdown = memo(function CommentMarkdown({ content, tasks, onOpenTask }: { content: string; tasks: Task[]; onOpenTask(task: Task): Promise<void> }) {
   const review = parseReviewComment(content);
   const mentions = (children: ReactNode) => <CommentMentionText tasks={tasks} onOpenTask={onOpenTask}>{children}</CommentMentionText>;
   const markdown = <ReactMarkdown components={{
@@ -1062,7 +1062,7 @@ function CommentMarkdown({ content, tasks, onOpenTask }: { content: string; task
     a: ({ children, href }) => commentLinkUrl(href) ? <a href={href} target="_blank" rel="noreferrer">{mentions(children)}</a> : <>{mentions(children)}</>
   }}>{review?.markdown ?? content}</ReactMarkdown>;
   return <div className="markdown-content">{markdown}{review && <ReviewFindings findings={review.findings} />}</div>;
-}
+}, (previous, next) => previous.content === next.content && sameCommentLinkTargets(previous.tasks, next.tasks));
 
 function ReviewFindings({ findings }: { findings: ReviewFinding[] }) {
   return <section className="review-findings" aria-label="审查发现"><h3>发现</h3><ul>{findings.map((finding, index) => <li key={`${finding.file ?? "general"}:${finding.line ?? 0}:${index}`} className={`review-finding review-finding-${finding.severity}`}><header><strong>{finding.severity === "blocking" ? "阻塞" : "警告"}</strong>{finding.file && <code>{finding.file}{finding.line === null ? "" : `:${finding.line}`}</code>}</header><p>{finding.message}</p></li>)}</ul></section>;
@@ -1155,7 +1155,7 @@ function RunTimelineGroup({ run, events, current, open, onToggle, onOpenDiff }: 
   return <section ref={record} className={`run-record ${open ? "open" : ""}`}>
     <div className="run-record-header"><button className="run-record-toggle" aria-expanded={open} onClick={() => onToggle(!open)}>
       <span className="run-record-chevron" aria-hidden="true">{open ? "▾" : "▸"}</span>
-      <span><small>{current ? "当前执行" : "历史执行"}</small><strong>Run #{run.attempt_no} · {run.role}</strong><RunRecordDuration run={run} /><small className="run-record-tokens" title={tokens ? `输入 ${formatTokenCount(tokens.input)}，输出 ${formatTokenCount(tokens.output)}，缓存 ${formatTokenCount(tokens.cached)}` : undefined}>Token {tokens ? formatTokenCount(tokens.total) : "—"} · {price === null ? "价格不可用" : `约 ${formatTokenPrice(price)}`}</small></span>
+      <span><small>{current ? "当前执行" : "历史执行"}</small><strong>Run #{run.attempt_no} · {run.role}</strong><span className="run-record-timing">{run.started_at && <small className="run-record-started">开始时间 <time dateTime={run.started_at}>{new Date(run.started_at).toLocaleString()}</time></small>}<RunRecordDuration run={run} /></span><small className="run-record-tokens" title={tokens ? `输入 ${formatTokenCount(tokens.input)}，输出 ${formatTokenCount(tokens.output)}，缓存 ${formatTokenCount(tokens.cached)}` : undefined}>Token {tokens ? formatTokenCount(tokens.total) : "—"} · {price === null ? "价格不可用" : `约 ${formatTokenPrice(price)}`}</small></span>
     </button>{run.role === "developer" && run.has_diff && <button className="secondary compact run-diff-button" onClick={() => onOpenDiff(run)}>修改记录</button>}<span className={`run-record-status status-${run.status}`}>{RUN_STATUS_LABELS[run.status] ?? run.status}</span></div>
     {open && <div ref={timeline} className="run-timeline">{events === undefined ? <p>正在加载运行记录…</p> : timelineEvents.length ? timelineEvents.map((event) => <RunTimelineEvent key={event.id} event={event} />) : <p>此 Run 尚未产生事件。</p>}</div>}
   </section>;

@@ -241,6 +241,10 @@ export function sameCommentSnapshot<T>(left: T[], right: T[]): boolean {
   return left.length === right.length && left.every((item, index) => JSON.stringify(item) === JSON.stringify(right[index]));
 }
 
+export function sameCommentLinkTargets<T extends { id: string; number_path: string }>(left: T[], right: T[]): boolean {
+  return left.length === right.length && left.every((task, index) => task.id === right[index]?.id && task.number_path === right[index]?.number_path);
+}
+
 export function taskMentionParts(content: string): TaskMentionPart[] {
   const parts: TaskMentionPart[] = [];
   let cursor = 0;

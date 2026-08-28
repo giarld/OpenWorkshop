@@ -473,6 +473,8 @@ test("starts a scheduling Agent when the main task is mentioned", async () => {
     database.prepare("INSERT INTO runs (id, project_id, commission_id, task_id, role, trigger_type, status, attempt_no, config_snapshot_json, context_snapshot_json) SELECT ?, project_id, id, ?, 'developer', 'resume', 'interrupted', 2, '{}', '{}' FROM commissions WHERE id = ?").run(interruptedRunId, childTaskId, commissionId);
     database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'review', 'failed', 'Blocking review result', ?, ?)")
       .run(randomUUID(), childTaskId, previousRunId, JSON.stringify({ passed: false, findings: [{ severity: "blocking", message: "Missing regression test" }] }), now);
+    database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'diff', 'failed', 'Workspace contains unattributed changes', ?, ?)")
+      .run(randomUUID(), childTaskId, previousRunId, JSON.stringify({ unownedPaths: ["x".repeat(1_100_000)] }), now);
     const mentionAgent = await registerProductionRunRoutes(server, database, () => ({
       initialize: async () => undefined,
       start: async (options) => { prompts.push(options.prompt); developerInstructions.push(options.developerInstructions); return { threadId: "thread-coordinate", turnId: "turn-coordinate", completed: new Promise<AgentEvent>(() => undefined) }; },
@@ -491,6 +493,7 @@ test("starts a scheduling Agent when the main task is mentioned", async () => {
     assert.match(prompts[0]!, /project scheduling Agent/);
     assert.match(prompts[0]!, /## task-tree\.md/);
     assert.doesNotMatch(prompts[0]!, /Context files:/);
+    assert.ok(prompts[0]!.length < 1_048_576);
     assert.match(developerInstructions[0]!, /Do not invoke tools/);
     const taskTree = await readFile(join(home, ".openworkshop", "runs", result.runId!, "task-tree.md"), "utf8");
     assert.match(taskTree, /1\.1 Child/);
@@ -499,6 +502,8 @@ test("starts a scheduling Agent when the main task is mentioned", async () => {
     assert.match(taskTree, new RegExp(`Run history:.*${previousRunId}.*reviewer.*succeeded.*${interruptedRunId}.*developer.*interrupted`));
     assert.match(taskTree, new RegExp(`Evidence: review/failed · run:${previousRunId} · Blocking review result`));
     assert.match(taskTree, /Missing regression test/);
+    assert.match(taskTree, /diff\/failed · run:.* · Workspace contains unattributed changes/);
+    assert.doesNotMatch(taskTree, /unownedPaths/);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM runs WHERE task_id = ?").get(childTaskId) as { count: number }).count, 2);
   } finally {
     await server.close();

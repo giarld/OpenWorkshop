@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canOpenTaskDelivery, canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, currentRunsForEvents, formatJson, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, isNearScrollBottom, mentionTriggerAtCursor, parseReviewComment, runDiffChanges, runDiffFilePatches, runDiffPatch, runEventDetail, runQuestions, runTimelineEvents, sameCommentSnapshot, screenshotFileName, taskLifecycleAction, taskMentionParts, tokenPrice, tokenUsageTotals, upsertComment } from "./task-run.ts";
+import { canOpenTaskDelivery, canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, currentRunsForEvents, formatJson, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, isNearScrollBottom, mentionTriggerAtCursor, parseReviewComment, runDiffChanges, runDiffFilePatches, runDiffPatch, runEventDetail, runQuestions, runTimelineEvents, sameCommentLinkTargets, sameCommentSnapshot, screenshotFileName, taskLifecycleAction, taskMentionParts, tokenPrice, tokenUsageTotals, upsertComment } from "./task-run.ts";
 
 test("recognizes supported clipboard images and generates readable screenshot names", () => {
   assert.equal(clipboardImageExtension("image/png"), "png");
@@ -153,6 +153,12 @@ test("reuses the comment snapshot when polling returns unchanged data", () => {
   assert.equal(sameCommentSnapshot(comments, [{ id: "comment-1", content: "已保存" }]), true);
   assert.equal(sameCommentSnapshot(comments, [{ id: "comment-1", content: "已更新" }]), false);
   assert.equal(sameCommentSnapshot(comments, []), false);
+});
+
+test("keeps rendered comment links stable across unrelated task polling changes", () => {
+  const previous = [{ id: "task-1", number_path: "1.1", status: "running" }];
+  assert.equal(sameCommentLinkTargets(previous, [{ id: "task-1", number_path: "1.1", status: "done" }]), true);
+  assert.equal(sameCommentLinkTargets(previous, [{ id: "task-1", number_path: "1.2", status: "running" }]), false);
 });
 
 test("parses clickable task mentions without matching ordinary version text", () => {
