@@ -4,8 +4,8 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test from "node:test";
-import { checkPort, doctorFailed, doctorLabel } from "./doctor.ts";
-import { buildPreflightResult, isAgentHealthResponse, sameServerOrigin } from "./preflight.ts";
+import { agentDoctorResults, checkPort, doctorFailed, doctorLabel } from "./doctor.ts";
+import { activeAgentPreflightCheck, buildPreflightResult, isAgentHealthResponse, sameServerOrigin } from "./preflight.ts";
 import { updateOpenWorkshop } from "./update-command.ts";
 import { isVersionCommand, WORKSHOP_VERSION } from "./version.ts";
 
@@ -60,6 +60,12 @@ test("doctor reports missing Git as a warning without failing", () => {
   assert.equal(doctorFailed([{ name: "database", ok: false }]), true);
 });
 
+test("doctor only warns for unavailable optional Agents when another Agent is healthy", () => {
+  const unavailable = { id: "claude-code", ok: false, pluginVersion: "test", capabilities: { ok: false, models: [], reasoningEfforts: [] }, error: "missing" };
+  assert.equal(agentDoctorResults([unavailable])[0]?.warning, undefined);
+  assert.equal(agentDoctorResults([{ ...unavailable, id: "codex" }, { ...unavailable, id: "claude-code", ok: true }])[0]?.warning, true);
+});
+
 test("preflight exposes independent capabilities", () => {
   const result = buildPreflightResult({
     service: { status: "ok" },
@@ -97,6 +103,14 @@ test("preflight rejects empty or malformed Agent health responses", () => {
   assert.equal(isAgentHealthResponse({ data: [] }), false);
   assert.equal(isAgentHealthResponse([null]), false);
   assert.equal(isAgentHealthResponse([{ id: "codex", ok: true }]), true);
+});
+
+test("preflight keeps Agent capability when only an optional backend is unavailable", () => {
+  assert.deepEqual(activeAgentPreflightCheck(
+    { health: { id: "codex", ok: true } },
+    [{ id: "codex", ok: true }, { id: "claude-code", ok: false, error: "missing" }]
+  ), { status: "ok", detail: "可选后端不可用: claude-code: missing" });
+  assert.equal(activeAgentPreflightCheck({ health: { id: "codex", ok: false, error: "missing" } }).status, "unavailable");
 });
 
 test("session server matching accepts only loopback aliases", () => {

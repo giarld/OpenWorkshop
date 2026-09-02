@@ -115,7 +115,7 @@ flowchart TD
 
 - macOS 或 Windows
 - Node.js 24+
-- 已安装并登录的 Codex CLI
+ - 已安装并登录的 Codex CLI 或 Claude Code CLI
 - 可选：Git 或 SVN，用于识别和隔离对应项目
 
 ### 安装与启动
@@ -170,7 +170,7 @@ workshop agent backends --output json
 workshop agent health --output json
 ```
 
-OpenWorkshop 默认使用服务进程 `PATH` 中的 `codex`。如需固定 Codex 运行时，可将 `WORKSHOP_CODEX_PATH` 设置为绝对可执行文件路径；配置路径无效时后端会判定为不可用，不会回退到 `PATH`。
+OpenWorkshop 默认使用服务进程 `PATH` 中的 `codex` 和 `claude`。如需固定运行时，可分别设置 `WORKSHOP_CODEX_PATH` 或 `WORKSHOP_CLAUDE_CODE_PATH` 为绝对可执行文件路径；配置路径无效时对应后端会判定为不可用，不会回退到 `PATH`。在 Agent 预设中选择 `Claude Code` 后，运行使用其 headless JSONL 接口；当前不提供审批、steering 和结构化文件事件能力。
 
 创建委托并推进需求：
 
@@ -288,7 +288,7 @@ workshop preflight [--server-url URL] [--output json]
 | `workshop log [-n 100]` | 输出最新服务日志的最后若干行 |
 | `workshop restart` | 优雅重启服务 |
 | `workshop stop` | 优雅停止服务 |
-| `workshop doctor` | 检查数据库、项目根目录、Git、Codex 和端口；Git 缺失仅警告，端口由当前 OpenWorkshop 占用时视为正常 |
+| `workshop doctor` | 检查数据库、项目根目录、Git、Agent 后端和端口；Git 缺失仅警告，单个 Agent 后端不可用但仍有其他后端可用时仅警告，端口由当前 OpenWorkshop 占用时视为正常 |
 | `workshop backup [path]` | 备份 SQLite 数据库 |
 | `workshop restore <path>` | 恢复数据库，并先保存当前数据库 |
 | `workshop pin set` | 修改 PIN 并撤销已有会话 |
@@ -300,7 +300,7 @@ workshop preflight [--server-url URL] [--output json]
 
 OpenWorkshop 目前处于 MVP 阶段，面向单个个人用户和可信本地网络：
 
-- 仅支持 Codex CLI，不提供可配置的第三方 Agent Runtime。
+ - 内置支持 Codex CLI 和 Claude Code；不提供动态第三方 Agent Runtime。
 - 关联已有本地目录，不负责克隆远程仓库。
 - 不自动执行 Git Commit、Push、创建 Pull Request 或 SVN Commit。
 - Web 界面面向桌面浏览器，当前提供简体中文。

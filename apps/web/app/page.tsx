@@ -149,5 +149,5 @@ function AgentPresetSwitcher() {
     }
   }
 
-  return <label className="agent-preset-switcher" title={message || "只影响之后创建的 Run"}>Agent 预设<select aria-label="切换 Agent 预设" disabled={!settings || busy} value={settings?.activePresetId ?? ""} onChange={(event) => void selectPreset(event.target.value)}><option value="" disabled>{message || "加载中…"}</option>{settings?.presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></label>;
+  return <label className="agent-preset-switcher" title={message || "只影响之后创建的 Run"}>Agent 预设<select aria-label="切换 Agent 预设" disabled={!settings || busy} value={settings?.activePresetId ?? ""} onChange={(event) => void selectPreset(event.target.value)}>{!settings && <option value="" disabled>{message || "加载中…"}</option>}{settings?.presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></label>;
 }

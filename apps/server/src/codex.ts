@@ -1,6 +1,6 @@
-import { spawn, execFile, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { spawn, execFile, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync, readdirSync, statSync } from "node:fs";
+import { delimiter, isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import { AgentError, APPROVAL_POLICIES, capabilityError, COMMAND_APPROVAL_POLICY, COMMAND_SANDBOX_MODE, normalizeSemver, SANDBOX_MODES, semverInRange, type AgentBackendHealth, type AgentCompletion, type AgentEvent, type AgentPlugin, type AgentPluginConfig, type AgentSession, type AgentSessionOptions, type AgentStartOptions, type AgentTurn, type ApprovalPolicy, type SandboxMode } from "./agent.ts";
@@ -108,8 +108,7 @@ export class CodexAppServer {
   }
 
   static launch(options: CodexAppServerOptions = {}): CodexAppServer {
-    const invocation = resolveInvocation(options.command ?? "codex", options.args ?? [...CODEX_APP_SERVER_ARGS], options.env);
-    const child = spawn(invocation.file, invocation.args, {
+    const child = spawn(options.command ?? "codex", options.args ?? [...CODEX_APP_SERVER_ARGS], {
       cwd: options.cwd,
       env: options.env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -448,31 +447,36 @@ export function validateCodexConfig(config: AgentPluginConfig): void {
 }
 
 async function execute(file: string, args: string[], timeout = 5_000, env = process.env): Promise<string> {
-  const invocation = resolveInvocation(file, args, env);
-  const { stdout } = await runFile(invocation.file, invocation.args, { encoding: "utf8", windowsHide: true, timeout, env });
+  const { stdout } = await runFile(file, args, { encoding: "utf8", windowsHide: true, timeout, env });
   return stdout;
-}
-
-export function resolveInvocation(file: string, args: string[], env = process.env, platform = process.platform): { file: string; args: string[] } {
-  let resolved = file;
-  if (platform === "win32" && !isAbsolute(file) && !file.includes("\\") && !file.includes("/")) {
-    const extensions = (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
-    const suffixes = /\.[^\\/]+$/.test(file) ? [""] : extensions;
-    resolved = (env.PATH ?? "").split(";").filter(Boolean).flatMap((directory) => suffixes.map((extension) => join(directory, file + extension))).find(existsSync) ?? file;
-  }
-  if (platform === "win32" && /^(?:codex)\.(?:cmd|bat)$/i.test(basename(resolved))) {
-    const script = join(dirname(resolved), "node_modules", "@openai", "codex", "bin", "codex.js");
-    if (existsSync(script)) return { file: process.execPath, args: [script, ...args] };
-  }
-  if (platform === "win32" && /\.(?:cmd|bat)$/i.test(resolved)) return { file: env.ComSpec ?? "cmd.exe", args: ["/d", "/s", "/c", [resolved, ...args].map(cmdQuote).join(" ")] };
-  return { file: resolved, args };
 }
 
 export const CODEX_MIN_VERSION = "0.147.0";
 
 export function resolveCodexCommand(env: NodeJS.ProcessEnv = process.env): string {
   const configured = env.WORKSHOP_CODEX_PATH?.trim();
-  if (!configured) return "codex";
+  if (!configured) {
+    if (process.platform !== "win32") return "codex";
+    for (const directory of (env.Path ?? env.PATH ?? "").split(delimiter).filter(Boolean)) {
+      for (const suffix of [".exe", ".com"]) {
+        const executable = join(directory, `codex${suffix}`);
+        if (existsSync(executable) && statSync(executable).isFile()) return executable;
+      }
+    }
+    const installed = env.LOCALAPPDATA ? join(env.LOCALAPPDATA, "OpenAI", "Codex", "bin") : undefined;
+    if (installed) {
+      try {
+        for (const version of readdirSync(installed, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort().reverse()) {
+          const executable = join(installed, version, "codex.exe");
+          if (existsSync(executable) && statSync(executable).isFile()) return executable;
+        }
+      } catch {
+        // The standard install directory is optional.
+      }
+    }
+    return "codex";
+  }
+  if (process.platform === "win32" && /\.(?:cmd|bat)$/i.test(configured)) throw new Error("WORKSHOP_CODEX_PATH does not support .cmd or .bat command shims");
   if (!isAbsolute(configured) || !existsSync(configured) || !statSync(configured).isFile()) throw new Error("WORKSHOP_CODEX_PATH must name an existing absolute executable path");
   return configured;
 }
@@ -608,9 +612,7 @@ function remaining(deadline: number): number {
   return timeout;
 }
 
-function cmdQuote(value: string): string { return `"${value.replaceAll('\"', '\"\"')}"`; }
-
-async function terminateProcessTree(child: ChildProcessWithoutNullStreams): Promise<void> {
+export async function terminateProcessTree(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   if (process.platform === "win32" && child.pid) {
     await runFile("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true }).catch(() => { child.kill("SIGKILL"); });
@@ -621,7 +623,7 @@ async function terminateProcessTree(child: ChildProcessWithoutNullStreams): Prom
   await waitForExit(child, 1_000);
 }
 
-async function waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
+export async function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
   if (child.exitCode !== null || child.signalCode !== null) return true;
   let timer: NodeJS.Timeout | undefined;
   try {

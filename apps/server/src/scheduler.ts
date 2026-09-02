@@ -12,7 +12,7 @@ import { notify } from "./notifications.ts";
 import { REVISION_INTERACTIONS, beginPlanRevision, createRevisionCard, parseRevisionProposal, publishRevisionConfirmation, revisionForRun, saveRevisionProposal, type RevisionProposal, type RevisionQuestion } from "./plan-revisions.ts";
 import type { CommandRunner, VcsInfo } from "./projects.ts";
 import { updateCommissionAcceptance } from "./tasks.ts";
-import { captureWorkspaceSnapshot, diffWorkspaceSnapshots, latestCommissionHashes, trackNewGitFiles, type WorkspaceSnapshot } from "./workspace-changes.ts";
+import { captureWorkspacePatch, captureWorkspaceSnapshot, diffWorkspaceSnapshots, latestCommissionHashes, trackNewGitFiles, type WorkspaceSnapshot } from "./workspace-changes.ts";
 
 const runFile = promisify(execFile);
 const ACTIVE_RUN_STATUSES = ["preparing", "running", "waiting_approval", "waiting_input"] as const;
@@ -1026,7 +1026,10 @@ async function recordRunDiffEvidence(database: DatabaseSync, runner: CommandRunn
     unownedPaths: after.changes.map(({ path }) => path)
   };
   const safe = Boolean(baseline) && diff.unownedPaths.length === 0 && diff.changes.every((change) => change.safe);
-  const payload = { version: 1, commissionId: run.commission_id, sourceRunId: run.id, workspaceMode, vcs, changes: diff.changes, unownedPaths: diff.unownedPaths, ...(!baseline && { baselineMissing: true }) };
+  const structuredPatch = database.prepare(`SELECT 1 FROM run_events
+    WHERE run_id = ? AND event_type = 'codex.event' AND json_extract(payload_json, '$.sourceType') = 'turn/diff/updated' LIMIT 1`).get(run.id);
+  const patch = structuredPatch ? undefined : await captureWorkspacePatch(cwd, vcs, runner);
+  const payload = { version: 1, commissionId: run.commission_id, sourceRunId: run.id, workspaceMode, vcs, changes: diff.changes, unownedPaths: diff.unownedPaths, ...(patch ? { patch } : {}), ...(!baseline && { baselineMissing: true }) };
   database.prepare("INSERT INTO evidence (id, task_id, run_id, criterion_key, type, status, summary, payload_json, created_at) VALUES (?, ?, ?, '*', 'diff', ?, ?, ?, ?)")
     .run(randomUUID(), run.task_id, run.id, safe ? "passed" : "failed", safe ? `Recorded ${diff.changes.length} attributable path changes` : baseline ? "Workspace contains changes that cannot be safely attributed" : "Workspace baseline is unavailable; current changes cannot be safely attributed", JSON.stringify(payload), new Date().toISOString());
 }

@@ -145,6 +145,9 @@ test("reads one terminal workspace diff per Developer Run", () => {
   ]);
   assert.equal(runDiffFilePatches(JSON.stringify({ patch: "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt" }))[0]?.changeType, "added");
   assert.equal(runDiffFilePatches(JSON.stringify({ patch: "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\n--- a/old.txt\n+++ /dev/null" }))[0]?.changeType, "deleted");
+  assert.deepEqual(runDiffFilePatches(JSON.stringify({ patch: "Index: src/app.cpp\n===================================================================\n--- src/app.cpp (revision 1)\n+++ src/app.cpp (working copy)\n@@ -1 +1 @@\n-old\n+new" })), [
+    { path: "src/app.cpp", changeType: "modified", patch: "Index: src/app.cpp\n===================================================================\n--- src/app.cpp (revision 1)\n+++ src/app.cpp (working copy)\n@@ -1 +1 @@\n-old\n+new" }
+  ]);
   assert.equal(runDiffPatch("invalid"), "");
 });
 

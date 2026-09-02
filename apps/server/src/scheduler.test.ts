@@ -11,6 +11,7 @@ import { openWorkshopDatabase, SettingsStore } from "./database.ts";
 import { answerRevisionCard, beginPlanRevision, saveRevisionProposal } from "./plan-revisions.ts";
 import { coveredTaskIds, createExecutionGrant, parseReviewResult, parseReworkResult, parseSupervisorDecision, ProjectLockManager, recoverInterruptedRuns, registerSchedulerRoutes, RUN_HEALTH_TIMEOUT_FAILURE_CODE, runnableTasks, Scheduler, workspacePlan } from "./scheduler.ts";
 import { registerTaskRoutes } from "./tasks.ts";
+import { WORKSHOP_VERSION } from "./version.ts";
 
 const runFile = promisify(execFile);
 const unavailableBackend = () => Object.assign(new Error("Agent backend is unavailable"), { statusCode: 503 });
@@ -37,7 +38,7 @@ test("task trigger creates the right grant and promotes only its authorized clos
     assert.equal(response.json().grant.scope, "target_closure");
     assert.deepEqual(statuses(fixture.database, [dependency, target, sibling]), ["in_progress", "todo", "backlog"]);
     assert.equal(started.length, 1);
-    assert.deepEqual(JSON.parse((fixture.database.prepare("SELECT config_snapshot_json FROM runs WHERE id = ?").get(started[0]!) as { config_snapshot_json: string }).config_snapshot_json), { prompt: "", model: "configured-model", reasoningEffort: "high", sandboxMode: "workspace-write", approvalPolicy: "on-request", networkAccess: true, agentBackend: "codex", pluginVersion: "0.3.17", backendOptions: { customArgs: ["--enable", "example"] } });
+    assert.deepEqual(JSON.parse((fixture.database.prepare("SELECT config_snapshot_json FROM runs WHERE id = ?").get(started[0]!) as { config_snapshot_json: string }).config_snapshot_json), { prompt: "", model: "configured-model", reasoningEffort: "high", sandboxMode: "workspace-write", approvalPolicy: "on-request", networkAccess: true, agentBackend: "codex", pluginVersion: WORKSHOP_VERSION, backendOptions: { customArgs: ["--enable", "example"] } });
     assert.equal((fixture.database.prepare("SELECT COUNT(*) AS count FROM runs").get() as { count: number }).count, 1);
     assert.equal((await server.inject({ method: "GET", url: `/api/tasks/${dependency}` })).json().latestRunStatus, "running");
     assert.equal((await server.inject({ method: "POST", url: `/api/tasks/${target}/trigger` })).statusCode, 409);
@@ -822,7 +823,7 @@ test("re-execution reconciles with a read-only supervisor before choosing the ne
     const supervisor = triggered.runIds[0]!;
     const supervisorRun = fixture.database.prepare("SELECT role, trigger_type, trigger_ref_id, config_snapshot_json FROM runs WHERE id = ?").get(supervisor) as { role: string; trigger_type: string; trigger_ref_id: string; config_snapshot_json: string };
     assert.deepEqual([supervisorRun.role, supervisorRun.trigger_type, supervisorRun.trigger_ref_id], ["supervisor", "reconcile", failedReviewer]);
-    assert.deepEqual(JSON.parse(supervisorRun.config_snapshot_json), { prompt: "", model: null, reasoningEffort: null, sandboxMode: "read-only", approvalPolicy: "never", networkAccess: false, agentBackend: "codex", pluginVersion: "0.3.17", backendOptions: { customArgs: [] } });
+    assert.deepEqual(JSON.parse(supervisorRun.config_snapshot_json), { prompt: "", model: null, reasoningEffort: null, sandboxMode: "read-only", approvalPolicy: "never", networkAccess: false, agentBackend: "codex", pluginVersion: WORKSHOP_VERSION, backendOptions: { customArgs: [] } });
 
     fixture.database.prepare("INSERT INTO run_events (run_id, event_type, summary, payload_json, redacted, created_at) VALUES (?, 'agent.message.delta', 'decision', ?, 0, ?)")
       .run(supervisor, JSON.stringify({ delta: '{"action":"resume_reviewer","summary":"The review process was interrupted by infrastructure shutdown."}' }), new Date().toISOString());
@@ -1594,11 +1595,12 @@ test("Git development changes reach reviewer and project root before worktree cl
     const triggered = await scheduler.trigger(task);
     await scheduler.terminal(triggered.runIds[0]!);
     const developerDiff = fixture.database.prepare("SELECT payload_json FROM evidence WHERE run_id = ? AND type = 'diff'").get(triggered.runIds[0]!) as { payload_json: string };
-    const developerPayload = JSON.parse(developerDiff.payload_json) as { sourceRunId: string; commissionId: string; changes: Array<{ path: string; baselineHash: string | null; hash: string | null; safe: boolean }> };
+    const developerPayload = JSON.parse(developerDiff.payload_json) as { sourceRunId: string; commissionId: string; patch?: string; changes: Array<{ path: string; baselineHash: string | null; hash: string | null; safe: boolean }> };
     assert.equal(developerPayload.sourceRunId, triggered.runIds[0]);
     assert.equal(developerPayload.commissionId, (fixture.database.prepare("SELECT commission_id FROM tasks WHERE id = ?").get(task) as { commission_id: string }).commission_id);
     assert.deepEqual(developerPayload.changes.map(({ path, baselineHash, safe }) => [path, baselineHash, safe]), [["src/feature.txt", null, true]]);
     assert.match(developerPayload.changes[0]!.hash!, /^[a-f0-9]{64}$/);
+    assert.match(developerPayload.patch ?? "", /src\/feature\.txt/);
     assert.equal(reviewerSawChange, true);
     assert.equal(starts[0]!.cwd, starts[1]!.cwd);
     await scheduler.terminal(starts[1]!.id);

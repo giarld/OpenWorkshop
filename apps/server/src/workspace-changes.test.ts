@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { openWorkshopDatabase } from "./database.ts";
-import { captureWorkspaceSnapshot, commissionAttributionSnapshot, diffWorkspaceSnapshots, trackNewGitFiles } from "./workspace-changes.ts";
+import { captureWorkspacePatch, captureWorkspaceSnapshot, commissionAttributionSnapshot, diffWorkspaceSnapshots, trackNewGitFiles } from "./workspace-changes.ts";
 
 const command = promisify(execFile);
 
@@ -180,10 +180,19 @@ test("SVN snapshots record exclusive-workspace deltas conservatively", async () 
     await writeFile(join(workingCopy, "base.txt"), "Run touched user file\n");
     await writeFile(join(workingCopy, "feature.txt"), "Run change\n");
     const diff = diffWorkspaceSnapshots(baseline, await captureWorkspaceSnapshot(workingCopy, "svn", run), new Map());
+    const patch = await captureWorkspacePatch(workingCopy, "svn", run);
     assert.deepEqual(diff.unownedPaths, ["base.txt"]);
     assert.equal(diff.changes.find(({ path }) => path === "base.txt")?.safe, false);
     assert.equal(diff.changes.find(({ path }) => path === "feature.txt")?.safe, true);
+    assert.match(patch ?? "", /base\.txt/);
   } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("SVN workspace patch falls back when --git is unavailable", async () => {
+  const calls: string[][] = [];
+  const patch = await captureWorkspacePatch("project", "svn", async (_file, args) => { calls.push(args); if (args.includes("--git")) throw new Error("unsupported"); return "plain svn diff"; });
+  assert.deepEqual(calls, [["diff", "--git"], ["diff"]]);
+  assert.equal(patch, "plain svn diff");
 });
 
 test("Git snapshots keep existing untracked directories opaque and intent-track only new paths", async () => {

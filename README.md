@@ -115,7 +115,7 @@ Each review reads the acceptance criteria, current requirement version, developm
 
 - macOS or Windows
 - Node.js 24+
-- Codex CLI installed and signed in
+- Codex CLI or Claude Code CLI installed and signed in
 - Optional: Git or SVN for project detection and isolation
 
 ### Install and Start
@@ -170,7 +170,7 @@ workshop agent backends --output json
 workshop agent health --output json
 ```
 
-OpenWorkshop uses `codex` from the service `PATH` by default. Set `WORKSHOP_CODEX_PATH` to an absolute executable path to pin the Codex runtime; an invalid configured path makes the backend unavailable and does not fall back to `PATH`.
+OpenWorkshop uses `codex` and `claude` from the service `PATH` by default. Set `WORKSHOP_CODEX_PATH` or `WORKSHOP_CLAUDE_CODE_PATH` to an absolute executable path to pin a runtime; an invalid configured path makes that backend unavailable and does not fall back to `PATH`. Select `Claude Code` in an Agent preset to run its headless JSONL interface; approvals, steering, and structured file events are not currently exposed.
 
 Create a request and advance its requirements:
 
@@ -287,7 +287,7 @@ Set a remote service with `--server-url` or `WORKSHOP_SERVER_URL`. The CLI binds
 | `workshop log [-n 100]` | Print the latest lines from the service log |
 | `workshop restart` | Gracefully restart the service |
 | `workshop stop` | Gracefully stop the service |
-| `workshop doctor` | Check the database, project roots, Git, Codex, and port; missing Git is a warning, and the current OpenWorkshop listener is accepted |
+| `workshop doctor` | Check the database, project roots, Git, Agent backends, and port; missing Git or an unavailable optional backend is a warning when another backend is healthy, and the current OpenWorkshop listener is accepted |
 | `workshop preflight [--server-url URL] [--output json]` | Check service, authentication, project-root, and Agent capabilities before workflow calls |
 | `workshop backup [path]` | Back up the SQLite database |
 | `workshop restore <path>` | Restore the database after backing up the current database |
@@ -300,7 +300,7 @@ Override the application data directory with `WORKSHOP_HOME`. By default it cont
 
 OpenWorkshop is currently an MVP for a single personal user on a trusted local network:
 
-- Only Codex CLI is supported; third-party Agent runtimes are not configurable.
+- Codex CLI and Claude Code are supported as built-in backends; dynamic third-party Agent runtimes are not configurable.
 - Existing local directories are connected; OpenWorkshop does not clone remote repositories.
 - Git commits, pushes, pull requests, and SVN commits are never performed automatically.
 - The web UI targets desktop browsers and is currently available in Simplified Chinese.

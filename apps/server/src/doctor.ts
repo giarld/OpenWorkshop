@@ -1,4 +1,5 @@
 import { createServer } from "node:net";
+import type { AgentBackendHealth } from "./agent.ts";
 
 export type DoctorResult = { name: string; ok: boolean; detail?: string; warning?: boolean };
 type WorkshopPortState = { port: number };
@@ -9,6 +10,11 @@ export function doctorLabel(result: DoctorResult): "OK" | "WARN" | "FAIL" {
 
 export function doctorFailed(results: DoctorResult[]): boolean {
   return results.some((result) => !result.ok && !result.warning);
+}
+
+export function agentDoctorResults(agents: readonly AgentBackendHealth[]): DoctorResult[] {
+  const anyAgentOk = agents.some((agent) => agent.ok);
+  return agents.map((agent) => ({ name: `agent ${agent.id}`, ok: agent.ok, ...(agent.runtimeVersion ?? agent.error ? { detail: agent.runtimeVersion ?? agent.error } : {}), ...(!agent.ok && anyAgentOk ? { warning: true } : {}) }));
 }
 
 export async function checkPort(host: string, port: number, workshop?: WorkshopPortState): Promise<void> {

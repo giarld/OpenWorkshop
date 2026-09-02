@@ -10,10 +10,11 @@ import { createServer } from "./app.js";
 import { AgentRegistry } from "./agent.js";
 import { setPin } from "./auth.js";
 import { createCodexPlugin } from "./codex.js";
+import { createClaudeCodePlugin } from "./claude.js";
 import { backupDatabase, openWorkshopDatabase, restoreDatabase, SettingsStore } from "./database.js";
-import { checkPort, doctorFailed, doctorLabel, type DoctorResult } from "./doctor.js";
+import { agentDoctorResults, checkPort, doctorFailed, doctorLabel, type DoctorResult } from "./doctor.js";
 import { pruneRawRunEvents } from "./runs.js";
-import { buildPreflightResult, isAgentHealthResponse, sameServerOrigin, type PreflightCheck, type PreflightCheckName } from "./preflight.js";
+import { activeAgentPreflightCheck, buildPreflightResult, sameServerOrigin, type PreflightCheck, type PreflightCheckName } from "./preflight.js";
 import { startSystemNotificationWorker } from "./notifications.js";
 import { acquireInstanceLock, clearRuntimeState, consumeRuntimeStop, prepareWorkshopHome, pruneLogFiles, readLatestLog, readRuntimeState, requestRuntimeStop, writeRuntimeState, type RuntimeState } from "./platform.js";
 import { browserCommand, ensureBackgroundService, startBackgroundService, waitForServiceStop } from "./service-control.js";
@@ -334,7 +335,7 @@ function printResult(data: unknown, output: string, text = false): void {
 }
 
 function help(): string {
-  return `OpenWorkshop ${WORKSHOP_VERSION}\n\nService commands:\n  start [--foreground] [--host HOST] [--port PORT]\n  stop, restart, status, gui, log [-n LINES], doctor, preflight, backup, restore, pin, update, version\n\nAgent integration:\n  skill install [--agent codex] [--force]\n  agent backends|health [--output json]\n\nAuthentication:\n  auth status|initialize|login|logout\n  login (alias for auth login)\n\n${workflowHelp()}\n\nEnvironment:\n  WORKSHOP_HOME, WORKSHOP_SERVER_URL, WORKSHOP_CODEX_PATH`;
+  return `OpenWorkshop ${WORKSHOP_VERSION}\n\nService commands:\n  start [--foreground] [--host HOST] [--port PORT]\n  stop, restart, status, gui, log [-n LINES], doctor, preflight, backup, restore, pin, update, version\n\nAgent integration:\n  skill install [--agent codex] [--force]\n  agent backends|health [--output json]\n\nAuthentication:\n  auth status|initialize|login|logout\n  login (alias for auth login)\n\n${workflowHelp()}\n\nEnvironment:\n  WORKSHOP_HOME, WORKSHOP_SERVER_URL, WORKSHOP_CODEX_PATH, WORKSHOP_CLAUDE_CODE_PATH`;
 }
 
 async function preflight(home: string, serverUrl?: string) {
@@ -375,14 +376,11 @@ async function preflight(home: string, serverUrl?: string) {
   }
 
   try {
-    const result = await apiRequest(home, { method: "GET", path: "/api/agents/health", query: {}, output: "json", ...(serverUrl ? { serverUrl } : {}) });
-    if (!isAgentHealthResponse(result.data)) {
-      checks.agent = { status: "unavailable", detail: "Agent 健康检查未返回有效后端列表" };
-    } else {
-      const agents = result.data;
-      const failed = agents.filter((agent) => agent.ok !== true);
-      checks.agent = failed.length ? { status: "unavailable", detail: failed.map((agent) => String(agent.id ?? "agent") + ": " + String(agent.error ?? "unavailable")).join("; ") } : { status: "ok" };
-    }
+    const [active, backends] = await Promise.all([
+      apiRequest(home, { method: "GET", path: "/api/agents/presets", query: {}, output: "json", ...(serverUrl ? { serverUrl } : {}) }),
+      apiRequest(home, { method: "GET", path: "/api/agents/health", query: {}, output: "json", ...(serverUrl ? { serverUrl } : {}) }).then((result) => result.data).catch(() => undefined)
+    ]);
+    checks.agent = activeAgentPreflightCheck(active.data, backends);
   } catch (error) {
     checks.agent = { status: "unavailable", detail: preflightError(error) };
   }
@@ -416,8 +414,8 @@ async function doctor(home: string, host: string, port: number): Promise<DoctorR
     database?.close();
   }
   results.push(await check("git", async () => void await runFile("git", ["--version"], { windowsHide: true }), true));
-  const agents = await new AgentRegistry([createCodexPlugin()]).healthAll();
-  results.push(...agents.map((agent) => ({ name: `agent ${agent.id}`, ok: agent.ok, ...(agent.runtimeVersion ?? agent.error ? { detail: agent.runtimeVersion ?? agent.error } : {}) })));
+  const agents = await new AgentRegistry([createCodexPlugin(), createClaudeCodePlugin()]).healthAll();
+  results.push(...agentDoctorResults(agents));
   results.push(await check(`port ${host}:${port}`, async () => checkPort(host, port, await readRuntimeState(home))));
   return results;
 }

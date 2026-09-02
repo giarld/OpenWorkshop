@@ -12,6 +12,14 @@ export function isAgentHealthResponse(value: unknown): value is Array<{ id?: unk
   return Array.isArray(value) && value.length > 0 && value.every((item) => item !== null && typeof item === "object" && !Array.isArray(item));
 }
 
+export function activeAgentPreflightCheck(value: unknown, backends?: unknown): PreflightCheck {
+  if (!value || typeof value !== "object" || !("health" in value) || !value.health || typeof value.health !== "object") return { status: "unavailable", detail: "Agent 预设未返回有效的激活后端健康状态" };
+  const health = value.health as { id?: unknown; ok?: unknown; error?: unknown };
+  if (health.ok !== true) return { status: "unavailable", detail: String(health.id ?? "agent") + ": " + String(health.error ?? "unavailable") };
+  const warnings = isAgentHealthResponse(backends) ? backends.filter((backend) => backend.id !== health.id && backend.ok !== true) : [];
+  return warnings.length ? { status: "ok", detail: "可选后端不可用: " + warnings.map((backend) => String(backend.id ?? "agent") + ": " + String(backend.error ?? "unavailable")).join("; ") } : { status: "ok" };
+}
+
 export function buildPreflightResult(checks: Record<PreflightCheckName, PreflightCheck>): PreflightResult {
   const readOnly = checks.service.status === "ok" && checks.auth.status === "ok";
   const project = readOnly && checks.projectRoots.status === "ok";

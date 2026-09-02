@@ -220,7 +220,8 @@ function gitDiffPath(value: string, stripSidePrefix = true): string {
 }
 
 export function runDiffFilePatches(payloadJson: string): RunDiffFilePatch[] {
-  return runDiffPatch(payloadJson).split(/(?=^diff --git )/m).flatMap((patch) => {
+  const raw = runDiffPatch(payloadJson);
+  const gitPatches = raw.split(/(?=^diff --git )/m).flatMap((patch) => {
     if (!patch.startsWith("diff --git ")) return [];
     const changeType = /^new file mode /m.test(patch) ? "added"
       : /^deleted file mode /m.test(patch) ? "deleted"
@@ -234,6 +235,13 @@ export function runDiffFilePatches(payloadJson: string): RunDiffFilePatch[] {
       patch.match(/^diff --git .+ ("?b\/.+)$/m)?.[1]
     ].map((value, index) => value ? gitDiffPath(value, index !== 1) : "").find(Boolean);
     return path ? [{ path, patch: patch.trimEnd(), changeType }] : [];
+  });
+  if (gitPatches.length) return gitPatches;
+  return raw.split(/(?=^Index: )/m).flatMap((patch) => {
+    const path = patch.match(/^Index: (.+)$/m)?.[1]?.trim();
+    if (!path) return [];
+    const changeType = /^--- .+\(nonexistent\)$/m.test(patch) ? "added" : /^\+\+\+ .+\(nonexistent\)$/m.test(patch) ? "deleted" : "modified";
+    return [{ path, patch: patch.trimEnd(), changeType }];
   });
 }
 

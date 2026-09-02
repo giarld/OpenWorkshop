@@ -19,8 +19,10 @@ type AgentRole = "supervisor" | "developer" | "reviewer";
 type AgentRolePresetConfig = { model: string | null; reasoningEffort: string | null; backendOptions: { customArgs?: string[]; [key: string]: unknown } };
 type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 type ApprovalPolicy = "untrusted" | "on-request" | "never";
-type AgentPreset = { id: string; name: string; agentBackend: "codex"; model: string | null; reasoningEffort: string | null; backendOptions: AgentRolePresetConfig["backendOptions"]; roleConfigs: Record<AgentRole, AgentRolePresetConfig>; sandboxMode: SandboxMode; approvalPolicy: ApprovalPolicy; networkAccess: boolean; isDefault: boolean };
-type AgentSettings = { health: { ok: boolean; runtimeVersion?: string; capabilities: { ok: boolean; models: CodexModel[]; reasoningEfforts: string[]; error?: string }; error?: string }; activePresetId: string; presets: AgentPreset[] };
+type AgentBackend = { id: string; displayName: string };
+type AgentPreset = { id: string; name: string; agentBackend: string; model: string | null; reasoningEffort: string | null; backendOptions: AgentRolePresetConfig["backendOptions"]; roleConfigs: Record<AgentRole, AgentRolePresetConfig>; sandboxMode: SandboxMode; approvalPolicy: ApprovalPolicy; networkAccess: boolean; isDefault: boolean };
+type AgentHealth = { id: string; ok: boolean; runtimeVersion?: string; capabilities: { ok: boolean; models: CodexModel[]; reasoningEfforts: string[]; error?: string }; error?: string };
+type AgentSettings = { health: AgentHealth; healthByBackend: Record<string, AgentHealth>; activePresetId: string; presets: AgentPreset[]; backends: AgentBackend[] };
 const ROLE_LABELS: Record<AgentRole, string> = { supervisor: "项目主管 Agent", developer: "执行 Agent", reviewer: "审查 Agent" };
 const ROLE_DESCRIPTIONS: Record<AgentRole, string> = { supervisor: "负责需求澄清、任务规划与执行调度协调。", developer: "负责实现任务与处理返工。", reviewer: "负责独立验证任务结果。" };
 const COLOR_THEME_OPTIONS: Array<{ value: ColorTheme; label: string }> = [
@@ -69,9 +71,11 @@ export function SettingsWorkspace({ onLogout, onPinChanged }: { onLogout(): void
   }, []);
 
   useEffect(() => {
-    const refresh = () => void fetch("/api/agents/presets").then(async (response) => {
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      setAgentSettings(await response.json() as AgentSettings);
+    const refresh = () => void Promise.all([fetch("/api/agents/presets"), fetch("/api/agents/backends"), fetch("/api/agents/health")]).then(async ([response, backendsResponse, healthResponse]) => {
+      if (!response.ok || !backendsResponse.ok || !healthResponse.ok) throw new Error(`HTTP ${response.status}`);
+      const presetSettings = await response.json() as Omit<AgentSettings, "backends" | "healthByBackend">;
+      const health = await healthResponse.json() as AgentHealth[];
+      setAgentSettings({ ...presetSettings, backends: await backendsResponse.json() as AgentBackend[], healthByBackend: Object.fromEntries(health.map((item) => [item.id, item])) });
     }).catch((error: Error) => setAgentMessage(`加载 Agent 设置失败：${error.message}`));
     refresh();
     window.addEventListener("agent-preset-changed", refresh);
@@ -164,9 +168,9 @@ export function SettingsWorkspace({ onLogout, onPinChanged }: { onLogout(): void
       </form>
 
       <section className="settings-group" aria-labelledby="agent-settings-title">
-        <header><p className="settings-level">Agent 级</p><h3 id="agent-settings-title">Agent 预设</h3><p>创建多个独立的 Agent 执行配置，并选择当前用于新 Run 的预设。</p>{agentSettings?.health.runtimeVersion && <p>当前版本：{agentSettings.health.runtimeVersion}</p>}{agentSettings && !agentSettings.health.ok && <aside>Codex 当前不可用：{agentSettings.health.error}</aside>}</header>
+        <header><p className="settings-level">Agent 级</p><h3 id="agent-settings-title">Agent 预设</h3><p>创建多个独立的 Agent 执行配置，并选择当前用于新 Run 的预设。</p>{agentSettings?.health.runtimeVersion && <p>当前版本：{agentSettings.health.runtimeVersion}</p>}{agentSettings && !agentSettings.health.ok && <aside>{agentSettings.backends.find((backend) => backend.id === agentSettings.presets.find((preset) => preset.id === agentSettings.activePresetId)?.agentBackend)?.displayName ?? "Agent"} 当前不可用：{agentSettings.health.error}</aside>}</header>
         <div className="agent-settings-editor">
-          {!agentSettings ? <section className="agent-preset-manager" aria-label="Agent 预设"><p>{agentMessage || "正在读取本机 Codex 模型…"}</p></section> : <AgentPresetManager key={agentSettings.activePresetId} settings={agentSettings} busy={busy} onRefresh={async () => { const response = await fetch("/api/agents/presets"); if (!response.ok) throw new Error("加载预设失败"); setAgentSettings(await response.json() as AgentSettings); }} />}
+          {!agentSettings ? <section className="agent-preset-manager" aria-label="Agent 预设"><p>{agentMessage || "正在读取本机 Agent 设置…"}</p></section> : <AgentPresetManager key={agentSettings.activePresetId} settings={agentSettings} busy={busy} onRefresh={async () => { const [response, backendsResponse, healthResponse] = await Promise.all([fetch("/api/agents/presets"), fetch("/api/agents/backends"), fetch("/api/agents/health")]); if (!response.ok || !backendsResponse.ok || !healthResponse.ok) throw new Error("加载预设失败"); const presetSettings = await response.json() as Omit<AgentSettings, "backends" | "healthByBackend">; const health = await healthResponse.json() as AgentHealth[]; setAgentSettings({ ...presetSettings, backends: await backendsResponse.json() as AgentBackend[], healthByBackend: Object.fromEntries(health.map((item) => [item.id, item])) }); }} />}
           {agentMessage && <p className="workspace-message" role="status">{agentMessage}</p>}
         </div>
       </section>
@@ -244,6 +248,9 @@ function ReasoningEffortPicker({ value, defaultValue, values, capabilitiesOk, on
 function AgentPresetManager({ settings, busy, onRefresh }: { settings: AgentSettings; busy: boolean; onRefresh(): Promise<void> }) {
   const active = settings.presets.find((item) => item.id === settings.activePresetId) ?? settings.presets[0]!;
   const [selectedId, setSelectedId] = useState(active.id);
+  const [agentBackend, setAgentBackend] = useState(active.agentBackend);
+  const backendHealth = settings.healthByBackend[agentBackend] ?? settings.health;
+  const isClaudeCode = agentBackend === "claude-code";
   const [role, setRole] = useState<AgentRole>("supervisor");
   const [roleDrafts, setRoleDrafts] = useState<Record<AgentRole, AgentRolePresetConfig>>(() => active.roleConfigs);
   const [error, setError] = useState("");
@@ -255,9 +262,9 @@ function AgentPresetManager({ settings, busy, onRefresh }: { settings: AgentSett
   const [sandboxMode, setSandboxMode] = useState(active.sandboxMode);
   const [approvalPolicy, setApprovalPolicy] = useState(active.approvalPolicy);
   const [networkAccess, setNetworkAccess] = useState(active.networkAccess);
-  const models = settings.health.capabilities.models;
+  const models = backendHealth.capabilities.models;
   const selectedModel = model ? models.find((item) => item.id === model) : models.find((item) => item.isDefault);
-  const efforts = selectedModel ? reasoningValues(selectedModel) : settings.health.capabilities.reasoningEfforts;
+  const efforts = selectedModel ? reasoningValues(selectedModel) : backendHealth.capabilities.reasoningEfforts;
   const unavailableModel = Boolean(model && !models.some((item) => item.id === model));
   const unavailableEffort = Boolean(reasoningEffort && !efforts.includes(reasoningEffort));
 
@@ -272,7 +279,7 @@ function AgentPresetManager({ settings, busy, onRefresh }: { settings: AgentSett
   function load(id: string) {
     const preset = settings.presets.find((item) => item.id === id) ?? active;
     const config = preset.roleConfigs[role];
-    setSelectedId(preset.id); setRoleDrafts(preset.roleConfigs); setName(preset.name); loadRoleFields(config); setSandboxMode(preset.sandboxMode); setApprovalPolicy(preset.approvalPolicy); setNetworkAccess(preset.networkAccess);
+    setSelectedId(preset.id); setAgentBackend(preset.agentBackend); setRoleDrafts(preset.roleConfigs); setName(preset.name); loadRoleFields(config); setSandboxMode(preset.sandboxMode); setApprovalPolicy(preset.approvalPolicy); setNetworkAccess(preset.networkAccess);
   }
 
   function loadRole(nextRole: AgentRole) {
@@ -302,16 +309,16 @@ function AgentPresetManager({ settings, busy, onRefresh }: { settings: AgentSett
     const roleConfigs = { ...roleDrafts, [role]: roleConfig };
     const primary = roleConfigs.supervisor;
     setRoleDrafts(roleConfigs);
-    await request("/api/agents/presets/" + selectedId, "PUT", { name, agentBackend: "codex", model: primary.model, reasoningEffort: primary.reasoningEffort, backendOptions: primary.backendOptions, roleConfigs, sandboxMode, approvalPolicy, networkAccess });
+    await request("/api/agents/presets/" + selectedId, "PUT", { name, agentBackend, model: primary.model, reasoningEffort: primary.reasoningEffort, backendOptions: primary.backendOptions, roleConfigs, sandboxMode, approvalPolicy, networkAccess });
   }
 
   async function create() {
     const roleConfig = currentRoleDraft();
     const roleConfigs = { ...roleDrafts, [role]: roleConfig };
     const primary = roleConfigs.supervisor;
-    const created = await request("/api/agents/presets", "POST", { name: "新预设", agentBackend: "codex", model: primary.model, reasoningEffort: primary.reasoningEffort, backendOptions: primary.backendOptions, roleConfigs, sandboxMode, approvalPolicy, networkAccess }) as AgentPreset;
+    const created = await request("/api/agents/presets", "POST", { name: "新预设", agentBackend, model: primary.model, reasoningEffort: primary.reasoningEffort, backendOptions: primary.backendOptions, roleConfigs, sandboxMode, approvalPolicy, networkAccess }) as AgentPreset;
     const createdRoleConfig = created.roleConfigs[role];
-    setSelectedId(created.id); setRoleDrafts(created.roleConfigs); setName(created.name); loadRoleFields(createdRoleConfig); setSandboxMode(created.sandboxMode); setApprovalPolicy(created.approvalPolicy); setNetworkAccess(created.networkAccess);
+    setSelectedId(created.id); setAgentBackend(created.agentBackend); setRoleDrafts(created.roleConfigs); setName(created.name); loadRoleFields(createdRoleConfig); setSandboxMode(created.sandboxMode); setApprovalPolicy(created.approvalPolicy); setNetworkAccess(created.networkAccess);
   }
 
   async function remove() {
@@ -327,14 +334,13 @@ function AgentPresetManager({ settings, busy, onRefresh }: { settings: AgentSett
     <div className="preset-toolbar"><select value={selectedId} onChange={(event) => load(event.target.value)} aria-label="选择 Agent 预设">{settings.presets.map((item) => <option key={item.id} value={item.id}>{item.name}{item.id === settings.activePresetId ? "（当前）" : ""}</option>)}</select><button type="button" className="secondary" disabled={busy} onClick={() => void run(create, "预设已创建。")}>新建预设</button><button type="button" className="danger" disabled={busy || settings.presets.length === 1 || settings.presets.find((item) => item.id === selectedId)?.isDefault} onClick={() => void run(remove, "预设已删除。")}>删除预设</button></div>
     <form className="settings-fields agent-settings-fields" onSubmit={(event) => { event.preventDefault(); void run(save, "预设已保存。"); }}>
       <label>预设名称<input value={name} maxLength={80} onChange={(event) => setName(event.target.value)} required /></label>
-      <label>Agent 后端<select value="codex" disabled><option value="codex">Codex</option></select><small>当前仅支持 Codex。</small></label>
+      <label>Agent 后端<select value={agentBackend} onChange={(event) => { const next = event.target.value; const roleDefaults = { model: next === "claude-code" ? "sonnet" : null, reasoningEffort: null, backendOptions: { customArgs: [] } }; setAgentBackend(next); setRoleDrafts({ supervisor: roleDefaults, developer: roleDefaults, reviewer: roleDefaults }); setModel(roleDefaults.model ?? ""); setReasoningEffort(""); setCustomArgs(""); if (next === "claude-code") setNetworkAccess(true); }}>{settings.backends.map((backend) => <option key={backend.id} value={backend.id}>{backend.displayName}</option>)}</select><small>选择用于新 Run 的内置 Agent 后端。</small></label>
       <label>Agent 角色<select value={role} onChange={(event) => loadRole(event.target.value as AgentRole)}>{Object.entries(ROLE_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><small>{ROLE_DESCRIPTIONS[role]}</small></label>
-      <label className="agent-model-field">模型<ModelPicker value={model} models={models} capabilitiesOk={settings.health.capabilities.ok} onChange={(value) => { setModel(value); setReasoningEffort(""); }} onRetry={onRefresh} />{unavailableModel && settings.health.capabilities.ok && <small>自定义或当前不可发现</small>}</label>
-      <label>思考强度<ReasoningEffortPicker value={reasoningEffort} defaultValue={selectedModel?.defaultReasoningEffort} values={efforts} capabilitiesOk={settings.health.capabilities.ok} onChange={setReasoningEffort} onRetry={onRefresh} />{unavailableEffort && settings.health.capabilities.ok && <small>当前不可发现</small>}</label>
-      <label className="agent-custom-args">Codex 额外参数<textarea value={customArgs} onChange={(event) => setCustomArgs(event.target.value)} rows={4} placeholder={"--enable\nfeature_name"} /><small>每行一个参数；安全边界使用上方专用字段。</small></label>
-      <label>沙箱<select value={sandboxMode} onChange={(event) => setSandboxMode(event.target.value as SandboxMode)}><option value="read-only">read-only</option><option value="workspace-write">workspace-write</option><option value="danger-full-access">danger-full-access</option></select></label>
-      <label>审批策略<select value={approvalPolicy} onChange={(event) => setApprovalPolicy(event.target.value as ApprovalPolicy)}><option value="untrusted">untrusted</option><option value="on-request">on-request</option><option value="never">never</option></select></label>
-      <label className="agent-network-setting"><span><input type="checkbox" checked={networkAccess} disabled={sandboxMode !== "workspace-write"} onChange={(event) => setNetworkAccess(event.target.checked)} />允许工作区网络访问</span></label>
+      <label className="agent-model-field">模型<ModelPicker value={model} models={models} capabilitiesOk={backendHealth.capabilities.ok} onChange={(value) => { setModel(value); setReasoningEffort(""); }} onRetry={onRefresh} />{unavailableModel && backendHealth.capabilities.ok && <small>自定义或当前不可发现</small>}</label>
+      <label>思考强度<ReasoningEffortPicker value={reasoningEffort} defaultValue={selectedModel?.defaultReasoningEffort} values={efforts} capabilitiesOk={backendHealth.capabilities.ok} onChange={setReasoningEffort} onRetry={onRefresh} />{unavailableEffort && backendHealth.capabilities.ok && <small>当前不可发现</small>}</label>
+      <label className="agent-custom-args">{settings.backends.find((backend) => backend.id === agentBackend)?.displayName ?? "Agent"} 额外参数<textarea value={customArgs} onChange={(event) => setCustomArgs(event.target.value)} rows={4} placeholder={"--enable\nfeature_name"} /><small>每行一个参数；安全边界使用上方专用字段。</small></label>
+      <label>{isClaudeCode ? "权限模式" : "沙箱"}<select value={sandboxMode} onChange={(event) => setSandboxMode(event.target.value as SandboxMode)}>{isClaudeCode ? <><option value="read-only">plan</option><option value="workspace-write">acceptEdits</option><option value="danger-full-access">bypassPermissions</option></> : <><option value="read-only">read-only</option><option value="workspace-write">workspace-write</option><option value="danger-full-access">danger-full-access</option></>}</select></label>
+      {!isClaudeCode && <><label>审批策略<select value={approvalPolicy} onChange={(event) => setApprovalPolicy(event.target.value as ApprovalPolicy)}><option value="untrusted">untrusted</option><option value="on-request">on-request</option><option value="never">never</option></select></label><label className="agent-network-setting"><span><input type="checkbox" checked={networkAccess} disabled={sandboxMode !== "workspace-write"} onChange={(event) => setNetworkAccess(event.target.checked)} />允许工作区网络访问</span></label></>}
       <div className="settings-actions"><p className="workspace-message" role="status">{message}</p><p className="workspace-message" role="alert">{error}</p><button disabled={busy}>保存预设</button>{selectedId !== settings.activePresetId && <button type="button" className="secondary" disabled={busy} onClick={() => void run(() => activate(selectedId), "已切换当前预设。")}>设为当前预设</button>}</div>
     </form>
   </section>;

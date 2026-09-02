@@ -8,6 +8,7 @@ import { refreshAgentHealth, registerAgentSettingsRoutes } from "./agent-setting
 import { agentErrorBody, AgentRegistry } from "./agent.js";
 import { registerAuthentication } from "./auth.js";
 import { createCodexPlugin } from "./codex.js";
+import { createClaudeCodePlugin } from "./claude.js";
 import { registerCommissionRoutes, type RequirementAnalyzer } from "./commissions.js";
 import { recoverCommissionLifecycleOperations } from "./commission-archive.js";
 import { registerDocumentRoutes } from "./documents.ts";
@@ -38,7 +39,7 @@ export async function createServer(database: DatabaseSync, webRoot = DEFAULT_WEB
     const message = redactSensitive(value.message || "Request failed").value;
     reply.code(statusCode).send(agentErrorBody(error, message));
   });
-  const agents = new AgentRegistry([createCodexPlugin()]);
+  const agents = new AgentRegistry([createCodexPlugin(), createClaudeCodePlugin()]);
   registerAuthentication(server, database);
   registerAgentSettingsRoutes(server, database, agents);
   registerProjectRoutes(server, database);

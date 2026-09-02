@@ -131,6 +131,7 @@ test("starts a new Session for each turn when continuation is unsupported", asyn
   await analyze({ ...input, messages: [{ role: "human", content: "second answer" }] });
   assert.deepEqual({ sessions, starts, continues }, { sessions: 2, starts: 2, continues: 0 });
   assert.match(prompts[1]!, /second answer/);
+  assert.match(prompts[1]!, /Do not ask a yes\/no gateway question/);
 });
 
 test("clears the previous idle timer before continuing a cached Session", async (context) => {

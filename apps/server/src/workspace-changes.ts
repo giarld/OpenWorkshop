@@ -25,6 +25,13 @@ export async function captureWorkspaceSnapshot(root: string, vcs: VcsInfo["type"
   return { version: 1, vcs, changes: changes.sort(byPath) };
 }
 
+export async function captureWorkspacePatch(root: string, vcs: VcsInfo["type"], runner: CommandRunner): Promise<string | undefined> {
+  if (vcs === "git") return runner("git", ["diff", "--binary", "HEAD"], root).catch(() => undefined);
+  if (vcs !== "svn") return undefined;
+  try { return await runner("svn", ["diff", "--git"], root); }
+  catch { return runner("svn", ["diff"], root).catch(() => undefined); }
+}
+
 export async function trackNewGitFiles(root: string, baseline: WorkspaceSnapshot, runner: CommandRunner): Promise<void> {
   const known = new Set(baseline.changes.map(({ path }) => path));
   const opaque = baseline.changes.filter((change) => change.kind === "directory" && change.hash === null).map(({ path }) => path);

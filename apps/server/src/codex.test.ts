@@ -14,8 +14,8 @@ import {
   CodexAppServer,
   CodexAppServerClosedError,
   createCodexPlugin,
-  resolveInvocation,
   normalizeCodexEvent,
+  resolveCodexCommand,
   snapshotRoleConfig,
   validateCodexConfig,
   validateCustomArgs,
@@ -293,23 +293,6 @@ test("keeps a slow model timeout and cleanup non-fatal at the registry boundary"
   assert.equal(health.capabilities.ok, false);
 });
 
-test("resolves the global Windows Codex script without going through cmd.exe", async () => {
-  const root = await mkdtemp(join(tmpdir(), "project-workshop-path-"));
-  try {
-    const command = join(root, "codex.cmd");
-    await writeFile(command, "@echo off\r\n");
-    const invocation = resolveInvocation("codex", ["--version"], { PATH: root, PATHEXT: ".CMD;.EXE", ComSpec: "C:\\Windows\\System32\\cmd.exe" }, "win32");
-    assert.equal(invocation.file, "C:\\Windows\\System32\\cmd.exe");
-    assert.match(invocation.args.at(-1) ?? "", /codex\.cmd.*--version/i);
-
-    await mkdir(join(root, "node_modules", "@openai", "codex", "bin"), { recursive: true });
-    const script = join(root, "node_modules", "@openai", "codex", "bin", "codex.js");
-    await writeFile(script, "");
-    assert.deepEqual(resolveInvocation("codex", [], { PATH: root, PATHEXT: ".CMD;.EXE" }, "win32"), { file: process.execPath, args: [script] });
-    assert.deepEqual(resolveInvocation(command, ["app-server"], {}, "win32"), { file: process.execPath, args: [script, "app-server"] });
-  } finally { await rm(root, { recursive: true, force: true }); }
-});
-
 test("merges OpenCodex custom models into Codex capabilities", async () => {
   const health = await checkCodexHealth({
     includeExternalModels: true,
@@ -319,6 +302,34 @@ test("merges OpenCodex custom models into Codex capabilities", async () => {
   });
   assert.equal(health.capabilities.models.some((model) => model.id === "echo/gpt-5.6-sol"), true);
   assert.deepEqual(health.capabilities.models.find((model) => model.id === "echo/gpt-5.6-sol")?.supportedReasoningEfforts, [{ reasoningEffort: "high" }]);
+});
+
+test("rejects an explicit Windows Codex command shim", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "project-workshop-codex-command-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const command = join(root, "codex.cmd");
+  await writeFile(command, "@echo off\r\n");
+  if (process.platform === "win32") assert.throws(() => resolveCodexCommand({ WORKSHOP_CODEX_PATH: command }), /does not support/);
+  else assert.equal(resolveCodexCommand({ WORKSHOP_CODEX_PATH: command }), command);
+});
+
+test("resolves a Windows Codex executable from PATH instead of a command shim", async (context) => {
+  if (process.platform !== "win32") return;
+  const root = await mkdtemp(join(tmpdir(), "project-workshop-codex-path-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const executable = join(root, "codex.exe");
+  await writeFile(executable, "fake");
+  assert.equal(resolveCodexCommand({ PATH: root }), executable);
+});
+
+test("resolves the standard Windows Codex install when the service PATH is stale", async (context) => {
+  if (process.platform !== "win32") return;
+  const root = await mkdtemp(join(tmpdir(), "project-workshop-codex-install-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const executable = join(root, "OpenAI", "Codex", "bin", "version-1", "codex.exe");
+  await mkdir(join(root, "OpenAI", "Codex", "bin", "version-1"), { recursive: true });
+  await writeFile(executable, "fake");
+  assert.equal(resolveCodexCommand({ LOCALAPPDATA: root }), executable);
 });
 
 test("returns after the interrupt RPC is accepted and propagates an RPC rejection", async () => {

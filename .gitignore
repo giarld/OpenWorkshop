@@ -19,13 +19,6 @@ graphify-out/
 coverage/
 .cache/
 
-# Internal project guidance, documentation, and memory
-/AGENTS.md
-/CLAUDE.md
-/.memory/
-/docs/
-/project-*/
-
 # Local configuration
 .env
 .env.*
@@ -36,3 +29,10 @@ coverage/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Internal project files (public release exclusions)
+/AGENTS.md
+/CLAUDE.md
+/.memory/
+/docs/
+/project-*/
