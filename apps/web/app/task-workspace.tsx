@@ -17,6 +17,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { Children, memo, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import webPackage from "../package.json";
+import { applyColorTheme, COLOR_THEME_STORAGE_KEY } from "./theme-settings";
 import { AVATAR_SETTINGS_EVENT, DEFAULT_AVATARS, avatarSettings, isImageAvatar, type AvatarSettings } from "./avatar-settings";
 import { browserNotificationRuntime, notificationHashTarget, notificationHashTargetsOtherProject, notificationNavigation, pushBrowserNotifications, type AppNotification, type NotificationTarget } from "./browser-notifications";
 import { DeliveryWorkspace } from "./delivery-workspace";
@@ -577,12 +578,37 @@ function ProjectManagementDialog({ dialog, project, busy, error, onClose, onSubm
   </dialog>;
 }
 
+const NAV_ICON_PATHS: Record<View, string> = {
+  projects: "M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z",
+  commissions: "M4 5h16v14H4V5Zm0 8h5l2 3h2l2-3h5",
+  requirements: "M14 3H5v18h14V8l-5-5Zm0 0v5h5M8 12h8M8 16h6",
+  board: "M3 4h18v16H3V4Zm6 0v16m6-16v16",
+  delivery: "m3 7 9-4 9 4v10l-9 4-9-4V7Zm0 0 9 4 9-4m-9 4v10M7 5l10 4",
+  notifications: "M5 17h14l-2-3V9a5 5 0 0 0-10 0v5l-2 3Zm5 3h4",
+  usage: "M4 3v18h17M8 16v-5m5 5V7m5 9V4",
+  settings: "M4 7h16M4 17h16M9 4v6m6 4v6"
+};
+
+function WorkspaceNavIcon({ view }: { view: View }) {
+  return <svg className="workspace-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={NAV_ICON_PATHS[view]} /></svg>;
+}
+
 function WorkspaceNav({ view, unreadNotifications, onChange }: { view: View; unreadNotifications: number; onChange(view: View): void }) {
+  function toggleTheme() {
+    const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+    window.localStorage.setItem(COLOR_THEME_STORAGE_KEY, theme);
+    applyColorTheme(theme);
+  }
+
   return <nav className="workspace-nav" aria-label="工作区分页">
     <div className="workspace-brand"><img src="/brand/openworkshop-logo-64.png" width="32" height="32" alt="" aria-hidden="true" /><span className="workspace-brand-title"><strong>OpenWorkshop</strong><small>v{webPackage.version}</small></span></div>
     <p>工作区</p>
-    {PAGES.map((item) => <button key={item.id} className={view === item.id ? "active" : ""} aria-current={view === item.id ? "page" : undefined} onClick={() => onChange(item.id)}><span>{item.label}</span>{item.id === "notifications" && unreadNotifications > 0 && <span className="notification-badge" aria-label={unreadNotifications + " 条未处理通知"}>{unreadNotifications > 99 ? "99+" : unreadNotifications}</span>}</button>)}
-    <button className={`workspace-nav-settings ${view === "settings" ? "active" : ""}`} aria-current={view === "settings" ? "page" : undefined} onClick={() => onChange("settings")}>设置</button>
+    {PAGES.map((item) => <button key={item.id} className={view === item.id ? "active" : ""} aria-current={view === item.id ? "page" : undefined} onClick={() => onChange(item.id)}><span className="workspace-nav-label"><WorkspaceNavIcon view={item.id} />{item.label}</span>{item.id === "notifications" && unreadNotifications > 0 && <span className="notification-badge" aria-label={unreadNotifications + " 条未处理通知"}>{unreadNotifications > 99 ? "99+" : unreadNotifications}</span>}</button>)}
+    <button className={`workspace-nav-settings ${view === "settings" ? "active" : ""}`} aria-current={view === "settings" ? "page" : undefined} onClick={() => onChange("settings")}><span className="workspace-nav-label"><WorkspaceNavIcon view="settings" />设置</span></button>
+    <button type="button" className="workspace-nav-theme" onClick={toggleTheme}>
+      <span className="workspace-nav-label theme-to-dark"><svg className="workspace-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M20.5 13A8.5 8.5 0 0 1 11 3.5 8.5 8.5 0 1 0 20.5 13Z" /></svg>切换至深色</span>
+      <span className="workspace-nav-label theme-to-light"><svg className="workspace-nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5" /></svg>切换至浅色</span>
+    </button>
     <a className="workspace-nav-github" href="https://github.com/giarld/OpenWorkshop" target="_blank" rel="noreferrer" aria-label="在新标签页打开 OpenWorkshop GitHub 仓库"><img src="/brand/github-mark.svg" width="16" height="16" alt="" aria-hidden="true" /><span>GitHub</span></a>
   </nav>;
 }

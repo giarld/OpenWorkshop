@@ -1,6 +1,7 @@
 export type ColorTheme = "light" | "system" | "dark";
 export type ResolvedColorTheme = "light" | "dark";
 
+export const COLOR_THEME_CHANGED_EVENT = "workshop:color-theme-changed";
 export const COLOR_THEME_STORAGE_KEY = "workshop:color-theme";
 export const DEFAULT_COLOR_THEME: ColorTheme = "light";
 export const SYSTEM_COLOR_THEME_QUERY = "(prefers-color-scheme: dark)";
@@ -17,6 +18,7 @@ export function applyColorTheme(theme: ColorTheme, root: HTMLElement = document.
   const resolved = resolvedColorTheme(theme, systemDark);
   root.dataset.theme = resolved;
   root.style.colorScheme = resolved;
+  root.dispatchEvent(new Event(COLOR_THEME_CHANGED_EVENT));
 }
 
 export function watchSystemColorTheme(media = window.matchMedia(SYSTEM_COLOR_THEME_QUERY), root: HTMLElement = document.documentElement) {

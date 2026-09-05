@@ -3,7 +3,7 @@
 import { useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { defaultModelLabel, defaultReasoningLabel, manualModelChoice, pickerBlurCloses, reasoningValues, visibleModels } from "./agent-picker-state";
 import { AVATAR_SETTINGS_EVENT, DEFAULT_AVATARS, avatarSettings, isImageAvatar, type AvatarSettings } from "./avatar-settings";
-import { applyColorTheme, COLOR_THEME_STORAGE_KEY, DEFAULT_COLOR_THEME, storedColorTheme, type ColorTheme } from "./theme-settings";
+import { applyColorTheme, COLOR_THEME_CHANGED_EVENT, COLOR_THEME_STORAGE_KEY, DEFAULT_COLOR_THEME, storedColorTheme, type ColorTheme } from "./theme-settings";
 
 type Settings = {
   globalConcurrency: number;
@@ -42,7 +42,10 @@ export function SettingsWorkspace({ onLogout, onPinChanged }: { onLogout(): void
   const [colorTheme, setColorTheme] = useState<ColorTheme>(DEFAULT_COLOR_THEME);
 
   useEffect(() => {
-    setColorTheme(storedColorTheme(window.localStorage.getItem(COLOR_THEME_STORAGE_KEY)));
+    const sync = () => setColorTheme(storedColorTheme(window.localStorage.getItem(COLOR_THEME_STORAGE_KEY)));
+    sync();
+    document.documentElement.addEventListener(COLOR_THEME_CHANGED_EVENT, sync);
+    return () => document.documentElement.removeEventListener(COLOR_THEME_CHANGED_EVENT, sync);
   }, []);
 
   function changeColorTheme(theme: ColorTheme) {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { COLOR_THEME_INIT_SCRIPT, DEFAULT_COLOR_THEME, resolvedColorTheme, storedColorTheme } from "./theme-settings.ts";
+import { applyColorTheme, COLOR_THEME_CHANGED_EVENT, COLOR_THEME_INIT_SCRIPT, DEFAULT_COLOR_THEME, resolvedColorTheme, storedColorTheme } from "./theme-settings.ts";
 
 test("normalizes persisted color themes", () => {
   assert.equal(storedColorTheme("dark"), "dark");
@@ -20,4 +20,17 @@ test("initial theme script applies the saved theme before hydration", () => {
   assert.match(COLOR_THEME_INIT_SCRIPT, /localStorage\.getItem/);
   assert.match(COLOR_THEME_INIT_SCRIPT, /matchMedia/);
   assert.match(COLOR_THEME_INIT_SCRIPT, /document\.documentElement\.dataset\.theme/);
+});
+
+test("applies the resolved theme before notifying other theme controls", () => {
+  const root = Object.assign(new EventTarget(), { dataset: { theme: "light" }, style: { colorScheme: "light" } });
+  const observed: string[] = [];
+  root.addEventListener(COLOR_THEME_CHANGED_EVENT, () => observed.push(root.dataset.theme));
+  applyColorTheme("dark", root as unknown as HTMLElement, false);
+  assert.equal(root.style.colorScheme, "dark");
+  applyColorTheme("light", root as unknown as HTMLElement, true);
+  assert.equal(root.style.colorScheme, "light");
+  applyColorTheme("system", root as unknown as HTMLElement, true);
+  assert.equal(root.style.colorScheme, "dark");
+  assert.deepEqual(observed, ["dark", "light", "dark"]);
 });
