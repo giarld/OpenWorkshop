@@ -11,6 +11,33 @@ export function currentRunsForEvents<Run extends { id: string }>(runs: Run[]): R
   return runs.slice(0, 1);
 }
 
+export function mergeRunEvents(previous: RunEvent[], next: RunEvent[]): RunEvent[] {
+  const events = new Map(previous.map((event) => [event.id, event]));
+  for (const event of next) events.set(event.id, event);
+  return [...events.values()].sort((left, right) => left.id - right.id);
+}
+
+export function nextRunEventCursor(events: RunEvent[]): number {
+  return events.reduce((cursor, event) => Math.max(cursor, event.id), 0);
+}
+
+export type TaskDetailRequest = Readonly<{ taskId: string; sequence: number }>;
+
+export function createTaskDetailRequestGate() {
+  let latestSequence = 0;
+  return {
+    begin(taskId: string): TaskDetailRequest {
+      return { taskId, sequence: ++latestSequence };
+    },
+    accepts(request: TaskDetailRequest, currentTaskId: string | null): boolean {
+      return request.taskId === currentTaskId && request.sequence === latestSequence;
+    },
+    invalidate(): void {
+      latestSequence += 1;
+    }
+  };
+}
+
 export function isNearScrollBottom(scroll: { scrollTop: number; clientHeight: number; scrollHeight: number }, threshold = 0.9): boolean {
   return scroll.scrollHeight <= scroll.clientHeight || scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight * threshold;
 }
@@ -53,6 +80,7 @@ export function canOpenTaskDelivery(task: { parent_id: string | null; archived_a
 }
 
 const TOKEN_PRICES: Record<string, { input: number; cached: number; output: number }> = {
+  "gpt-6-astra": { input: 10, cached: 1, output: 50 },
   "deepseek-v4-flash": { input: 0.14, cached: 0.0028, output: 0.28 },
   "deepseek-v4-pro": { input: 0.435, cached: 0.003625, output: 0.87 },
   "gpt-5.6-sol": { input: 5, cached: 0.5, output: 30 },

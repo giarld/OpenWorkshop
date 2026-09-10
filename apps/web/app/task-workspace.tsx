@@ -21,10 +21,10 @@ import { applyColorTheme, COLOR_THEME_STORAGE_KEY } from "./theme-settings";
 import { AVATAR_SETTINGS_EVENT, DEFAULT_AVATARS, avatarSettings, isImageAvatar, type AvatarSettings } from "./avatar-settings";
 import { browserNotificationRuntime, notificationHashTarget, notificationHashTargetsOtherProject, notificationNavigation, pushBrowserNotifications, type AppNotification, type NotificationTarget } from "./browser-notifications";
 import { DeliveryWorkspace } from "./delivery-workspace";
-import { CommissionWorkspace } from "./commission-workspace";
+import { CommissionWorkspace, type ProjectCommission } from "./commission-workspace";
 import { UsageStatisticsWorkspace } from "./usage-statistics-workspace";
 import { PROJECT_NAME_MAX_LENGTH, activeProjects, createKeyedSingleFlight, createProjectDataRequestGate, initialWorkspaceView, isStaleWorkspaceHash, projectIdAfterArchive, projectNameError, projectRunLabels, workspaceContentState, type ManagedProject, type WorkspaceView } from "./project-management";
-import { canOpenTaskDelivery, canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, currentRunsForEvents, formatJson, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, isNearScrollBottom, mentionTriggerAtCursor, parseReviewComment, runDiffChanges, runDiffFilePatches, runEventDetail, runQuestions, runTimelineEvents, sameCommentLinkTargets, sameCommentSnapshot, screenshotFileName, taskLifecycleAction, tokenPrice, tokenUsageTotals, upsertComment, type MentionTrigger, type ReviewFinding, type RunDiffChange, type RunDiffFilePatch, type RunEvent, type RunQuestion } from "./task-run";
+import { canOpenTaskDelivery, canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, createTaskDetailRequestGate, currentRunsForEvents, formatJson, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, isNearScrollBottom, mentionTriggerAtCursor, mergeRunEvents, nextRunEventCursor, parseReviewComment, runDiffChanges, runDiffFilePatches, runEventDetail, runQuestions, runTimelineEvents, sameCommentLinkTargets, sameCommentSnapshot, screenshotFileName, taskLifecycleAction, tokenPrice, tokenUsageTotals, upsertComment, type MentionTrigger, type ReviewFinding, type RunDiffChange, type RunDiffFilePatch, type RunEvent, type RunQuestion } from "./task-run";
 import {
   TASK_STATUSES,
   boardCollisionDetection,
@@ -45,7 +45,7 @@ import {
 
 type Project = ManagedProject;
 type RootPath = { id: string; path: string; real_path: string };
-type Commission = { id: string; title: string; status: string };
+type Commission = ProjectCommission;
 type Run = { id: string; task_id: string; role: string; trigger_type: string; status: string; attempt_no: number; started_at: string | null; finished_at: string | null; failure_summary: string | null; token_input: number | null; token_output: number | null; token_cached: number | null; has_diff: boolean; configSnapshot?: { model?: string } };
 type TaskEvidence = { id: string; run_id: string | null; type: string; status: string; summary: string; payload_json: string; created_at: string };
 type TaskAttachment = { id: string; task_id: string; comment_id: string | null; run_id: string | null; original_name: string; media_type: string; size_bytes: number };
@@ -117,6 +117,10 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
   const projectDataRequestGate = useRef(createProjectDataRequestGate()).current;
   const projectLoadingRequestGate = useRef(createProjectDataRequestGate()).current;
   const projectSnapshotSingleFlight = useRef(createKeyedSingleFlight()).current;
+  const taskDialogTaskRef = useRef<string | null>(null);
+  const taskDetailRequestGate = useRef(createTaskDetailRequestGate()).current;
+  const taskRunEventCursors = useRef<Record<string, number>>({});
+  const taskDetailSingleFlight = useRef(createKeyedSingleFlight()).current;
   projectIdRef.current = projectId;
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { delay: 180, tolerance: 8 } }), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
 
@@ -260,6 +264,12 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     setCollapsed((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
   }
 
+  function closeTaskDialog() {
+    taskDialogTaskRef.current = null;
+    taskDetailRequestGate.invalidate();
+    setTaskDialogTask(null);
+  }
+
   function selectProject(nextProjectId: string) {
     if (nextProjectId === projectIdRef.current) return;
     if (notificationHashTargetsOtherProject(location.hash, nextProjectId)) history.replaceState(null, "", `${location.pathname}${location.search}`);
@@ -268,7 +278,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     projectLoadingRequestGate.invalidate();
     setTasks([]);
     setProjectCommissions([]);
-    setTaskDialogTask(null);
+    closeTaskDialog();
     historyDialog.current?.close();
     setHistoryTasks([]);
     setMessage("");
@@ -396,11 +406,13 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
 
   async function openTask(task: Task) {
     setMessage("");
+    taskDialogTaskRef.current = task.id;
     setTaskDialogTask(task);
     setTaskRuns([]);
     setTaskTokenRuns([]);
     setTaskEvidence([]);
     setTaskRunEvents({});
+    taskRunEventCursors.current = {};
     await refreshTaskDialog(task.id);
   }
 
@@ -417,25 +429,40 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
   }
 
   async function refreshTaskDialog(taskId: string) {
+    if (taskDialogTaskRef.current !== taskId) return;
+    return taskDetailSingleFlight.run(taskId, async () => {
+    const request = taskDetailRequestGate.begin(taskId);
+    const isCurrent = () => taskDetailRequestGate.accepts(request, taskDialogTaskRef.current);
     try {
       const tree = (tasks.find((task) => task.id === taskId) ?? historyTasks.find((task) => task.id === taskId))?.parent_id === null;
       const [task, runs, tokenRuns, evidence] = await Promise.all([api<Task>(`/api/tasks/${taskId}`), api<Run[]>(`/api/tasks/${taskId}/runs`), tree ? api<Run[]>(`/api/tasks/${taskId}/runs?scope=tree`) : Promise.resolve(null), api<TaskEvidence[]>(`/api/tasks/${taskId}/evidence?excludeDiff=true`)]);
+      if (!isCurrent()) return;
       setTaskDialogTask((current) => current?.id === taskId ? task : current);
       setTaskRuns(runs);
       setTaskTokenRuns(tokenRuns ?? runs);
       setTaskEvidence(evidence);
       const targets = currentRunsForEvents(runs);
-      const loaded = await Promise.all(targets.map(async (run) => [run.id, await api<RunEvent[]>(`/api/runs/${run.id}/events`)] as const));
-      setTaskRunEvents((current) => Object.fromEntries([...Object.entries(current).filter(([id]) => runs.some((run) => run.id === id)), ...loaded]));
-    } catch (error) { setMessage((error as Error).message); }
+      const loaded = await Promise.all(targets.map(async (run) => {
+        const after = taskRunEventCursors.current[run.id] ?? 0;
+        const events = await api<RunEvent[]>(`/api/runs/${run.id}/events?after=${after}`);
+        taskRunEventCursors.current[run.id] = Math.max(after, nextRunEventCursor(events));
+        return [run.id, events] as const;
+      }));
+      if (isCurrent()) setTaskRunEvents((current) => Object.fromEntries([...Object.entries(current).filter(([id]) => runs.some((run) => run.id === id)), ...loaded.map(([id, events]) => [id, mergeRunEvents(current[id] ?? [], events)])]));
+    } catch (error) { if (isCurrent()) setMessage((error as Error).message); }
+    });
   }
 
   async function loadRunEvents(runId: string) {
     if (Object.hasOwn(taskRunEvents, runId)) return;
+    const requestedTaskId = taskDialogTaskRef.current;
+    if (!requestedTaskId) return;
     try {
-      const events = await api<RunEvent[]>(`/api/runs/${runId}/events`);
-      setTaskRunEvents((current) => ({ ...current, [runId]: events }));
-    } catch (error) { setMessage(`运行记录加载失败：${(error as Error).message}`); }
+      const after = taskRunEventCursors.current[runId] ?? 0;
+      const events = await api<RunEvent[]>(`/api/runs/${runId}/events?after=${after}`);
+      taskRunEventCursors.current[runId] = Math.max(after, nextRunEventCursor(events));
+      if (taskDialogTaskRef.current === requestedTaskId) setTaskRunEvents((current) => ({ ...current, [runId]: mergeRunEvents(current[runId] ?? [], events) }));
+    } catch (error) { if (taskDialogTaskRef.current === requestedTaskId) setMessage(`运行记录加载失败：${(error as Error).message}`); }
   }
 
   async function taskAction(path: "trigger" | "pause" | "resume" | "cancel", success: string) {
@@ -444,7 +471,9 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     try {
       if (path === "trigger") await triggerTask(taskDialogTask);
       else await api(`/api/tasks/${taskDialogTask.id}/${path}`, { method: "POST" });
-      await refreshProject(); await refreshTaskDialog(taskDialogTask.id); setMessage(success);
+      const taskId = taskDialogTask.id;
+      await refreshProject();
+      if (taskDialogTaskRef.current === taskId) { await refreshTaskDialog(taskId); if (taskDialogTaskRef.current === taskId) setMessage(success); }
     } catch (error) { setMessage((error as Error).message); }
     finally { setTaskBusy(false); }
   }
@@ -461,8 +490,10 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     try {
       await api(`/api/tasks/${task.id}/${action}`, { method: "POST" });
       await refreshProject();
-      await refreshTaskDialog(task.id);
-      setMessage(action === "archive" ? tree ? "主任务及其全部子任务已归档。" : "任务已归档。" : tree ? "主任务及其全部子任务已解除归档并回到 Done。" : "任务已解除归档并回到 Done。");
+      if (taskDialogTaskRef.current === task.id) {
+        await refreshTaskDialog(task.id);
+        if (taskDialogTaskRef.current === task.id) setMessage(action === "archive" ? tree ? "主任务及其全部子任务已归档。" : "任务已归档。" : tree ? "主任务及其全部子任务已解除归档并回到 Done。" : "任务已解除归档并回到 Done。");
+      }
     } catch (error) { setMessage((error as Error).message); }
     finally { setTaskBusy(false); }
   }
@@ -478,7 +509,10 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
     const data = new FormData(event.currentTarget);
     const answers = Object.fromEntries(questions.map((question) => [question.id, { answers: [String(data.get(question.id) ?? "").trim()] }]));
     setTaskBusy(true);
-    try { await api(`/api/runs/${run.id}/input`, { method: "POST", body: JSON.stringify({ requestId, answers }) }); await refreshTaskDialog(run.task_id); setMessage("已提交 Agent 所需信息。"); }
+    try {
+      await api(`/api/runs/${run.id}/input`, { method: "POST", body: JSON.stringify({ requestId, answers }) });
+      if (taskDialogTaskRef.current === run.task_id) { await refreshTaskDialog(run.task_id); if (taskDialogTaskRef.current === run.task_id) setMessage("已提交 Agent 所需信息。"); }
+    }
     catch (error) { setMessage((error as Error).message); }
     finally { setTaskBusy(false); }
   }
@@ -523,7 +557,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
         {contentState === "settings" ? settings : contentState === "loading" ? <section className="empty-state">正在加载当前项目…</section> : <>
         {showOverview && <WorkspaceOverview total={overview.total} completed={overview.completed} running={overview.running} attention={overview.attention} completion={overview.completion} />}
         {view === "projects" && <ProjectManagementPage projects={projects} projectId={projectId} associate={associate} onSelect={selectProject} onManage={openProjectManagement} />}
-        <CommissionWorkspace projectId={projectId} section={view === "requirements" ? "requirements" : "commissions"} hidden={!(["commissions", "requirements"] as View[]).includes(view)} onChanged={() => void refreshProject()} onStageChange={(stage) => setView(stage)} />
+        <CommissionWorkspace projectId={projectId} projectCommissions={projectCommissions} section={view === "requirements" ? "requirements" : "commissions"} hidden={!(["commissions", "requirements"] as View[]).includes(view)} onChanged={() => void refreshProject()} onStageChange={(stage) => setView(stage)} />
         <DeliveryWorkspace projectId={projectId} tasks={tasks} section={view === "notifications" ? "notifications" : "delivery"} hidden={!(["delivery", "notifications"] as View[]).includes(view)} onChanged={() => { void loadCurrentProjectTasks(); void refreshNotificationCount(); }} onNavigateNotification={navigateNotification} notificationTargetId={notificationTarget?.entityType === "delivery" ? notificationTarget.entityId : null} onNotificationTargetHandled={() => setNotificationTarget(null)} />
         {view === "usage" && <UsageStatisticsWorkspace />}
         {view === "board" && <><div className="filters">
@@ -542,7 +576,7 @@ export function TaskWorkspace({ header, settings }: { header: ReactNode; setting
         </>}
       </section>
     </div>
-    <TaskRunDialog dialog={taskDialog} task={taskDialogTask} tasks={[...tasks, ...historyTasks]} runs={taskRuns} tokenRuns={taskTokenRuns} evidence={taskEvidence} eventsByRun={taskRunEvents} busy={taskBusy} message={message} onClose={() => setTaskDialogTask(null)} onOpenTask={openTask} onOpenRun={loadRunEvents} onAction={taskAction} onLifecycle={taskLifecycle} onAnswer={answerRunInput} onApprovals={() => { setTaskDialogTask(null); setView("notifications"); }} onDelivery={() => { setTaskDialogTask(null); setView("delivery"); }} />
+    <TaskRunDialog key={taskDialogTask?.id ?? "task-dialog"} dialog={taskDialog} task={taskDialogTask} tasks={[...tasks, ...historyTasks]} runs={taskRuns} tokenRuns={taskTokenRuns} evidence={taskEvidence} eventsByRun={taskRunEvents} busy={taskBusy} message={message} onClose={closeTaskDialog} onOpenTask={openTask} onOpenRun={loadRunEvents} onAction={taskAction} onLifecycle={taskLifecycle} onAnswer={answerRunInput} onApprovals={() => { closeTaskDialog(); setView("notifications"); }} onDelivery={() => { closeTaskDialog(); setView("delivery"); }} />
     <HistoryTasksDialog dialog={historyDialog} tasks={historyTasks} commissions={commissionTitles} loading={historyLoading} onOpen={openTask} />
     <ProjectManagementDialog dialog={projectManagementDialog} project={managedProject} busy={projectManagementBusy} error={projectManagementError} onClose={() => setManagedProject(null)} onSubmit={saveManagedProject} onArchive={archiveManagedProject} />
   </section>;
@@ -767,7 +801,12 @@ function TaskRunDialog({ dialog, task, tasks, runs, tokenRuns, evidence, eventsB
     setCommentError("");
     if (!task) { setComments([]); return; }
     let current = true;
-    const load = () => void api<TaskComment[]>(`/api/tasks/${task.id}/comments`).then((items) => { if (current) setComments((previous) => sameCommentSnapshot(previous, items) ? previous : items); }).catch((error: Error) => { if (current && !comments.length) setCommentError(error.message); });
+    let loading = false;
+    const load = () => {
+      if (loading) return;
+      loading = true;
+      void api<TaskComment[]>(`/api/tasks/${task.id}/comments`).then((items) => { if (current) setComments((previous) => sameCommentSnapshot(previous, items) ? previous : items); }).catch((error: Error) => { if (current && !comments.length) setCommentError(error.message); }).finally(() => { loading = false; });
+    };
     load();
     const timer = window.setInterval(load, 2000);
     return () => { current = false; window.clearInterval(timer); };

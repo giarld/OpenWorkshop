@@ -431,7 +431,8 @@ aside { padding: .8rem 1rem; border-left: .25rem solid #c47a2c; background: #fff
 @keyframes clarification-thinking { 0%, 60%, 100% { opacity: .35; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-.22rem); } }
 .clarification-controls { display: grid; gap: .6rem; padding-top: .8rem; border-top: 1px solid #d9d2c1; overflow-y: auto; }
 .commission-message-form, .requirement-actions { display: flex; gap: .5rem; }
-.commission-message-form button { white-space: nowrap; }
+.commission-message-form button { white-space: nowrap; align-self: start; }
+.clarification-controls textarea { resize: vertical; }
 .clarification-choice-form { display: grid; gap: .5rem; }
 .clarification-choice-form label { display: flex; align-items: center; gap: .45rem; padding: .45rem .6rem; border: 1px solid #d9d2c1; border-radius: .3rem; }
 .clarification-choice-form label:has(input:checked) { border-color: #55735f; background: #e7efe9; }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canOpenTaskDelivery, canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, currentRunsForEvents, formatJson, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, isNearScrollBottom, mentionTriggerAtCursor, parseReviewComment, runDiffChanges, runDiffFilePatches, runDiffPatch, runEventDetail, runQuestions, runTimelineEvents, sameCommentLinkTargets, sameCommentSnapshot, screenshotFileName, taskLifecycleAction, taskMentionParts, tokenPrice, tokenUsageTotals, upsertComment } from "./task-run.ts";
+import { canOpenTaskDelivery, canResumeTaskRun, clipboardImageExtension, commentLinkUrl, commentMentionParts, commentThreadRows, createTaskDetailRequestGate, currentRunsForEvents, formatJson, formatRunDuration, formatTokenCount, formatTokenPrice, insertMention, isCommentSubmitShortcut, isLongRunEventDetail, isNearScrollBottom, mentionTriggerAtCursor, mergeRunEvents, nextRunEventCursor, parseReviewComment, runDiffChanges, runDiffFilePatches, runDiffPatch, runEventDetail, runQuestions, runTimelineEvents, sameCommentLinkTargets, sameCommentSnapshot, screenshotFileName, taskLifecycleAction, taskMentionParts, tokenPrice, tokenUsageTotals, upsertComment } from "./task-run.ts";
 
 test("recognizes supported clipboard images and generates readable screenshot names", () => {
   assert.equal(clipboardImageExtension("image/png"), "png");
@@ -26,6 +26,13 @@ test("only offers generic resume for active ordinary interrupted tasks", () => {
   assert.equal(canResumeTaskRun("in_progress", { status: "interrupted", trigger_type: "coordinate" }), false);
 });
 
+test("merges incremental Run events and advances the cursor", () => {
+  const event = (id: number) => ({ id, event_type: "event", summary: "", payload: {}, created_at: "" });
+  assert.deepEqual(mergeRunEvents([event(1), event(3)], [event(2), event(3)]).map((item) => item.id), [1, 2, 3]);
+  assert.equal(nextRunEventCursor([event(2), event(9), event(4)]), 9);
+  assert.equal(nextRunEventCursor([]), 0);
+});
+
 test("offers task lifecycle actions only for Done and Archived tasks", () => {
   assert.equal(taskLifecycleAction("done"), "archive");
   assert.equal(taskLifecycleAction("archived"), "unarchive");
@@ -49,6 +56,7 @@ test("totals task tokens while keeping cached input as a subset", () => {
   assert.equal(tokenUsageTotals([{ token_input: null, token_output: null, token_cached: null }]), null);
   assert.equal(formatTokenCount(12345), "12,345");
   assert.equal(tokenPrice([{ token_input: 100, token_output: 40, token_cached: 80, configSnapshot: { model: "gpt-5.6-sol" } }]), 0.00134);
+  assert.equal(tokenPrice([{ token_input: 1_000_000, token_output: 1_000_000, token_cached: 1_000_000, configSnapshot: { model: "gpt-6-astra" } }]), 51);
   assert.equal(tokenPrice([{ token_input: 100, token_output: 40, token_cached: 80, configSnapshot: { model: "echo/gpt-5.6-sol" } }]), 0.00134);
   assert.equal(tokenPrice([{ token_input: 1_000_000, token_output: 1_000_000, token_cached: 1_000_000, configSnapshot: { model: "deepseek/deepseek-v4-flash" } }]), 0.2828);
   assert.equal(tokenPrice([{ token_input: 1_000_000, token_output: 1_000_000, token_cached: 1_000_000, configSnapshot: { model: "deepseek/deepseek-v4-pro" } }]), 0.873625);
@@ -113,6 +121,19 @@ test("does not duplicate a comment already loaded by polling", () => {
 test("loads only the current Run events during task refresh", () => {
   assert.deepEqual(currentRunsForEvents([{ id: "current" }, { id: "history-1" }, { id: "history-2" }]), [{ id: "current" }]);
   assert.deepEqual(currentRunsForEvents([]), []);
+});
+
+test("only accepts the latest task detail request for the selected task", () => {
+  const gate = createTaskDetailRequestGate();
+  const first = gate.begin("task-a");
+  const second = gate.begin("task-b");
+
+  assert.equal(gate.accepts(first, "task-a"), false);
+  assert.equal(gate.accepts(first, "task-b"), false);
+  assert.equal(gate.accepts(second, "task-b"), true);
+
+  gate.invalidate();
+  assert.equal(gate.accepts(second, "task-b"), false);
 });
 
 test("shows the comment scroll control until the viewport reaches 90 percent", () => {

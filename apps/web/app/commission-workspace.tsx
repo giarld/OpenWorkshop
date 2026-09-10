@@ -2,10 +2,10 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import ReactMarkdown from "react-markdown";
-import { clarificationOptionLabel, clarificationOptions, clarificationStep, stageAfterAnalysis, type CommissionStage } from "./commission-flow";
+import { taskPlanningStatus, uploadClarificationAttachments, clarificationOptionLabel, clarificationOptions, clarificationStep, stageAfterAnalysis, type CommissionStage } from "./commission-flow";
 import { formatTokenCount } from "./task-run";
 
-type Commission = { id: string; title: string; status: string; summary: string | null; main_task_id: string | null; archived_at: string | null; archive_size_bytes: number | null; clarification_token_input: number; clarification_token_output: number; clarification_token_cached: number; clarification_analysis_running?: boolean };
+type Commission = { id: string; title: string; status: string; summary: string | null; main_task_id: string | null; archived_at: string | null; archive_size_bytes: number | null; clarification_token_input: number; clarification_token_output: number; clarification_token_cached: number; task_planning_running?: boolean; clarification_analysis_running?: boolean };
 type Message = { id: string; role: "human" | "agent" | "system"; content: string; options_json: string | null; created_at: string };
 type Attachment = { id: string; original_name: string; size_bytes: number };
 type Requirement = { id: string; version_no: number; content_markdown: string; acceptance_json: string; status: string };
@@ -19,20 +19,26 @@ const STATUS_LABELS: Record<string, string> = {
   backlog: "Backlog", active: "执行中", paused: "已暂停", blocked: "已阻塞", awaiting_acceptance: "等待验收", done: "已完成", archived: "已归档"
 };
 
-export function CommissionWorkspace({ projectId, section, hidden, onChanged, onStageChange }: { projectId: string; section: "commissions" | "requirements"; hidden: boolean; onChanged(): void; onStageChange(stage: CommissionStage): void }) {
+export type ProjectCommission = Commission;
+
+export function CommissionWorkspace({ projectId, projectCommissions, section, hidden, onChanged, onStageChange }: { projectId: string; projectCommissions: Commission[]; section: "commissions" | "requirements"; hidden: boolean; onChanged(): void; onStageChange(stage: CommissionStage): void }) {
   const [commissions, setCommissions] = useState<Commission[]>([]);
   const [archivedCommissions, setArchivedCommissions] = useState<Commission[]>([]);
   const [selected, setSelected] = useState<CommissionDetails | null>(null);
   const [dialogMode, setDialogMode] = useState<DialogMode>(null);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const [planningId, setPlanningId] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisProgress, setAnalysisProgress] = useState<string[]>([]);
   const [copiedRequirementId, setCopiedRequirementId] = useState<string | null>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const timeline = useRef<HTMLDivElement>(null);
+  const clarificationRefreshInFlight = useRef(false);
+  const requirementsRefreshInFlight = useRef(false);
 
   useEffect(() => { void loadCommissions(); }, [projectId]);
+  useEffect(() => { setCommissions(projectCommissions); }, [projectCommissions]);
   useEffect(() => {
     const element = dialog.current;
     if (dialogMode && element && !element.open) element.showModal();
@@ -42,9 +48,28 @@ export function CommissionWorkspace({ projectId, section, hidden, onChanged, onS
   useEffect(() => { if (dialogMode === "clarification" && timeline.current) timeline.current.scrollTop = timeline.current.scrollHeight; }, [dialogMode, selected?.id, selected?.messages.length, analyzing, analysisProgress.length]);
   useEffect(() => {
     if (dialogMode !== "clarification" || !selected?.clarification_analysis_running) return;
-    const timer = window.setInterval(() => void api<CommissionDetails>(`/api/commissions/${selected.id}`).then(setSelected, (error: Error) => setMessage(error.message)), 1000);
+    const timer = window.setInterval(() => {
+      if (clarificationRefreshInFlight.current) return;
+      clarificationRefreshInFlight.current = true;
+      void api<CommissionDetails>(`/api/commissions/${selected.id}`).then(setSelected, (error: Error) => setMessage(error.message)).finally(() => { clarificationRefreshInFlight.current = false; });
+    }, 2000);
     return () => window.clearInterval(timer);
   }, [dialogMode, selected?.id, selected?.clarification_analysis_running]);
+
+  useEffect(() => {
+    if (hidden || dialogMode !== "requirement" || !selected?.id) return;
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      if (requirementsRefreshInFlight.current) return;
+      requirementsRefreshInFlight.current = true;
+      try {
+        const details = await api<CommissionDetails>(`/api/commissions/${selected.id}`);
+        if (!cancelled) setSelected(details);
+      } catch (error) { if (!cancelled) setMessage((error as Error).message); }
+      finally { requirementsRefreshInFlight.current = false; }
+    }, 2000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [hidden, dialogMode, projectId, selected?.id]);
 
   async function loadCommissions(preferredId?: string) {
     try {
@@ -111,11 +136,16 @@ export function CommissionWorkspace({ projectId, section, hidden, onChanged, onS
   async function uploadAttachment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
-    const file = (new FormData(form).get("file") as File | null);
-    if (!file || !selected) return;
+    const files = new FormData(form).getAll("file").filter((value): value is File => value instanceof File && Boolean(value.name));
+    if (!files.length || !selected) return;
     await run(async () => {
-      await api(`/api/commissions/${selected.id}/attachments`, { method: "POST", headers: { "Content-Type": file.type || "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) }, body: file });
-      form.reset(); await loadCommissions(selected.id); setMessage("附件已上传。");
+      try {
+        await uploadClarificationAttachments(files, async (file) => {
+          const attachment = await api<Attachment>(`/api/commissions/${selected.id}/attachments`, { method: "POST", headers: { "Content-Type": file.type || "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) }, body: file });
+          setSelected((current) => current?.id === selected.id ? { ...current, attachments: [...current.attachments, attachment] } : current);
+        });
+        setMessage(`已上传 ${files.length} 个附件。`);
+      } finally { form.reset(); }
     });
   }
 
@@ -170,9 +200,10 @@ export function CommissionWorkspace({ projectId, section, hidden, onChanged, onS
   }
 
   async function decideRequirement(requirement: Requirement, action: "approve" | "reject", reason?: string) {
+    if (action === "approve") setPlanningId(selected!.id);
     await run(async () => {
       try { await api(`/api/requirements/${requirement.id}/${action}`, action === "reject" ? { method: "POST", body: JSON.stringify({ reason }) } : { method: "POST" }); }
-      finally { await loadCommissions(selected!.id); onChanged(); }
+      finally { setPlanningId(null); await loadCommissions(selected!.id); onChanged(); }
       if (action === "approve") onStageChange("board");
       setMessage(action === "approve" ? "需求已批准，任务规划已生成。" : "需求已拒绝，可以继续补充信息。");
     });
@@ -237,7 +268,7 @@ export function CommissionWorkspace({ projectId, section, hidden, onChanged, onS
         const clarified = isClarified(item.status);
         return <article className="commission-card" key={item.id}>
           <button className="commission-card-main" onClick={() => void openCommission(item.id, "details")}>
-            <span className="commission-card-title"><strong>{item.title}</strong><small>{STATUS_LABELS[item.status] ?? item.status}</small></span>
+            <span className="commission-card-title"><strong>{item.title}</strong><small>{taskPlanningStatus(item, planningId === item.id) ?? STATUS_LABELS[item.status] ?? item.status}</small></span>
             <span className="commission-summary">{item.summary || "尚未填写委托内容。"}</span>
           </button>
           <span className="commission-card-actions"><button className={clarified ? "secondary" : ""} onClick={() => void (clarified ? showRequirement(item.id) : openCommission(item.id, "clarification"))}>{clarified ? "已澄清" : "需求澄清"}</button>{clarified ? <button className="secondary" disabled={busy} onClick={() => void archiveSelectedCommission(item)}>归档</button> : <button className="danger" disabled={busy} onClick={() => void deleteCommission(item)}>删除</button>}</span>
@@ -249,7 +280,7 @@ export function CommissionWorkspace({ projectId, section, hidden, onChanged, onS
       <header className="commission-index-header"><div><p className="eyebrow">Requirements</p><h2>需求文档列表</h2><p>集中查看已生成的需求文档，点击后在独立悬浮页中专注审阅。</p></div></header>
       {requirementCommissions.length ? <div className="commission-list">{requirementCommissions.map((item) => <article className="commission-card requirement-card" key={item.id}>
         <button className="commission-card-main" onClick={() => void showRequirement(item.id)}>
-          <span className="commission-card-title"><strong>{item.title}</strong><small>{STATUS_LABELS[item.status] ?? item.status}</small></span>
+          <span className="commission-card-title"><strong>{item.title}</strong><small>{taskPlanningStatus(item, planningId === item.id) ?? STATUS_LABELS[item.status] ?? item.status}</small></span>
           <span className="commission-summary">{item.summary || "需求文档已生成，点击查看完整内容与验收标准。"}</span>
         </button>
         <button className="secondary" onClick={() => void showRequirement(item.id)}>查看文档</button>
@@ -269,14 +300,15 @@ export function CommissionWorkspace({ projectId, section, hidden, onChanged, onS
         <p className="clarification-token">Token: 输入 {formatTokenCount(selected.clarification_token_input)} · 输出 {formatTokenCount(selected.clarification_token_output)}</p>
         <div className="commission-timeline" ref={timeline}>{selected.messages.length ? selected.messages.map((item) => <article key={item.id} className={`commission-message ${item.role}`}><strong>{item.role === "human" ? "你" : item.role === "agent" ? "需求分析 Agent" : "系统"}</strong><p>{item.content}</p></article>) : <p>尚无澄清消息。</p>}{analysisRunning && <article className="commission-message agent thinking-message" role="status" aria-live="polite"><strong>需求分析 Agent</strong><div className="analysis-progress">{analysisProgress.slice(0, -1).map((item, index) => <span key={`${index}:${item}`}>{item}</span>)}<span>{analysisProgress.at(-1) ?? "正在进行需求分析"}<span className="thinking-dots" aria-hidden="true"><i /><i /><i /></span></span></div></article>}</div>
         <div className="clarification-controls">
-          {nextClarification === "reply" && (latestOptions.length ? <form className="clarification-choice-form" onSubmit={sendChoice}>{latestOptions.map((option, index) => <label key={option}><input type="radio" name="choice" value={option} required disabled={busy || analysisRunning} />{clarificationOptionLabel(option, index === 0)}</label>)}<label><input type="radio" name="choice" value="__custom__" required disabled={busy || analysisRunning} />其他（自定义）</label><input name="custom" autoComplete="off" placeholder="输入自定义答案" disabled={busy || analysisRunning} /><button disabled={busy || analysisRunning}>{analysisRunning ? "分析中…" : "提交选择并继续分析"}</button></form> : <form className="commission-message-form" onSubmit={sendMessage}><input name="content" placeholder="回复需求分析 Agent" required disabled={busy || analysisRunning} /><button disabled={busy || analysisRunning}>{analysisRunning ? "分析中…" : "回复并继续分析"}</button></form>)}
-          <form className="commission-message-form" onSubmit={uploadAttachment}><input name="file" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,.txt,.md,.pdf,.docx" required disabled={busy || analysisRunning} /><button className="secondary" disabled={busy || analysisRunning}>上传附件</button></form>
+          {nextClarification === "reply" && (latestOptions.length ? <form className="clarification-choice-form" onSubmit={sendChoice}>{latestOptions.map((option, index) => <label key={option}><input type="radio" name="choice" value={option} required disabled={busy || analysisRunning} />{clarificationOptionLabel(option, index === 0)}</label>)}<label><input type="radio" name="choice" value="__custom__" required disabled={busy || analysisRunning} />其他（自定义）</label><textarea name="custom" rows={3} autoComplete="off" aria-label="自定义答案" placeholder="输入自定义答案" disabled={busy || analysisRunning} /><button disabled={busy || analysisRunning}>{analysisRunning ? "分析中…" : "提交选择并继续分析"}</button></form> : <form className="commission-message-form" onSubmit={sendMessage}><textarea name="content" rows={3} autoComplete="off" aria-label="回复需求分析 Agent" placeholder="回复需求分析 Agent" required disabled={busy || analysisRunning} /><button disabled={busy || analysisRunning}>{analysisRunning ? "分析中…" : "回复并继续分析"}</button></form>)}
+          <form className="commission-message-form" onSubmit={uploadAttachment}><input name="file" type="file" multiple aria-label="选择附件（每批最多 10 个）" accept=".png,.jpg,.jpeg,.gif,.webp,.txt,.md,.pdf,.docx" required disabled={busy || analysisRunning} /><button className="secondary" disabled={busy || analysisRunning}>上传附件（最多 10 个）</button></form>
           {selected.attachments.length > 0 && <p className="attachment-summary">附件：{selected.attachments.map((item) => `${item.original_name} (${Math.ceil(item.size_bytes / 1024)} KB)`).join("、")}</p>}
           {nextClarification === "analyze" && <button onClick={() => void analyze()} disabled={busy || analysisRunning}>{analysisRunning ? "分析中…" : "运行需求分析"}</button>}
         </div>
       </div>}
       {dialogMode === "requirement" && <div className="requirement-document commission-dialog-body">
-        {currentRequirement ? <><p className="requirement-version">当前版本 v{currentRequirement.version_no} · {currentRequirement.status} · 共 {selected?.requirements.length ?? 0} 个版本</p><div className="requirement-content"><button type="button" className="secondary requirement-copy" onClick={() => void copyRequirement(currentRequirement)}>{copiedRequirementId === currentRequirement.id ? "已复制" : "复制"}</button><div className="markdown-content requirement-markdown"><ReactMarkdown>{currentRequirement.content_markdown}</ReactMarkdown></div></div><section><h3>验收标准</h3><p>{JSON.parse(currentRequirement.acceptance_json).map((item: unknown) => String(item)).join("；") || "无"}</p></section>{currentRequirement.status === "awaiting_approval" && <div className="requirement-actions"><button disabled={busy} onClick={() => void decideRequirement(currentRequirement, "approve")}>批准需求并生成任务</button><RequirementReject disabled={busy} onReject={(reason) => decideRequirement(currentRequirement, "reject", reason)} /></div>}</> : <p>需求分析信息充分后会生成待批准版本。</p>}
+        {selected && taskPlanningStatus(selected, planningId === selected.id) && <p className="workspace-message" role="status" aria-live="polite">{taskPlanningStatus(selected, planningId === selected.id)}</p>}
+        {currentRequirement ? <><p className="requirement-version">当前版本 v{currentRequirement.version_no} · {currentRequirement.status} · 共 {selected?.requirements.length ?? 0} 个版本</p><div className="requirement-content"><button type="button" className="secondary requirement-copy" onClick={() => void copyRequirement(currentRequirement)}>{copiedRequirementId === currentRequirement.id ? "已复制" : "复制"}</button><div className="markdown-content requirement-markdown"><ReactMarkdown>{currentRequirement.content_markdown}</ReactMarkdown></div></div><section><h3>验收标准</h3><p>{JSON.parse(currentRequirement.acceptance_json).map((item: unknown) => String(item)).join("；") || "无"}</p></section>{currentRequirement.status === "awaiting_approval" && <div className="requirement-actions"><button disabled={busy || selected?.task_planning_running} onClick={() => void decideRequirement(currentRequirement, "approve")}>{planningId === selected?.id || selected?.task_planning_running ? "正在规划任务…" : "批准需求并生成任务"}</button><RequirementReject disabled={busy} onReject={(reason) => decideRequirement(currentRequirement, "reject", reason)} /></div>}</> : <p>需求分析信息充分后会生成待批准版本。</p>}
       </div>}
       {dialogMode && message && <p className="workspace-message dialog-message" role="status">{message}</p>}
     </dialog>

@@ -94,12 +94,34 @@ test("compresses a clarified commission and restores its documents, tasks, histo
     database.prepare("INSERT INTO documents (id, project_id, commission_id, type, title, created_at) VALUES (?, ?, ?, 'requirement', 'Requirement', ?)").run(documentId, projectId, commissionId, now);
     database.prepare("INSERT INTO document_versions (id, document_id, version_no, content_markdown, source_json, locked, created_by, created_at) VALUES (?, ?, 1, '# Document', '{}', 1, 'human', ?)").run(versionId, documentId, now);
     database.prepare("UPDATE documents SET current_version_id = ? WHERE id = ?").run(versionId, documentId);
+    const deliveryId = randomUUID();
+    const attemptId = randomUUID();
+    const deliveryNotificationId = randomUUID();
+    database.prepare(`INSERT INTO deliveries (id, commission_id, main_task_id, method, status, request_json, preview_json, progress_json, result_json, external_effect_started, created_at, updated_at)
+      VALUES (?, ?, ?, 'document', 'succeeded', '{}', '{}', '{}', '{"summary":"delivered"}', 0, ?, ?)`).run(deliveryId, commissionId, taskId, now, now);
+    database.prepare(`INSERT INTO delivery_attempts (id, delivery_id, attempt_no, status, request_json, preview_json, progress_json, result_json, created_at)
+      VALUES (?, ?, 1, 'succeeded', '{}', '{}', '{}', '{"summary":"delivered"}', ?)`).run(attemptId, deliveryId, now);
+    database.prepare("INSERT INTO notifications (id, kind, title, body, entity_type, entity_id, created_at) VALUES (?, 'blocked', 'Delivery', 'History', 'delivery', ?, ?)").run(deliveryNotificationId, deliveryId, now);
+    const originalDelivery = database.prepare("SELECT * FROM deliveries WHERE id = ?").get(deliveryId);
+    const originalAttempt = database.prepare("SELECT * FROM delivery_attempts WHERE id = ?").get(attemptId);
 
     assert.equal((await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/archive` })).statusCode, 409);
     database.prepare("UPDATE runs SET status = 'succeeded', finished_at = ? WHERE id = ?").run(now, runId);
     database.prepare("INSERT INTO task_dependencies (task_id, depends_on_task_id, created_by, created_at) VALUES (?, ?, 'human', ?)").run(dependentTaskId, taskId, now);
     assert.equal((await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/archive` })).statusCode, 409);
     database.prepare("DELETE FROM task_dependencies WHERE task_id = ? AND depends_on_task_id = ?").run(dependentTaskId, taskId);
+    for (const table of ["deliveries", "delivery_attempts"]) {
+      const id = table === "deliveries" ? deliveryId : attemptId;
+      for (const status of ["queued", "preparing", "running", "waiting_human"]) {
+        database.prepare(`UPDATE ${table} SET status = ? WHERE id = ?`).run(status, id);
+        const rejected = await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/archive` });
+        assert.equal(rejected.statusCode, 409, rejected.body);
+        assert.match(rejected.json().message, /未结束的交付/);
+        assert.equal(database.prepare("SELECT lifecycle_operation FROM commissions WHERE id = ?").get(commissionId)?.lifecycle_operation, null);
+        await access(attachment.storage_path);
+      }
+      database.prepare(`UPDATE ${table} SET status = 'succeeded' WHERE id = ?`).run(id);
+    }
     const abandonedArchive = join(home, "archives", commissionId);
     const abandonedArchiveTemp = join(home, "archives", `${commissionId}.crash.tmp`);
     database.prepare("UPDATE commissions SET lifecycle_operation = 'archiving', lifecycle_token = 'crashed' WHERE id = ?").run(commissionId);
@@ -114,6 +136,8 @@ test("compresses a clarified commission and restores its documents, tasks, histo
     assert.throws(() => database.prepare("INSERT INTO comments (id, task_id, author_type, kind, content, created_at) VALUES (?, ?, 'human', 'normal', 'late write', ?)").run(randomUUID(), taskId, now), /lifecycle operation/i);
     assert.throws(() => database.prepare("UPDATE plan_revisions SET status = 'reviewing' WHERE id = ?").run(revisionId), /lifecycle operation/i);
     assert.throws(() => database.prepare("UPDATE plan_revision_cards SET status = 'answered' WHERE comment_id = ?").run(commentId), /lifecycle operation/i);
+    assert.throws(() => database.prepare("UPDATE deliveries SET status = 'queued' WHERE id = ?").run(deliveryId), /lifecycle operation/i);
+    assert.throws(() => database.prepare("UPDATE delivery_attempts SET status = 'queued' WHERE id = ?").run(attemptId), /lifecycle operation/i);
     const archivedCommission = await archiving as { archive_path: string; archive_size_bytes: number; status: string };
     assert.equal(archivedCommission.status, "archived");
     assert.ok(archivedCommission.archive_size_bytes > 0);
@@ -128,6 +152,10 @@ test("compresses a clarified commission and restores its documents, tasks, histo
     await assert.rejects(access(attachment.storage_path));
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM tasks WHERE commission_id = ?").get(commissionId) as { count: number }).count, 0);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM documents WHERE commission_id = ?").get(commissionId) as { count: number }).count, 0);
+    assert.equal(database.prepare("SELECT * FROM deliveries WHERE id = ?").get(deliveryId), undefined);
+    assert.equal(database.prepare("SELECT * FROM delivery_attempts WHERE id = ?").get(attemptId), undefined);
+    assert.equal(database.prepare("SELECT * FROM notifications WHERE id = ?").get(deliveryNotificationId), undefined);
+    assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
     assert.deepEqual(new SettingsStore(database).get("pendingRunAdvances"), [{ runId: "keep-me", kind: "terminal", createdAt: now }]);
     assert.equal(((await server.inject({ method: "GET", url: `/api/projects/${projectId}/commissions` })).json() as unknown[]).length, 1);
     assert.equal(((await server.inject({ method: "GET", url: `/api/projects/${projectId}/commissions?archived=true` })).json() as Array<{ id: string }>)[0]?.id, commissionId);
@@ -160,9 +188,25 @@ test("compresses a clarified commission and restores its documents, tasks, histo
     assert.equal((database.prepare("SELECT system_notified_at FROM notifications WHERE id = ?").get(notificationId) as { system_notified_at: string }).system_notified_at, now);
     assert.equal((database.prepare("SELECT summary FROM run_events WHERE run_id = ?").get(runId) as { summary: string }).summary, "done");
     assert.equal((database.prepare("SELECT content_markdown FROM document_versions WHERE id = ?").get(versionId) as { content_markdown: string }).content_markdown, "# Document");
+    assert.deepEqual(database.prepare("SELECT * FROM deliveries WHERE id = ?").get(deliveryId), originalDelivery);
+    assert.deepEqual(database.prepare("SELECT * FROM delivery_attempts WHERE id = ?").get(attemptId), originalAttempt);
+    assert.equal(database.prepare("SELECT entity_id FROM notifications WHERE id = ?").get(deliveryNotificationId)?.entity_id, deliveryId);
+    assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
     assert.equal(await readFile(attachment.storage_path, "utf8"), "compressible content ".repeat(100));
     await assert.rejects(access(join(abandonedRestore, "stale-source-file")));
     await assert.rejects(access(archivedCommission.archive_path));
+
+    const legacyArchive = await archiveCommission(database, attachmentsRoot, otherCommissionId);
+    const legacyPath = join(String(legacyArchive.archive_path), "metadata.json.gz");
+    const legacy = JSON.parse(gunzipSync(await readFile(legacyPath)).toString("utf8")) as { tables: Record<string, unknown> };
+    delete legacy.tables.deliveries;
+    delete legacy.tables.deliveryAttempts;
+    const legacyData = gzipSync(Buffer.from(JSON.stringify(legacy), "utf8"));
+    await writeFile(legacyPath, legacyData);
+    database.prepare("UPDATE commissions SET archive_sha256 = ? WHERE id = ?").run(createHash("sha256").update(legacyData).digest("hex"), otherCommissionId);
+    await reactivateCommission(database, attachmentsRoot, otherCommissionId);
+    assert.ok(database.prepare("SELECT id FROM tasks WHERE id = ?").get(dependentTaskId));
+    assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
   } finally {
     await server.close();
     database.close();
@@ -176,12 +220,16 @@ test("approving a requirement automatically writes the planning Agent task tree"
   const database = await openWorkshopDatabase(home);
   let analyzedWith: unknown;
   let plannedWith: unknown;
+  const started = Promise.withResolvers<void>();
+  const finish = Promise.withResolvers<void>();
   const analyzer: RequirementAnalyzer = async (input) => {
     analyzedWith = input.agentConfig;
     return { contentMarkdown: "## Goal\nShip it", acceptanceCriteria: ["Done"] };
   };
   const planner: TaskPlanner = async (input) => {
     plannedWith = input.agentConfig;
+    started.resolve();
+    await finish.promise;
     return ({
     mainTask: { title: "Delivery", description: "Human acceptance", priority: "high", acceptanceCriteria: ["Accepted"] },
     tasks: [{ clientId: "T1", parentClientId: null, title: "Implement", description: "Build it", priority: "medium", ownerType: "ai", readOnly: false, acceptanceCriteria: ["Reviewed"], dependsOn: [] }]
@@ -194,7 +242,17 @@ test("approving a requirement automatically writes the planning Agent task tree"
     registerCommissionRoutes(server, database, join(home, "attachments"), analyzer, planner);
     const commissionId = (await server.inject({ method: "POST", url: `/api/projects/${projectId}/commissions`, payload: { title: "Feature", message: "Ship it" } })).json().id;
     const requirementId = (await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/analyze` })).json().requirement.id;
-    assert.equal((await server.inject({ method: "POST", url: `/api/requirements/${requirementId}/approve` })).statusCode, 200);
+    const approval = server.inject({ method: "POST", url: `/api/requirements/${requirementId}/approve` }).then((response) => response);
+    try {
+      await started.promise;
+      assert.equal((await server.inject(`/api/commissions/${commissionId}`)).json().task_planning_running, true);
+      assert.equal((await server.inject(`/api/projects/${projectId}/commissions`)).json()[0].task_planning_running, true);
+      assert.equal((await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/replan` })).statusCode, 409);
+    } finally {
+      finish.resolve();
+    }
+    assert.equal((await approval).statusCode, 200);
+    assert.equal((await server.inject(`/api/commissions/${commissionId}`)).json().task_planning_running, false);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM tasks WHERE commission_id = ? AND status = 'backlog'").get(commissionId) as { count: number }).count, 2);
     assert.equal((database.prepare("SELECT COUNT(*) AS count FROM documents WHERE commission_id = ? AND type = 'plan'").get(commissionId) as { count: number }).count, 1);
     assert.deepEqual(analyzedWith, { prompt: "", model: "supervisor-model", reasoningEffort: "high", sandboxMode: "workspace-write", approvalPolicy: "on-request", networkAccess: true, agentBackend: "codex", pluginVersion: WORKSHOP_VERSION, backendOptions: { customArgs: [] } });
@@ -616,3 +674,20 @@ function storedDocx(xml: string, declaredSize = Buffer.byteLength(xml)): Buffer 
   eocd.writeUInt32LE(local.length + name.length + content.length, 16);
   return Buffer.concat([local, name, content, central, name, eocd]);
 }
+
+test("clears task planning activity after planner failure", async () => {
+  const home = await mkdtemp(join(tmpdir(), "project-workshop-planning-failure-"));
+  const server = Fastify();
+  const database = await openWorkshopDatabase(home);
+  try {
+    const projectId = seedProject(database);
+    registerCommissionRoutes(server, database, join(home, "attachments"), undefined, async () => { throw new Error("Planner failed"); });
+    const commissionId = (await server.inject({ method: "POST", url: `/api/projects/${projectId}/commissions`, payload: { title: "Feature" } })).json().id;
+    await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/requirements/approved`, payload: { contentMarkdown: "# Approved", acceptanceCriteria: [] } });
+    assert.equal((await server.inject({ method: "POST", url: `/api/commissions/${commissionId}/replan` })).statusCode, 500);
+    const details = (await server.inject(`/api/commissions/${commissionId}`)).json();
+    assert.equal(details.task_planning_running, false);
+    assert.equal(details.main_task_id, null);
+    assert.equal(details.status, "planned");
+  } finally { await server.close(); database.close(); await rm(home, { recursive: true, force: true }); }
+});

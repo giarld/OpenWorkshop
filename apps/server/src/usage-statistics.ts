@@ -26,6 +26,7 @@ type UsageBucket = {
 };
 
 const TOKEN_PRICES: Record<string, { input: number; cached: number; output: number }> = {
+  "gpt-6-astra": { input: 10, cached: 1, output: 50 },
   "deepseek-v4-flash": { input: 0.14, cached: 0.0028, output: 0.28 },
   "deepseek-v4-pro": { input: 0.435, cached: 0.003625, output: 0.87 },
   "gpt-5.6-sol": { input: 5, cached: 0.5, output: 30 },

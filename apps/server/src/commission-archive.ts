@@ -33,6 +33,8 @@ type ArchiveSnapshot = {
     evidence: Row[];
     documents: Row[];
     documentVersions: Row[];
+    deliveries?: Row[];
+    deliveryAttempts?: Row[];
     notifications: Row[];
   };
 };
@@ -158,6 +160,7 @@ export async function deleteClarifyingCommission(database: DatabaseSync, attachm
   const commission = commissionRow(database, commissionId);
   if (commission.archived_at || !["draft", "clarifying"].includes(String(commission.status))) throw conflict("Only a commission in clarification can be deleted");
   assertNoActiveRuns(database, commissionId);
+  assertNoActiveDeliveries(database, commissionId);
   const snapshot = snapshotCommission(database, commission);
   database.exec("BEGIN IMMEDIATE");
   try {
@@ -179,8 +182,9 @@ function snapshotCommission(database: DatabaseSync, commission: Row): ArchiveSna
   const runIds = ids(runs);
   const approvals = selectBy(database, "approvals", "run_id", runIds);
   const documents = rows(database, "SELECT * FROM documents WHERE commission_id = ? ORDER BY rowid", commissionId);
+  const deliveries = rows(database, "SELECT * FROM deliveries WHERE commission_id = ? ORDER BY rowid", commissionId);
   const requirementVersions = rows(database, "SELECT * FROM requirement_versions WHERE commission_id = ? ORDER BY rowid", commissionId);
-  const entityIds = [commissionId, ...taskIds, ...runIds, ...ids(approvals), ...ids(documents), ...ids(requirementVersions)];
+  const entityIds = [commissionId, ...taskIds, ...runIds, ...ids(approvals), ...ids(documents), ...ids(requirementVersions), ...ids(deliveries)];
   return {
     version: 1,
     commission,
@@ -202,6 +206,8 @@ function snapshotCommission(database: DatabaseSync, commission: Row): ArchiveSna
       evidence: selectBy(database, "evidence", "task_id", taskIds),
       documents,
       documentVersions: selectBy(database, "document_versions", "document_id", ids(documents)),
+      deliveries,
+      deliveryAttempts: selectBy(database, "delivery_attempts", "delivery_id", ids(deliveries)),
       notifications: selectBy(database, "notifications", "entity_id", entityIds)
     }
   };
@@ -247,6 +253,8 @@ function clearCommissionRows(database: DatabaseSync, commissionId: string, notif
   if (retainedAdvances.length !== pendingAdvances.length) settings.set("pendingRunAdvances", retainedAdvances);
   database.prepare("UPDATE commissions SET active_requirement_version_id = NULL, main_task_id = NULL WHERE id = ?").run(commissionId);
   deleteByIds(database, "notifications", ids(notifications));
+  database.prepare("DELETE FROM delivery_attempts WHERE delivery_id IN (SELECT id FROM deliveries WHERE commission_id = ?)").run(commissionId);
+  database.prepare("DELETE FROM deliveries WHERE commission_id = ?").run(commissionId);
   database.prepare("DELETE FROM approvals WHERE run_id IN (SELECT id FROM runs WHERE commission_id = ?)").run(commissionId);
   database.prepare("DELETE FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE commission_id = ?)").run(commissionId);
   database.prepare("DELETE FROM evidence WHERE task_id IN (SELECT id FROM tasks WHERE commission_id = ?)").run(commissionId);
@@ -294,6 +302,8 @@ function restoreCommissionRows(database: DatabaseSync, snapshot: ArchiveSnapshot
   insertRows(database, "evidence", tables.evidence);
   insertRows(database, "documents", tables.documents.map((row) => ({ ...row, current_version_id: null })));
   insertRows(database, "document_versions", tables.documentVersions);
+  insertRows(database, "deliveries", tables.deliveries ?? []);
+  insertRows(database, "delivery_attempts", tables.deliveryAttempts ?? []);
   for (const row of tables.documents) if (row.current_version_id) database.prepare("UPDATE documents SET current_version_id = ? WHERE id = ?").run(sqlValue(row, "current_version_id"), sqlValue(row, "id"));
   insertRows(database, "notifications", tables.notifications.map((row) => Object.hasOwn(row, "system_notified_at") ? row : { ...row, system_notified_at: requiredSnapshotString(row.created_at, "notification.created_at") }));
 }
@@ -341,6 +351,7 @@ function claimArchive(database: DatabaseSync, commissionId: string, lifecycleTok
     if (commission.archived_at || commission.status === "archived") throw conflict("Commission is already archived");
     if (["draft", "clarifying"].includes(String(commission.status))) throw conflict("Commission clarification is not complete");
     assertNoActiveRuns(database, commissionId);
+    assertNoActiveDeliveries(database, commissionId);
     assertNoCrossCommissionDependencies(database, commissionId);
     const claimed = database.prepare("UPDATE commissions SET lifecycle_operation = 'archiving', lifecycle_token = ? WHERE id = ? AND lifecycle_operation IS NULL")
       .run(lifecycleToken, commissionId);
@@ -379,6 +390,15 @@ function assertNoActiveRuns(database: DatabaseSync, commissionId: string): void 
   const placeholders = ACTIVE_RUN_STATUSES.map(() => "?").join(", ");
   if (database.prepare(`SELECT 1 FROM runs WHERE commission_id = ? AND status IN (${placeholders}) LIMIT 1`).get(commissionId, ...ACTIVE_RUN_STATUSES)) {
     throw conflict("Commission has an active run");
+  }
+}
+
+function assertNoActiveDeliveries(database: DatabaseSync, commissionId: string): void {
+  if (database.prepare(`SELECT 1 FROM deliveries AS delivery WHERE commission_id = ? AND (
+    status IN ('queued', 'preparing', 'running', 'waiting_human') OR EXISTS (
+      SELECT 1 FROM delivery_attempts WHERE delivery_id = delivery.id AND status IN ('queued', 'preparing', 'running', 'waiting_human')
+    )) LIMIT 1`).get(commissionId)) {
+    throw conflict("委托存在未结束的交付，请先完成、取消交付或处理人工核对");
   }
 }
 

@@ -57,6 +57,14 @@ export type RequirementAnalyzer = (input: {
 export function registerCommissionRoutes(server: FastifyInstance, database: DatabaseSync, attachmentsRoot: string, analyze?: RequirementAnalyzer, plan?: TaskPlanner): void {
   registerAttachmentParsers(server);
   const runningAnalyses = new Set<string>();
+  const runningPlans = new Set<string>();
+  async function generatePlan(commissionId: string) {
+    if (!plan) throw unavailable("Planning Agent is not configured");
+    if (runningPlans.has(commissionId)) throw conflict("Task planning is already running");
+    runningPlans.add(commissionId);
+    try { return await planCommission(database, commissionId, plan); }
+    finally { runningPlans.delete(commissionId); }
+  }
 
   server.get<{ Params: { id: string }; Querystring: { archived?: string } }>("/api/projects/:id/commissions", async (request) => {
     projectExists(database, request.params.id);
@@ -70,7 +78,7 @@ export function registerCommissionRoutes(server: FastifyInstance, database: Data
       FROM commissions AS commission
       WHERE project_id = ? AND ${archiveFilter}
       ORDER BY created_at DESC
-    `).all(request.params.id);
+    `).all(request.params.id).map((row) => ({ ...row, task_planning_running: runningPlans.has(String(row.id)) }));
   });
 
   server.post<{ Params: { id: string }; Body: { title?: unknown; message?: unknown } }>("/api/projects/:id/commissions", async (request, reply) => {
@@ -89,10 +97,10 @@ export function registerCommissionRoutes(server: FastifyInstance, database: Data
       database.exec("ROLLBACK");
       throw error;
     }
-    return reply.code(201).send(commissionDetails(database, id, runningAnalyses));
+    return reply.code(201).send(commissionDetails(database, id, runningAnalyses, runningPlans));
   });
 
-  server.get<{ Params: { id: string } }>("/api/commissions/:id", async (request) => commissionDetails(database, request.params.id, runningAnalyses));
+  server.get<{ Params: { id: string } }>("/api/commissions/:id", async (request) => commissionDetails(database, request.params.id, runningAnalyses, runningPlans));
 
   server.delete<{ Params: { id: string } }>("/api/commissions/:id", async (request, reply) => {
     await deleteClarifyingCommission(database, attachmentsRoot, request.params.id);
@@ -252,7 +260,7 @@ export function registerCommissionRoutes(server: FastifyInstance, database: Data
       database.exec("ROLLBACK");
       throw error;
     }
-    if (plan) await planCommission(database, approved.commissionId, plan);
+    if (plan) await generatePlan(approved.commissionId);
     return requirementById(database, approved.requirementId);
   });
 
@@ -274,7 +282,7 @@ export function registerCommissionRoutes(server: FastifyInstance, database: Data
       }
     }
     if (!plan) throw unavailable("Planning Agent is not configured");
-    return planCommission(database, commission.id, plan);
+    return generatePlan(commission.id);
   });
 
   server.post<{ Params: { id: string }; Body: { reason?: unknown } }>("/api/requirements/:id/reject", async (request) => {
@@ -386,11 +394,12 @@ function limitedText(text: string): string {
   return encoded.length <= MAX_EXTRACTED_BYTES ? text : `${encoded.subarray(0, MAX_EXTRACTED_BYTES).toString("utf8")}\n[truncated]`;
 }
 
-function commissionDetails(database: DatabaseSync, id: string, runningAnalyses?: ReadonlySet<string>) {
+function commissionDetails(database: DatabaseSync, id: string, runningAnalyses?: ReadonlySet<string>, runningPlans?: ReadonlySet<string>) {
   const commission = commissionById(database, id);
   return {
     ...commission,
     clarification_analysis_running: runningAnalyses?.has(id) ?? false,
+    task_planning_running: runningPlans?.has(id) ?? false,
     attachments: database.prepare("SELECT * FROM attachments WHERE commission_id = ? ORDER BY created_at, rowid").all(id),
     messages: database.prepare("SELECT * FROM requirement_messages WHERE commission_id = ? ORDER BY created_at, rowid").all(id),
     requirements: database.prepare("SELECT * FROM requirement_versions WHERE commission_id = ? ORDER BY version_no DESC").all(id)
